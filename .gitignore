@@ -42,3 +42,9 @@ resource/
 # ---- 本地临时验证目录（可移植性/克隆测试用，随手就删）----
 _clone_test/
 _portable_test/
+
+# ---- 分发包压缩包（体积大，走 GitHub Releases 上传，别进仓库）----
+#   GitHub 单文件 >100MB 会被直接拒收
+*.zip
+*.7z
+*.rar
