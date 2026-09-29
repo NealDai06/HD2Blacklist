@@ -1,0 +1,53 @@
+# HD2 黑名单 (hd2_blacklist) —— 运行依赖
+#
+# 安装：  pip install -r requirements.txt
+#
+# 说明
+#   * 请在 Windows 上安装；tkinter 由官方 Python 安装包自带，无需 pip。
+#   * **推荐 Python 3.10 ~ 3.12**，可直接使用本规范指定的 rapidocr-onnxruntime。
+#   * Python 3.13+ 见文件末尾"Python 3.13 用户"一节。
+
+# ---- GUI ----
+pillow>=10.0.0            # 图像处理 + ImageTk + 默认图标生成
+numpy>=1.24.0             # OCR / 图像数值运算
+
+# ---- 屏幕捕获 ----
+mss>=9.0.1                # 小区域高速截图
+
+# ---- OCR ----
+# rapidocr-onnxruntime 的元数据写着 Requires-Python <3.13，
+# 但它其实是 **纯 Python 包**，在 3.13 上实测可正常运行（见 README 第 2 节）。
+rapidocr-onnxruntime>=1.3.24; python_version < "3.13"
+rapidocr>=3.0.0;             python_version >= "3.13"
+onnxruntime>=1.16.0
+
+# ---- 字符串匹配 ----
+rapidfuzz>=3.5.0
+
+# ---- 进程监控（WMI 事件订阅）----
+wmi>=1.5.1
+pywin32>=306
+
+# ---- 系统托盘 ----
+pystray>=0.19.5
+
+# ---- 桌面通知 ----
+winotify>=1.1.0
+
+# ---- 自定义音效播放 ----
+pygame>=2.5.0
+
+# ---- 打包（可选，仅发布时需要）----
+pyinstaller>=6.3.0
+
+
+# ============================================================
+# Python 3.13 用户
+# ============================================================
+# 如果上面 `rapidocr>=3.0.0` 的依赖解析很慢，或者你想使用本规范指定的
+# rapidocr-onnxruntime，可以这样装（已实测可在 Python 3.13.5 上运行）：
+#
+#   pip install --ignore-requires-python rapidocr-onnxruntime==1.4.4
+#   pip install --only-binary=:all: opencv-python-headless pyclipper shapely PyYAML
+#
+# 装完用 `python main.py --check` 确认 OCR 引擎一项是 [ OK ]。
