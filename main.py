@@ -130,6 +130,11 @@ class HD2BlacklistApp:
             on_stop=self._on_game_stop,
         )
 
+        # 区域框得太小 = 永远识别不到东西。这种情况必须主动说出来，
+        # 否则用户只会觉得"扫描没反应"（真实案例：HUD 区域被框成 10x13 像素）。
+        for warning in self.region_cfg.warnings():
+            self.log.warning("[区域] %s", warning)
+
     # ------------------------------------------------------------ 游戏事件
     def _on_game_start(self):
         """由 WMI 监听线程调用 —— 绝不能在这里碰 tkinter。"""
@@ -481,6 +486,54 @@ def run_self_check() -> int:
             db.close()
 
     check("match_text 接口", _matcher_check)
+
+    def _symbol_check():
+        """全符号玩家名（例如 `?`）必须能被索引、能过 OCR 名字过滤器。
+
+        回归：旧实现把「去掉所有非字母数字」当作唯一归一化手段，
+        `?` 会变成空串然后被整个丢出索引 —— 这类名字永远匹配不上。
+        """
+        import tempfile
+        from database import BlacklistDB as DB
+        from matcher import Matcher as M
+        from scan_session import is_valid_player_name
+        fd, tmp = tempfile.mkstemp(suffix=".db", dir=config.LOG_DIR)
+        os.close(fd)
+        db = DB(tmp)
+        try:
+            db.add("-", "?")
+            m = M(db)
+            if not m.check(["?"]):
+                raise RuntimeError("黑名单里的 `?` 无法被 check() 命中")
+            if not m.check(["？"]):                 # 全角也要能对上
+                raise RuntimeError("全角 `？` 无法命中半角 `?` 条目")
+            if not m.match_text("? : hello"):
+                raise RuntimeError("聊天文本里的 `?` 无法命中")
+            if not is_valid_player_name("?", m.name_allowlist()):
+                raise RuntimeError("OCR 名字过滤器会把 `?` 丢掉")
+            if is_valid_player_name("???", m.name_allowlist()):
+                raise RuntimeError("`???` 不应命中只有 `?` 时放行的白名单")
+            return "全符号玩家名（如 `?`）可索引、可命中、可过过滤器"
+        finally:
+            db.close()
+            for suffix in ("", "-wal", "-shm"):
+                try:
+                    os.remove(tmp + suffix)
+                except OSError:
+                    pass
+
+    check("全符号玩家名", _symbol_check)
+
+    def _region_check():
+        rc = RegionConfig()
+        warns = rc.warnings()
+        if warns:
+            raise RuntimeError("；".join(warns))
+        sizes = "，".join(f"{k}={v['width']}x{v['height']}"
+                          for k, v in rc.get_all().items())
+        return f"三个区域尺寸合理（{sizes}）"
+
+    check("监视区域尺寸", _region_check)
 
     try:
         from notifier import ensure_default_icon

@@ -14,6 +14,7 @@
 """
 from __future__ import annotations
 
+import re
 import threading
 import time
 
@@ -22,6 +23,7 @@ import numpy as np
 from config import (OCR_CONFIDENCE_MIN, SCAN_THREAD_PRIORITY,
                     SESSION_DIFF_TOLERANCE, SESSION_MAX_STATIC_FRAMES,
                     SESSION_SKIP_UNCHANGED, get_logger)
+from matcher import fold as _fold_name
 from priority import low_priority
 
 # 明显的 UI 文字，避免把菜单项当成玩家名
@@ -33,21 +35,52 @@ UI_BLACKLIST = {
     "continue", "cancel", "confirm", "select", "loadout",
     "stratagems", "stratagem", "mission", "social", "armory",
     "warbond", "acquisitions", "ship", "management",
+    # ESC 菜单里的分栏标题 / 页签（真实截图里会被 OCR 认出来，
+    # 之前会被当成"玩家名"送进匹配器，纯属噪声）
+    "小队", "队员", "小队成员", "当前小队", "社交", "游戏", "好友",
+    "最近玩家", "最近组队", "星图", "军械库", "战争债券", "军需官",
+    "舰船管理", "个人资料", "成就", "账户",
 }
+
+#: 「等级 / 头衔」这类行，长得像名字但永远不是玩家名。
+#: 真实例："185级|功勋英雄"（ESC 菜单里紧跟在玩家名下面的一行）。
+_UI_LINE_RES = (
+    re.compile(r"^\s*\d{1,4}\s*[级級]"),                  # 185级|功勋英雄
+    re.compile(r"^\s*[Ll][Vv]\.?\s*\d{1,4}\s*$"),         # Lv.42
+    re.compile(r"^\s*(等级|經驗|经验)\s*\d{1,4}\s*$"),
+)
+
+#: 从"名字 + 等级头衔被 OCR 拼成一行"里砍掉等级那一段
+_LEVEL_SEG_RE = re.compile(r"\d{1,4}\s*[级級].*$", re.DOTALL)
+
+#: 把"被 OCR 拼成一整行"的文本再切开时用的分隔符
+_SPLIT_MERGED_RE = re.compile(r"[\s|｜/\\·・•,，]+")
 
 _NAME_MIN_LEN = 2
 _NAME_MAX_LEN = 30
 
 
-def is_valid_player_name(text: str) -> bool:
-    """判断 OCR 文本是否像一个玩家名。"""
+def is_valid_player_name(text: str, allowlist=None) -> bool:
+    """判断 OCR 文本是否像一个玩家名。
+
+    allowlist 是「黑名单里确实存在的名字」集合（matcher.name_allowlist()）。
+    命中白名单的一律放行 —— 有些玩家名天然不像名字（比如整条就是一个 `?`），
+    按普通规则会被丢掉，于是永远匹配不上。
+    """
     if not text:
         return False
     t = text.strip()
+    if allowlist:
+        key = _fold_name(t)
+        if key and key in allowlist:
+            return True
     if len(t) < _NAME_MIN_LEN or len(t) > _NAME_MAX_LEN:
         return False
     if t.isdigit():
         return False
+    for rx in _UI_LINE_RES:
+        if rx.match(t):
+            return False
     if t.lower() in UI_BLACKLIST:
         return False
     # 至少要包含一个字母/数字/汉字
@@ -61,7 +94,8 @@ def is_valid_player_name(text: str) -> bool:
     return True
 
 
-def evaluate_scan(ocr_results, min_conf: float = OCR_CONFIDENCE_MIN) -> list:
+def evaluate_scan(ocr_results, min_conf: float = OCR_CONFIDENCE_MIN,
+                  allowlist=None) -> list:
     """从 OCR 结果里筛出有效玩家名，保持原始顺序并去重。
 
     接受两种输入：
@@ -69,7 +103,8 @@ def evaluate_scan(ocr_results, min_conf: float = OCR_CONFIDENCE_MIN) -> list:
         [(text, conf, bbox), ...]        —— 会先把同一行的碎片拼回完整名字
     """
     out, seen = [], set()
-    for item in group_into_lines(ocr_results or [], min_conf) or ():
+    for item in group_into_lines(ocr_results or [], min_conf,
+                                 allowlist=allowlist) or ():
         if item not in seen:
             seen.add(item)
             out.append(item)
@@ -77,7 +112,8 @@ def evaluate_scan(ocr_results, min_conf: float = OCR_CONFIDENCE_MIN) -> list:
 
 
 def group_into_lines(ocr_results, min_conf: float = OCR_CONFIDENCE_MIN,
-                     y_overlap: float = 0.5, gap_ratio: float = 1.2) -> list:
+                     y_overlap: float = 0.5, gap_ratio: float = 1.2,
+                     allowlist=None) -> list:
     """把 OCR 碎片按「同一行」聚合并过滤成有效玩家名。
 
     规则：
@@ -113,8 +149,7 @@ def group_into_lines(ocr_results, min_conf: float = OCR_CONFIDENCE_MIN,
 
     names = []
     for text in no_box:                     # 没有坐标的，各自成行
-        if is_valid_player_name(text):
-            names.append(text)
+        _append_names(names, text, allowlist)
 
     frags.sort(key=lambda f: (f["yc"], f["x0"]))
     lines = []
@@ -139,15 +174,43 @@ def group_into_lines(ocr_results, min_conf: float = OCR_CONFIDENCE_MIN,
         line.sort(key=lambda f: f["x0"])
         # 直接拼接：matcher 归一化时会去掉所有非字母数字字符，
         # 所以 "SamplePlayer" + "01" 与 "SamplePlayer_01" 等价。
-        merged = "".join(f["text"] for f in line).strip()
-        if is_valid_player_name(merged):
-            names.append(merged)
+        _append_names(names, "".join(f["text"] for f in line).strip(), allowlist)
     return names
 
 
-def evaluate_boxes(ocr_results, min_conf: float = OCR_CONFIDENCE_MIN) -> list:
+def _append_names(out: list, text: str, allowlist=None) -> None:
+    """把一个候选文本加进结果。
+
+    处理三种真实形态：
+        "PlayerX"                    → 直接就是名字
+        "PlayerX185级|功勋英雄"       → OCR 把名字和等级拼成一行 → 砍掉等级段留 "PlayerX"
+        "185级|功勋英雄"           → 整行就是等级/头衔 → 砍完为空，整行丢掉
+                                    （不砍就直接丢，也不会把"功勋英雄"当成名字）
+    整行合法但既不是名字也不是等级时（多词名被拼在一起），保持原样。
+    """
+    if not text:
+        return
+    t = text.strip()
+    if not t:
+        return
+    if _LEVEL_SEG_RE.search(t):
+        head = _LEVEL_SEG_RE.sub("", t).strip(" |｜/\\·・•-_")
+        if head and is_valid_player_name(head, allowlist):
+            out.append(head)
+        return
+    if is_valid_player_name(t, allowlist):
+        out.append(t)
+        return
+    for part in _SPLIT_MERGED_RE.split(t):
+        part = part.strip()
+        if part and part != t and is_valid_player_name(part, allowlist):
+            out.append(part)
+
+
+def evaluate_boxes(ocr_results, min_conf: float = OCR_CONFIDENCE_MIN,
+                   allowlist=None) -> list:
     """group_into_lines 的别名（语义更明确：输入是带框的 OCR 结果）。"""
-    return group_into_lines(ocr_results, min_conf)
+    return group_into_lines(ocr_results, min_conf, allowlist=allowlist)
 
 
 class ScanSession:
@@ -221,6 +284,21 @@ class ScanSession:
             return True
         return float(np.abs(small - prev).mean()) > SESSION_DIFF_TOLERANCE
 
+    def _name_allowlist(self):
+        """「黑名单里确实存在的名字」白名单，供 OCR 判读过滤器放行。
+
+        取不到（测试替身 / 老版本 matcher）时返回 None，过滤器就用默认规则。
+        """
+        matcher = getattr(self.scheduler, "matcher", None)
+        fn = getattr(matcher, "name_allowlist", None)
+        if not callable(fn):
+            return None
+        try:
+            return fn()
+        except Exception as e:                           # noqa: BLE001
+            self.logger.debug("[Session] 读取名字白名单失败: %s", e)
+            return None
+
     def _scan_once(self):
         """抓图 + OCR + 有效性过滤。
 
@@ -234,13 +312,18 @@ class ScanSession:
             if not self._frame_changed(img):
                 return img, None, True
             ocr = self.scheduler.ocr
+            allowlist = self._name_allowlist()
             # 真实引擎提供 recognize_lines（会把被 OCR 切开的名字拼回去）；
             # 测试替身只有 recognize_raw 时自动退回逐行过滤。
             lines_fn = getattr(ocr, "recognize_lines", None)
             if callable(lines_fn):
-                valid_names = lines_fn(img)
+                try:
+                    valid_names = lines_fn(img, allowlist=allowlist)
+                except TypeError:                        # 老签名/替身
+                    valid_names = lines_fn(img)
             else:
-                valid_names = evaluate_scan(ocr.recognize_raw(img))
+                valid_names = evaluate_scan(ocr.recognize_raw(img),
+                                            allowlist=allowlist)
         return img, valid_names, False
 
     def _run(self):

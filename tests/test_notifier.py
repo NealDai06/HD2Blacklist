@@ -314,6 +314,49 @@ class TestOverlayWindow(TempCase):
         # CreateWindowExW 必须用同一个类名常量，不能再写字面量
         self.assertIn("ex_style, OVERLAY_CLASS_NAME", src)
 
+    def test_each_stack_slot_gets_its_own_window(self):
+        """回归：每个通知栏必须有自己的窗口。
+
+        真 bug：所有通知栏之前共用一个 WS_EX_LAYERED 窗口，而
+        `UpdateLayeredWindow` 会把**整个窗口**重绘成新图并搬走它 ——
+        后画的把先画的整个盖掉，用户只看得见最后一条。
+        配合"只播一次音效"，现象就是"命中多个黑名单玩家却只播报一个人"。
+        """
+        w = nt._OverlayWindow()
+        try:
+            if not w.start(timeout=8.0):
+                self.skipTest("Overlay 不可用")
+            for i in range(3):
+                w.show(Image.new("RGBA", (200, 60), (10, 10, 10, 255)),
+                       100, 40 + i * 70, 5.0, slot=i)
+            time.sleep(0.6)
+            self.assertEqual(len(w._surfaces), 3, "3 个槽位应有 3 个窗口")
+            hwnds = [s.hwnd for s in w._surfaces]
+            self.assertTrue(all(hwnds), "窗口句柄不能为空")
+            self.assertEqual(len(set(hwnds)), 3, "槽位之间不能共用窗口")
+            for s in w._surfaces:
+                self.assertTrue(nt.user32.IsWindowVisible(s.hwnd),
+                                f"第 {s.index} 个通知栏应当可见")
+            w.hide()
+            time.sleep(0.2)
+            for s in w._surfaces:
+                self.assertFalse(nt.user32.IsWindowVisible(s.hwnd),
+                                 "hide() 应当收起所有通知栏")
+        finally:
+            w.close()
+
+    def test_slot_beyond_limit_is_not_created(self):
+        w = nt._OverlayWindow()
+        try:
+            if not w.start(timeout=8.0):
+                self.skipTest("Overlay 不可用")
+            w.show(Image.new("RGBA", (120, 40), (0, 0, 0, 255)),
+                   10, 10, 3.0, slot=nt.MAX_NOTIFY_STACK + 3)
+            time.sleep(0.4)
+            self.assertLessEqual(len(w._surfaces), nt.MAX_NOTIFY_STACK)
+        finally:
+            w.close()
+
 
 # ==========================================================================
 class TestNotifier(TempCase):
@@ -405,9 +448,11 @@ class TestAlertBatch(TempCase):
         def __init__(self):
             self.available = True
             self.shown = []
+            self.slots = []          # 每个通知栏落在哪个堆叠槽位
 
-        def show(self, image, x, y, duration):
+        def show(self, image, x, y, duration, slot=0):
             self.shown.append((image.size, x, y, duration))
+            self.slots.append(slot)
 
         def hide(self):
             pass
@@ -600,6 +645,60 @@ class TestAlertBatch(TempCase):
             img2 = n.render_preview_image(n.cfg.get(), self._entries(2)[1],
                                           100.0, "chat")
             self.assertNotEqual(img1.tobytes(), img2.tobytes())
+        finally:
+            n.close()
+
+    def test_overflow_is_summarised_in_the_last_slot(self):
+        """命中数超过堆叠上限时，最后一个槽位换成汇总栏列出剩余玩家。
+
+        没有这条，用户只知道"命中了"，却不知道还有谁没显示出来。
+        """
+        import config as cfg_mod
+        limit = cfg_mod.MAX_NOTIFY_STACK
+        n = self._notifier()
+        try:
+            calls = []
+            real = n._show_overlay
+
+            def spy(entry, score, source, play_sound=True, stack_index=0):
+                calls.append((entry, stack_index))
+                return real(entry, score, source, play_sound, stack_index)
+
+            n._show_overlay = spy
+            total = limit + 2
+            hits = [(e, 100.0, "chat") for e in self._entries(total)]
+            shown = n.alert_batch(hits)
+
+            self.assertEqual(shown, limit)
+            self.assertEqual([c[1] for c in calls], list(range(limit)))
+            names = [c[0]["player_name"] for c in calls]
+            self.assertEqual(names[:limit - 1],
+                             [f"Player{i}" for i in range(1, limit)])
+            summary = names[-1]
+            self.assertIn(f"等 {total - (limit - 1)} 名", summary)
+            for i in range(limit, total + 1):
+                self.assertIn(f"Player{i}", summary)
+            self.assertEqual(len(n.sound.played), 1)
+        finally:
+            n.close()
+
+    def test_no_summary_when_everything_fits(self):
+        """刚好占满堆叠上限时不应出现汇总栏（每个玩家都有自己的栏）。"""
+        import config as cfg_mod
+        limit = cfg_mod.MAX_NOTIFY_STACK
+        n = self._notifier()
+        try:
+            calls = []
+            real = n._show_overlay
+
+            def spy(entry, score, source, play_sound=True, stack_index=0):
+                calls.append(entry["player_name"])
+                return real(entry, score, source, play_sound, stack_index)
+
+            n._show_overlay = spy
+            hits = [(e, 100.0, "chat") for e in self._entries(limit)]
+            self.assertEqual(n.alert_batch(hits), limit)
+            self.assertEqual(calls, [f"Player{i}" for i in range(1, limit + 1)])
         finally:
             n.close()
 

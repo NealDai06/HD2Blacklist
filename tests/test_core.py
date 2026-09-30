@@ -182,6 +182,31 @@ class TestRegionConfig(TempCase):
         self.cfg.reset_all()
         self.assertFalse(self.cfg.is_customized("player_list_hud"))
 
+    def test_defaults_have_no_size_warning(self):
+        self.assertEqual(self.cfg.warnings(), [])
+
+    def test_region_size_warning(self):
+        """区域被框成几个像素 → 永远识别不到东西，必须给出告警。
+
+        真实案例：HUD 玩家列表被误框成 10x13 像素。
+        """
+        self.cfg.set("player_list_hud", {"left": 1603, "top": 571,
+                                         "width": 10, "height": 13})
+        warns = self.cfg.warnings()
+        self.assertEqual(len(warns), 1)
+        self.assertIn("10x13", warns[0])
+        self.assertIn("HUD", warns[0])
+        # 改回一个合理尺寸后告警消失
+        self.cfg.set("player_list_hud", {"left": 100, "top": 200,
+                                         "width": 400, "height": 120})
+        self.assertEqual(self.cfg.warnings(), [])
+
+    def test_region_warnings_helper_handles_garbage(self):
+        from region_config import region_warnings
+        self.assertEqual(region_warnings({}), [])
+        self.assertEqual(region_warnings({"chat_event": None}), [])
+        self.assertEqual(region_warnings({"chat_event": {"width": "x"}}), [])
+
     def test_reject_bad_input(self):
         with self.assertRaises(KeyError):
             self.cfg.get("nope")
@@ -734,6 +759,118 @@ class TestMatcher(TempCase):
         self.db.delete(eid)
         self.matcher.reload()
         self.assertEqual(self.matcher.check(["PlayerX"]), [])
+
+
+# ==========================================================================
+class TestSymbolNames(TempCase):
+    """回归：玩家名整条就是一个符号（例如 `?`）时也要能命中。
+
+    曾经的 bug：归一化会去掉所有非字母数字字符，`?` 于是变成空串，
+    条目在 reload() 里被直接丢掉 —— 这类名字**永远**匹配不上，
+    而 OCR 那侧还有第二道关卡（is_valid_player_name 认为它不含字母数字）
+    会先把文本扔掉。
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.db = BlacklistDB(self.path("b.db"))
+        self.db.add("-", "?")
+        self.db.add("idn", "PlayerX")
+        self.db.add("idw", "playery")
+        self.matcher = Matcher(self.db)
+
+    def tearDown(self):
+        self.db.close()
+        super().tearDown()
+
+    def test_symbol_only_entry_is_indexed(self):
+        self.assertIn("?", self.matcher.symbol_names())
+        self.assertEqual(self.matcher.reload(), 3)
+
+    def test_check_matches_symbol_name(self):
+        hits = self.matcher.check(["?"])
+        self.assertEqual(len(hits), 1)
+        self.assertEqual(hits[0][0]["player_name"], "?")
+        self.assertEqual(hits[0][1], 100.0)
+
+    def test_fullwidth_question_mark_matches_halfwidth_entry(self):
+        """NFKC 折叠：OCR 给出全角 `？` 也要对上半角 `?`。"""
+        self.assertEqual(len(self.matcher.check(["？"])), 1)
+        self.assertEqual(len(self.matcher.match_text("？ : hello")), 1)
+        self.assertEqual(len(self.matcher.match_text("? : hello")), 1)
+
+    def test_symbol_name_matches_inside_a_line(self):
+        """ESC 菜单里名字单独一行 / 聊天里 "? : 你好" 都要命中。"""
+        self.assertEqual(len(self.matcher.match_text("?加入了游戏")), 1)
+        self.assertEqual(len(self.matcher.match_text("为什么?")), 1)
+
+    def test_longer_symbol_runs_do_not_false_positive(self):
+        """聊天里打 "???" 不该命中名字为 "?" 的条目。"""
+        self.assertEqual(self.matcher.match_text("???"), [])
+        self.assertEqual(self.matcher.match_text("?!"), [])
+        self.assertEqual(self.matcher.check(["??"]), [])
+
+    def test_normal_names_still_match(self):
+        self.assertEqual(self.matcher.check(["PlayerX"])[0][0]["player_name"],
+                         "PlayerX")
+        self.assertEqual(self.matcher.check(["playerx"])[0][0]["player_name"],
+                         "PlayerX")
+
+    def test_symbol_entry_coexists_with_normal_ones(self):
+        hits = self.matcher.check(["PlayerX", "?", "playery"])
+        self.assertEqual({h[0]["player_name"] for h in hits},
+                         {"PlayerX", "?", "playery"})
+
+    def test_symbol_key_helper(self):
+        from matcher import fold, symbol_key
+        self.assertEqual(symbol_key("?"), "?")
+        self.assertEqual(symbol_key("？"), "?")
+        self.assertEqual(symbol_key("★☆"), "★☆")
+        self.assertEqual(symbol_key("PlayerX"), "")
+        self.assertEqual(symbol_key(""), "")
+        self.assertEqual(fold("Ｎｅａｌ"), "playerx")
+
+
+# ==========================================================================
+class TestConfusableNames(TempCase):
+    """回归：OCR 把 0 认成 O、1 认成 l 时也要能命中（仅当解唯一）。"""
+
+    def setUp(self):
+        super().setUp()
+        self.db = BlacklistDB(self.path("b.db"))
+        self.db.add("id1", "Player_01")
+        self.matcher = Matcher(self.db)
+
+    def tearDown(self):
+        self.db.close()
+        super().tearDown()
+
+    def test_digit_letter_confusion_matches(self):
+        for wrong in ("Player_Ol", "Player_0l", "Player_O1", "PlayerOI"):
+            hits = self.matcher.check([wrong])
+            self.assertEqual(len(hits), 1, f"{wrong} 应当命中 Player_01")
+            self.assertEqual(hits[0][0]["player_name"], "Player_01")
+            self.assertEqual(hits[0][1], 100.0, "应当由易混层直接命中，而不是模糊")
+
+    def test_confusion_in_chat_text(self):
+        hits = self.matcher.match_text("Player_Ol has joined the game")
+        self.assertEqual(len(hits), 1)
+        self.assertEqual(hits[0][1], 100.0)
+
+    def test_ambiguous_confusion_is_refused(self):
+        """两个不同条目折叠到同一个键时，宁可不认也不能认错。"""
+        self.db.add("id2", "Player_0l")          # 与 Player_01 折叠后同键
+        self.matcher.reload()
+        hits = self.matcher.check(["PlayerO1"])
+        self.assertFalse([h for h in hits if h[1] >= 100.0],
+                         "折叠键有歧义时必须放弃易混匹配")
+
+    def test_plain_typo_still_uses_fuzzy(self):
+        """易混层管不到的错误仍然由模糊层兜底。"""
+        hits = self.matcher.check(["Player_01x"])
+        self.assertEqual(len(hits), 1)
+        self.assertLess(hits[0][1], 100.0)
+        self.assertFalse(self.matcher.check(["TotallyDifferentName"]))
 
 
 if __name__ == "__main__":

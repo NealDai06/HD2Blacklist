@@ -7,10 +7,13 @@
     python build.py --clean         # 先清理本次产物（用户 data/ 会先保留再放回）
     python build.py --console       # 保留控制台窗口（排查问题时用）
 
-产物：
-    dist/HD2Blacklist/HD2Blacklist.exe      (onedir)
-    dist/HD2Blacklist.exe                   (onefile)
-并且会在产物旁边生成一份 data/ 种子目录（含示例配置与默认提示图）。
+产物（都写到源码目录上一级的「发布包/」里）：
+    ../发布包/HD2Blacklist/HD2Blacklist.exe      (onedir 文件夹版)
+    ../发布包/HD2Blacklist.exe                   (onefile 单文件版)
+
+并且会自动在产物旁边放好：
+    · data/ 种子目录（示例配置 + 默认提示图 + 应用图标）
+    · 使用说明.txt / LICENSE.txt（从仓库根目录复制，永远与源码同步）
 
 注意：config.py 以 **exe 所在目录** 作为 BASE_DIR，
       所以 data/ 必须和 exe 放在一起（本脚本会自动复制）。
@@ -25,13 +28,16 @@ import subprocess
 import sys
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
-#: 产物输出到源码目录**上一级**的 v1/（与 source_code/ 平级）
+#: 产物输出到源码目录**上一级**的 发布包/（与 source_code/ 平级）
 OUT_ROOT = os.path.dirname(ROOT)
 APP_NAME = "HD2Blacklist"
 ENTRY = os.path.join(ROOT, "main.py")
-DIST = os.path.join(OUT_ROOT, "v1")
+DIST = os.path.join(OUT_ROOT, "发布包")
 BUILD = os.path.join(ROOT, "build")
 DATA = os.path.join(ROOT, "data")
+#: 随包分发给人看的文档（源文件在仓库根目录里，打包时复制到产物旁边）
+DOC_FILES = (("使用说明.txt", "使用说明.txt"),
+             ("LICENSE", "LICENSE.txt"))
 
 
 def log(msg):
@@ -184,6 +190,26 @@ def copy_seed_data(target_dir: str):
             log(f"复制 {icon_name}")
 
 
+def copy_docs(target_dir: str):
+    """把 使用说明.txt / LICENSE 复制到产物旁边（每次覆盖，保证与源码同步）。
+
+    这两个文件是**仓库里的源文件**（`source_code/使用说明.txt`、`source_code/LICENSE`），
+    打包时复制一份到 exe 同级，于是「仓库内容全在 source_code/ 里」和
+    「分发包自带说明书与许可证」两件事同时成立。
+    """
+    os.makedirs(target_dir, exist_ok=True)
+    for src_name, dst_name in DOC_FILES:
+        src = os.path.join(ROOT, src_name)
+        if not os.path.exists(src):
+            log(f"警告：缺少 {src_name}，产物里不会有 {dst_name}")
+            continue
+        try:
+            shutil.copy2(src, os.path.join(target_dir, dst_name))
+            log(f"复制 {src_name} → {dst_name}")
+        except OSError as e:
+            log(f"复制 {src_name} 失败: {e}")
+
+
 def _restore_kept_data(keep_dir: str, dest_dir: str) -> None:
     """把 --clean 前搬走的用户 data/ 放回去（用户数据整体优先）。"""
     if not keep_dir or not os.path.isdir(keep_dir):
@@ -219,7 +245,7 @@ def main(argv=None) -> int:
     so_dir = os.path.join(DIST, APP_NAME)
     if args.clean:
         # 只清理「本次要产出的那一份」+ 构建缓存。
-        # 注意不要整个删掉 v1/：那里可能还放着另一种打包形式和使用说明。
+        # 注意不要整个删掉 发布包/：那里还放着解压版、发布压缩包和使用说明。
         targets = [BUILD,
                    os.path.join(DIST, f"{APP_NAME}.exe") if args.onefile
                    else so_dir]
@@ -253,10 +279,13 @@ def main(argv=None) -> int:
     if args.onefile:
         exe = os.path.join(DIST, f"{APP_NAME}.exe")
         copy_seed_data(DIST)
+        copy_docs(DIST)
     else:
         _restore_kept_data(keep_dir, so_dir)
         exe = os.path.join(so_dir, f"{APP_NAME}.exe")
         copy_seed_data(so_dir)
+        copy_docs(so_dir)          # exe 旁边一份（发给别人时随包带走）
+        copy_docs(DIST)            # 发布包/ 顶层一份（自己看目录时一眼可见）
 
     print()
     if os.path.exists(exe):

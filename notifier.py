@@ -440,100 +440,30 @@ def render_overlay(cfg: dict, entry, score, source,
 # ==========================================================================
 # 分层窗口
 # ==========================================================================
-class _OverlayWindow:
-    """一个常驻的 WS_EX_LAYERED 窗口；由专属线程持有。"""
+class _OverlaySurface:
+    """一个分层窗口（通知堆叠里的一个槽位）。只在 Overlay 线程里使用。"""
 
-    def __init__(self, on_error=None):
-        self.log = get_logger("notifier")
-        self.available = False
+    def __init__(self, index: int):
+        self.index = index
         self.hwnd = None
-        self._queue = queue.Queue(maxsize=4)
-        self._stop = threading.Event()
-        self._ready = threading.Event()
-        self._hide_at = 0.0
-        self._thread = None
-        self._on_error = on_error
-        self._wndproc_ref = None      # 进程级常驻回调，见 _ensure_overlay_class
+        self.hide_at = 0.0
+        self._wndproc_ref = None
 
-    # ------------------------------------------------------------ 生命周期
-    def start(self, timeout: float = 5.0) -> bool:
-        self._thread = threading.Thread(target=self._run, daemon=True,
-                                        name="OverlayWindow")
-        self._thread.start()
-        self._ready.wait(timeout)
-        return self.available
-
-    def _run(self):
-        try:
-            self._create_window()
-            self.available = True
-        except Exception as e:                           # noqa: BLE001
-            self.log.error("Overlay 窗口创建失败: %s", e)
-            if self._on_error:
-                self._on_error(e)
-            self._ready.set()
-            return
-        self._ready.set()
-
-        msg = wt.MSG()
-        try:
-            while not self._stop.is_set():
-                while user32.PeekMessageW(ctypes.byref(msg), None, 0, 0, 1):
-                    if msg.message == 0x0012:            # WM_QUIT
-                        self._stop.set()
-                        break
-                    user32.TranslateMessage(ctypes.byref(msg))
-                    user32.DispatchMessageW(ctypes.byref(msg))
-                self._pump_requests()
-                if self._hide_at and time.time() >= self._hide_at:
-                    self._hide_at = 0.0
-                    user32.ShowWindow(self.hwnd, SW_HIDE)
-                time.sleep(0.02)
-        finally:
-            try:
-                if self.hwnd:
-                    user32.DestroyWindow(self.hwnd)
-            except Exception:                            # noqa: BLE001
-                pass
-
-    def _create_window(self):
+    def create(self):
         hinst = kernel32.GetModuleHandleW(None)
         # 窗口过程是进程级常驻对象，绝不按实例创建（见模块顶部说明）
-        wndproc = _ensure_overlay_class(hinst)
-        self._wndproc_ref = wndproc          # 额外持有引用，双保险
-
+        self._wndproc_ref = _ensure_overlay_class(hinst)
         ex_style = (WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_NOACTIVATE
                     | WS_EX_TOOLWINDOW | WS_EX_TOPMOST)
         hwnd = user32.CreateWindowExW(
-            ex_style, OVERLAY_CLASS_NAME, "HD2BlacklistOverlay", WS_POPUP,
+            ex_style, OVERLAY_CLASS_NAME,
+            f"HD2BlacklistOverlay{self.index}", WS_POPUP,
             0, 0, 10, 10, None, None, hinst, None)
         if not hwnd:
             raise ctypes.WinError(ctypes.get_last_error())
         self.hwnd = hwnd
-        self.log.info("Overlay 窗口已创建（NOACTIVATE|TRANSPARENT|TOOLWINDOW|TOPMOST）")
 
-    # ---------------------------------------------------------------- 请求
-    def show(self, image: Image.Image, x: int, y: int, duration: float):
-        try:
-            self._queue.put_nowait((image, int(x), int(y), float(duration)))
-        except queue.Full:
-            try:
-                self._queue.get_nowait()
-                self._queue.put_nowait((image, int(x), int(y), float(duration)))
-            except queue.Empty:
-                pass
-
-    def _pump_requests(self):
-        try:
-            while True:
-                image, x, y, duration = self._queue.get_nowait()
-                self._paint(image, x, y, duration)
-        except queue.Empty:
-            pass
-        except Exception as e:                           # noqa: BLE001
-            self.log.warning("Overlay 绘制失败: %s", e)
-
-    def _paint(self, image: Image.Image, x: int, y: int, duration: float):
+    def paint(self, image: Image.Image, x: int, y: int, duration: float):
         w, h = image.size
         screen_dc = user32.GetDC(None)
         mem_dc = gdi32.CreateCompatibleDC(screen_dc)
@@ -580,7 +510,7 @@ class _OverlayWindow:
             user32.ShowWindow(self.hwnd, SW_SHOWNOACTIVATE)
             # 重新压到最顶层；SWP_NOACTIVATE 保证不抢焦点
             user32.SetWindowPos(self.hwnd, -1, x, y, w, h, 0x0010)
-            self._hide_at = time.time() + max(0.2, duration)
+            self.hide_at = time.time() + max(0.2, duration)
         finally:
             if old:
                 gdi32.SelectObject(mem_dc, old)
@@ -590,12 +520,145 @@ class _OverlayWindow:
             user32.ReleaseDC(None, screen_dc)
 
     def hide(self):
-        self._hide_at = 0.0
+        self.hide_at = 0.0
         if self.hwnd:
             try:
                 user32.ShowWindow(self.hwnd, SW_HIDE)
             except Exception:                            # noqa: BLE001
                 pass
+
+    def destroy(self):
+        if self.hwnd:
+            try:
+                user32.DestroyWindow(self.hwnd)
+            except Exception:                            # noqa: BLE001
+                pass
+            self.hwnd = None
+
+
+class _OverlayWindow:
+    """一组常驻分层窗口（每个堆叠槽位一个），由专属线程持有。
+
+    为什么必须是**一组**而不是一个（这曾经是个真 bug）：
+        `UpdateLayeredWindow` 会把**整个窗口**重绘成新图，并把它移动到新位置。
+        批量命中时若 N 个通知栏共用一个窗口，后画的会把先画的整个盖掉 ——
+        用户最终只看得见**最后一条**；音效又只响一次，于是现象就是
+        "一次命中多个黑名单玩家，却只播报了一个人，还说不清是谁"。
+        每个槽位一个窗口之后，N 条就真的并排显示 N 栏。
+
+    对外接口保持不变（show/hide/close/hwnd/available）。
+    """
+
+    def __init__(self, on_error=None):
+        self.log = get_logger("notifier")
+        self.available = False
+        self._queue = queue.Queue(maxsize=max(4, MAX_NOTIFY_STACK * 2))
+        self._stop = threading.Event()
+        self._ready = threading.Event()
+        self._thread = None
+        self._on_error = on_error
+        self._surfaces = []           # [_OverlaySurface]，索引 = 堆叠槽位
+        self._wndproc_ref = None      # 进程级常驻回调，见 _ensure_overlay_class
+
+    # ------------------------------------------------------------ 生命周期
+    def start(self, timeout: float = 5.0) -> bool:
+        self._thread = threading.Thread(target=self._run, daemon=True,
+                                        name="OverlayWindow")
+        self._thread.start()
+        self._ready.wait(timeout)
+        return self.available
+
+    @property
+    def hwnd(self):
+        """第一个槽位的窗口句柄（自检用）。"""
+        return self._surfaces[0].hwnd if self._surfaces else None
+
+    def _surface(self, slot: int):
+        """取（必要时创建）第 slot 个槽位窗口；超出上限返回 None。"""
+        slot = max(0, int(slot))
+        if slot >= MAX_NOTIFY_STACK:
+            return None
+        while len(self._surfaces) <= slot:
+            index = len(self._surfaces)
+            surface = _OverlaySurface(index)
+            surface.create()
+            self._surfaces.append(surface)
+            self.log.info("Overlay 窗口 #%d 已创建"
+                          "（NOACTIVATE|TRANSPARENT|TOOLWINDOW|TOPMOST）", index)
+        return self._surfaces[slot]
+
+    def _run(self):
+        try:
+            self._surface(0)                     # 先建好第一个，供 --check 用
+            self.available = True
+        except Exception as e:                   # noqa: BLE001
+            self.log.error("Overlay 窗口创建失败: %s", e)
+            if self._on_error:
+                self._on_error(e)
+            self._ready.set()
+            return
+        self._ready.set()
+
+        msg = wt.MSG()
+        try:
+            while not self._stop.is_set():
+                while user32.PeekMessageW(ctypes.byref(msg), None, 0, 0, 1):
+                    if msg.message == 0x0012:            # WM_QUIT
+                        self._stop.set()
+                        break
+                    user32.TranslateMessage(ctypes.byref(msg))
+                    user32.DispatchMessageW(ctypes.byref(msg))
+                self._pump_requests()
+                self._expire()
+                time.sleep(0.02)
+        finally:
+            for surface in self._surfaces:
+                surface.destroy()
+
+    def _expire(self):
+        """到点就把对应的槽位窗口收起来。"""
+        now = time.time()
+        for surface in self._surfaces:
+            if surface.hide_at and now >= surface.hide_at:
+                surface.hide()
+
+    # ---------------------------------------------------------------- 请求
+    def show(self, image: Image.Image, x: int, y: int, duration: float,
+             slot: int = 0):
+        """把一张图排到第 slot 个堆叠槽位显示。"""
+        item = (int(slot), image, int(x), int(y), float(duration))
+        try:
+            self._queue.put_nowait(item)
+        except queue.Full:
+            # 队列满了丢最旧的，保证最新一次命中一定显示得出来
+            try:
+                self._queue.get_nowait()
+                self._queue.put_nowait(item)
+            except queue.Empty:
+                pass
+
+    def _pump_requests(self):
+        while True:
+            try:
+                slot, image, x, y, duration = self._queue.get_nowait()
+            except queue.Empty:
+                return
+            except Exception as e:                           # noqa: BLE001
+                self.log.warning("Overlay 请求解析失败: %s", e)
+                return
+            try:
+                surface = self._surface(slot)
+                if surface is None:
+                    self.log.debug("超过堆叠上限，跳过第 %d 个通知栏", slot + 1)
+                    continue
+                surface.paint(image, x, y, duration)
+            except Exception as e:                           # noqa: BLE001
+                self.log.warning("Overlay 绘制失败: %s", e)
+
+    def hide(self):
+        """收起所有通知栏。"""
+        for surface in self._surfaces:
+            surface.hide()
 
     def close(self):
         self._stop.set()
@@ -792,7 +855,9 @@ class Notifier:
         hits: [(entry, score, source), ...]
         返回实际弹出的通知栏数量。
 
-        最多堆叠 MAX_NOTIFY_STACK 个；超出的部分只更新 DB 与 GUI，静默处理。
+        最多堆叠 MAX_NOTIFY_STACK 个。若命中数超过上限，**最后一个槽位会换成
+        一条汇总栏**把剩下的玩家名都列出来 —— 否则用户根本不知道还有谁被命中了
+        （之前的表现是"只播报了一个人，也不知道是哪一个"）。
         """
         if not hits:
             return 0
@@ -800,21 +865,52 @@ class Notifier:
         # 音效只播一次（无论弹几个通知栏）
         self._play_sound_once()
 
+        limit = max(1, int(MAX_NOTIFY_STACK))
+        overflow = len(hits) > limit
+        # 溢出时留一个槽位给汇总栏
+        show_count = (limit - 1) if overflow else min(len(hits), limit)
+        show_count = max(1, show_count) if hits else 0
+
         shown = 0
-        for i, item in enumerate(hits):
-            if i >= MAX_NOTIFY_STACK:
-                break
+        for i, item in enumerate(hits[:show_count]):
             entry, score, source = item[0], item[1], item[2]
             if self._show_overlay(entry, score, source,
                                   play_sound=False, stack_index=i):
                 shown += 1
 
-        if len(hits) > MAX_NOTIFY_STACK:
-            self.log.info("批量命中 %d 条，仅弹出前 %d 个通知栏（其余已计入 DB/GUI）",
-                          len(hits), MAX_NOTIFY_STACK)
+        if overflow and shown:
+            rest = hits[show_count:]
+            if self._show_summary(rest, hits[0][2], stack_index=shown):
+                shown += 1
+
+        if len(hits) > limit:
+            self.log.info("批量命中 %d 条，前 %d 个各弹一栏，其余汇总成 1 栏",
+                          len(hits), show_count)
         if shown:
             self.log.info("批量提示：%d 个通知栏，1 次音效", shown)
         return shown
+
+    def _show_summary(self, hits, source, stack_index: int) -> bool:
+        """把「没抢到独立通知栏」的命中合并成一条汇总栏。"""
+        if not hits:
+            return False
+        names = [str(h[0].get("player_name") or h[0].get("player_id") or "未知")
+                 for h in hits]
+        joined = "、".join(names)
+        if len(joined) > 48:                       # 太长就截断，正文会自动换行
+            joined = joined[:46] + "…"
+        best = max((float(h[1] or 0) for h in hits), default=0.0)
+        entry = {
+            # 名字放在 player_name 而不是 note：note 可能被用户在
+            # 通知设置里关掉（show_fields.note=False），player_name 永远会显示
+            "player_name": f"等 {len(hits)} 名：{joined}",
+            "player_id": "",
+            "note": "同一次扫描命中的其余黑名单玩家",
+            "tk_count": 0,
+            "last_seen": "",
+        }
+        return self._show_overlay(entry, best, source,
+                                  play_sound=False, stack_index=stack_index)
 
     def _play_sound_once(self):
         """播放一次提示音（独立线程，绝不阻塞调用方）。"""
@@ -846,7 +942,8 @@ class Notifier:
                 x, y = pos
                 duration = float((cfg.get("timing") or {}).get("duration", 4.0))
                 if self._overlay.available:
-                    self._overlay.show(img, x, y, duration)
+                    self._overlay.show(img, x, y, duration,
+                                       slot=stack_index)
                     shown = True
         except Exception as e:                           # noqa: BLE001
             self.log.warning("Overlay 提示失败: %s", e)

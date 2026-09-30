@@ -85,20 +85,26 @@ class ScreenCapture:
 
     # ---------------------------------------------------------------- 工具
     @staticmethod
-    def region_std(img) -> float:
-        """区域灰度标准差 —— 用于判断 ESC 菜单是否已经打开。
+    def region_stats(img) -> tuple:
+        """返回 (平均亮度, 灰度标准差)；算不出来时返回 (255.0, 0.0)。
 
-        菜单打开后左上角会出现大量文字/面板，画面复杂度显著上升。
+        用于判断 ESC 菜单是否已经打开：菜单打开时这块区域是「暗色面板 + 少量亮字」
+        （平均亮度低、但标准差不为 0），菜单没打开时是游戏画面（平均亮度高）。
+        只算一次 numpy，几十微秒。
         """
         if img is None:
-            return 0.0
+            return 255.0, 0.0
         try:
             import numpy as np
-            g = img.convert("L")
-            arr = np.asarray(g, dtype=np.float32)
-            return float(arr.std())
+            arr = np.asarray(img.convert("L"), dtype=np.float32)
+            return float(arr.mean()), float(arr.std())
         except Exception:                                    # noqa: BLE001
-            return 0.0
+            return 255.0, 0.0
+
+    @staticmethod
+    def region_std(img) -> float:
+        """区域灰度标准差（保留旧接口）。"""
+        return ScreenCapture.region_stats(img)[1]
 
     def close(self) -> None:
         self._closed = True

@@ -232,8 +232,22 @@ python main.py
 
 - 每 100 ms 轮询 `GetAsyncKeyState(VK_ESCAPE)`（**不使用键盘钩子**），只在上升沿触发，去抖 1 秒
 - 按下后：先终止旧会话 → 等 0.6 秒菜单动画 → 判断菜单 **是否真的打开了**
-  （区域灰度标准差 > 20）
-- 菜单打开 → 启动扫描会话；**菜单没打开就跳过**（避免频繁按 ESC 造成无意义扫描）
+- 菜单打开 → 启动扫描会话；判定成「游戏画面」就跳过（避免频繁按 ESC 造成无意义扫描）
+- 判不准时最多复查 3 次（间隔 0.35 秒，躲开菜单淡入动画）；**复查完仍判不准就按"已打开"处理**
+  —— 多扫一次最多浪费几帧低优先级 OCR，漏扫则等于功能失效
+
+**判定依据（这里修过一个把 ESC 扫描几乎废掉的 bug）：**
+
+早先只看「区域灰度标准差 > 20」，假设"菜单打开后画面更复杂"。实测真实截图后这个假设是错的：
+
+| 画面 | 平均亮度 | 灰度标准差 |
+|---|---|---|
+| ESC 菜单**开着**（玩家名清晰可见，7 张实测） | 10 ~ 36 | 9.6 ~ 23.3 |
+| ESC 菜单**没开**（游戏画面 / 别的窗口） | 140 | 93 |
+
+阈值 20 正好压在前者的中间 → 菜单明明开着也有一半概率被判成"没开"，**连扫描都不启动**。
+现在改成看 **平均亮度**（`ESC_MENU_MEAN_MAX = 90`：暗色面板 = 菜单开着），
+标准差只用来排除"纯黑一片、根本没有文字"的情况。
 
 ### 5.4 冷启动扫描
 
@@ -246,25 +260,33 @@ python main.py
 
 | 终止条件 | 参数 | 默认值 |
 |---|---|---|
-| 连续 N 次没有识别到有效结果 | `max_consecutive_empty` | 3 |
+| 连续 N 次没有识别到有效结果 | `max_consecutive_empty` | ESC 4 / 冷启动 3 |
 | 总时长超过上限 | `max_duration` | ESC 8 秒 / 冷启动 15 秒 |
-| 距离上一次「发现新名字」超过 X 秒 | `keep_alive_after_hit` | ESC 3 秒 / 冷启动 0 秒 |
+| 距离上一次「发现新名字」超过 X 秒 | `keep_alive_after_hit` | ESC 3.5 秒 / 冷启动 0 秒 |
 
 > 第 3 条对应验收项「ESC 打开玩家列表，会话持续到 **滚动结束后 3 秒** 终止」——
-> 只要你还在滚动列表看到新名字，会话就继续；停下 3 秒后自动收工。
+> 只要你还在滚动列表看到新名字，会话就继续；停下几秒后自动收工。
 >
 > **同一时刻最多只有一个活跃会话**：再次触发会先终止旧会话。
 
-### 5.6 批量命中 → 多个通知栏 + 只播一次音效
+### 5.6 批量命中 → 每个玩家一个通知栏 + 只播一次音效
 
 一次扫描同时命中多个黑名单玩家时：
 
-- 每个玩家 **各自一个通知栏**，垂直堆叠、互不遮挡
+- 每个玩家 **各自一个通知栏**（**每个通知栏一个独立的无焦点窗口**），垂直堆叠、互不遮挡
 - **音效只播一次**（不会 N 个玩家响 N 下）
 - 每个玩家的 `encounter_count` **各自 +1**，Treeview 里 **各自闪烁**
-- 堆叠上限 `MAX_NOTIFY_STACK = 5`：超出的命中仍然正常计数、正常刷新 GUI，
-  只是不再弹通知栏
+- 堆叠上限 `MAX_NOTIFY_STACK = 5`：超过上限时 **最后一个槽位换成汇总栏**，
+  把剩下的玩家名都列出来（例如 `等 3 名：Player5、Player6、Player7`），
+  保证"命中了谁"永远是看得见的
 - 做了屏幕上下沿保护：放不下的通知栏会被跳过，绝不会被推到屏幕外
+- 一次命中的**整批名单**会打进 `data/logs/app.log`（`[Hit] 本批共命中 N 名黑名单玩家：…`），方便事后核对
+
+> **这里修过一个真 bug**：所有通知栏原先共用 **一个** `WS_EX_LAYERED` 窗口，
+> 而 `UpdateLayeredWindow` 会把整个窗口重绘成新图并搬走它 —— 后画的把先画的整个盖掉，
+> 用户最终只看得见最后一条；音效又只响一次，于是现象就是
+> 「一次命中多个黑名单玩家，却只播报了一个人，还说不清是哪一个」。
+> 现在每个堆叠槽位一个窗口（`_OverlaySurface`），N 条就真的并排显示 N 栏。
 
 ---
 
@@ -544,46 +566,57 @@ JSON 格式错误 → 回退默认，不崩溃；删除文件后重启即恢复�
 
 ## 10. 数据文件与目录
 
+**仓库根目录就是 `source_code/`** —— GitHub 上能看到的一切（源码 / 测试 / 文档 / 许可证）
+全都在这个文件夹里；分发包在工作区上一层，不进仓库。
+
 ```
-Helldiver_black/                     ← 工作区根目录
-├── source_code/                     ← 源码（开发就在这里）
-│   ├── main.py                     入口（--check / --capture-debug / --preview-notification）
-│   ├── single_instance.py          单实例互斥（命名 Mutex，重复打开只会叫回已有窗口）
-│   ├── priority.py                 游戏友好优先级（进程 below_normal + 扫描线程 lowest）
-│   ├── config.py                   常量、路径解析、日志工厂、DPI 感知
-│   ├── theme.py                    暗色主题（配色 / ttk 样式 / 窗口与托盘图标）
-│   ├── region_config.py            区域配置（默认 + 用户自定义）
-│   ├── notification_config.py      提示配置（深合并，热重载）
-│   ├── hotkey_config.py            扫描热键配置（可自定义 + 按键名映射）
-│   ├── hotkey_dialog.py            快捷键设置对话框（按键捕获）
-│   ├── database.py                 SQLite（WAL，原子命中更新 + 导入导出）
-│   ├── process_watcher.py          WMI 事件订阅 + 轮询降级
-│   ├── screen_capture.py           mss 小区域截图（按线程缓存实例）
-│   ├── ocr_engine.py               RapidOCR 封装（懒加载 + 预处理）
-│   ├── matcher.py                  精确 + 模糊匹配（check / match_text）
-│   ├── notifier.py                 无焦点分层窗口 Overlay + 音效 + 批量堆叠
-│   ├── scan_session.py             扫描会话（三个终止条件）
-│   ├── chat_scanner.py             聊天框**按需**扫描（点按钮才跑，无循环无定时）
-│   ├── chat_hotkey.py              聊天框扫描热键（系统全局 RegisterHotKey + 轮询兜底）
-│   ├── esc_trigger.py              ESC 触发 + 菜单打开判定
-│   ├── scan_scheduler.py           调度中枢（命中去重 / 批量处理 / 会话 / 证据 / 日志）
-│   ├── gui.py                      主界面（Treeview + 三行工具栏 + 托盘 + 导入导出）
-│   ├── gui_notification.py         通知设置对话框
-│   ├── calibrator.py               区域校准器
-│   ├── build.py                    PyInstaller 打包脚本（产物输出到 ../v1/）
+Helldiver_black/                     ← 工作区（不是一个 git 仓库）
+│
+├── source_code/                     ← ★ 仓库根目录（git 仓库、源码、文档都在这）
+│   ├── .git/                        仓库本体
+│   ├── .gitignore  LICENSE  README.md
+│   ├── 使用说明.txt                  分发给用户看的说明（打包时复制进发布包）
+│   ├── main.py                      入口（--check / --capture-debug / --preview-notification）
+│   ├── single_instance.py           单实例互斥（命名 Mutex，重复打开只会叫回已有窗口）
+│   ├── priority.py                  游戏友好优先级（进程 below_normal + 扫描线程 lowest）
+│   ├── config.py                    常量、路径解析、日志工厂、DPI 感知
+│   ├── theme.py                     暗色主题（配色 / ttk 样式 / 窗口与托盘图标）
+│   ├── region_config.py             区域配置（默认 + 用户自定义 + 过小告警）
+│   ├── notification_config.py       提示配置（深合并，热重载）
+│   ├── hotkey_config.py             扫描热键配置（可自定义 + 按键名映射）
+│   ├── hotkey_dialog.py             快捷键设置对话框（按键捕获）
+│   ├── database.py                  SQLite（WAL，原子命中更新 + 导入导出）
+│   ├── process_watcher.py           WMI 事件订阅 + 轮询降级
+│   ├── screen_capture.py            mss 小区域截图（按线程缓存实例）
+│   ├── ocr_engine.py                RapidOCR 封装（懒加载 + 预处理）
+│   ├── matcher.py                   精确 / 易混字符 / 模糊 / 符号层 四层匹配
+│   ├── notifier.py                  无焦点分层窗口 Overlay（每栏一窗）+ 音效 + 批量堆叠
+│   ├── scan_session.py              扫描会话（三个终止条件）+ 玩家名过滤器
+│   ├── chat_scanner.py              聊天框**按需**扫描（点按钮才跑，无循环无定时）
+│   ├── chat_hotkey.py               聊天框扫描热键（系统全局 RegisterHotKey + 轮询兜底）
+│   ├── esc_trigger.py               ESC 触发 + 菜单打开判定
+│   ├── scan_scheduler.py            调度中枢（命中去重 / 批量处理 / 会话 / 证据 / 日志）
+│   ├── gui.py                       主界面（Treeview + 三行工具栏 + 托盘 + 导入导出）
+│   ├── gui_notification.py          通知设置对话框
+│   ├── calibrator.py                区域校准器
+│   ├── build.py                     PyInstaller 打包脚本（产物输出到 ../发布包/）
 │   ├── requirements.txt
-│   ├── tests/                      单元 / 集成 / GUI 测试（395 个用例）
-│   │   ├── test_core.py            配置 / 数据库 / 匹配 / 导入导出
-│   │   ├── test_pipeline.py        截图 / OCR / 会话 / 按需扫描 / 去重 / 批量 / ESC
-│   │   ├── test_notifier.py        模板 / 渲染 / 无焦点窗口 / 音效 / 堆叠 / 字号
-│   │   ├── test_gui.py             主界面 / 通知设置 / 校准器 / 导入导出 GUI
-│   │   ├── test_theme.py           配色 / ttk 样式 / 应用图标 / 对比度
-│   │   ├── test_hotkey.py          快捷键配置 / 组合键判定 / 按键捕获
-│   │   └── test_e2e.py             端到端装配与数据流
+│   ├── tests/                       单元 / 集成 / GUI 测试（491 个用例）
+│   │   ├── test_core.py             配置 / 数据库 / 匹配（含符号名与易混字符）/ 导入导出
+│   │   ├── test_pipeline.py         截图 / OCR / 会话 / 按需扫描 / 去重 / 批量 / ESC
+│   │   ├── test_notifier.py         模板 / 渲染 / 无焦点窗口池 / 音效 / 堆叠 / 字号
+│   │   ├── test_gui.py              主界面 / 通知设置 / 校准器 / 导入导出 GUI
+│   │   ├── test_theme.py            配色 / ttk 样式 / 应用图标 / 对比度
+│   │   ├── test_hotkey.py           快捷键配置 / 组合键判定 / 按键捕获 / 全局热键
+│   │   ├── test_single.py           单实例互斥 / 唤醒已有窗口
+│   │   ├── test_priority.py         进程与线程优先级
+│   │   └── test_e2e.py              端到端装配与数据流
 │   ├── tools/
-│   │   ├── ocr_probe.py            真实 OCR 验证脚本（渲染样图 → 识别 → 匹配）
-│   │   └── hotkey_probe.py         全局热键真机探测（注册 → 模拟按键 → 注销）
-│   └── data/
+│   │   ├── ocr_probe.py             真实 OCR 验证脚本（渲染样图 → 识别 → 匹配）
+│   │   ├── perf_probe.py            抓屏 / OCR 的 CPU 与墙钟成本实测
+│   │   ├── hotkey_probe.py          全局热键真机探测（注册 → 模拟按键 → 注销）
+│   │   └── diagnose_ocr.py          拿真实证据截图复盘 OCR 识别效果
+│   └── data/                        ⚠ 运行期数据（git 忽略，别删）
 │       ├── blacklist.db            SQLite 数据库
 │       ├── user_config.json        区域配置
 │       ├── notification.json       提示配置
@@ -595,18 +628,24 @@ Helldiver_black/                     ← 工作区根目录
 │       ├── evidence/               命中证据截图（自动清理，默认保留 500 张）
 │       └── logs/app.log            运行日志（轮转，单文件上限 2 MB）
 │
-├── v1/                              ← 打包产物（两种形式，选一个用）
-│   ├── HD2Blacklist/                文件夹版，启动约 1 秒（推荐）
-│   ├── HD2Blacklist.exe             单文件版，便携但启动慢
-│   ├── data/                        单文件版的运行时数据目录
-│   └── 使用说明.txt
+├── 发布包/                           ← 打包 / 分发产物（不在仓库里）
+│   ├── HD2Blacklist/                文件夹版产物（build.py 输出，含 data/）
+│   ├── 解压版/HD2Blacklist/         发布压缩包解开后的样子（实测用）
+│   ├── HD2Blacklist-v1.0.0-win64.rar  发给别人的压缩包
+│   └── 使用说明.txt / LICENSE.txt    build.py 自动从仓库复制过来
 │
-├── resource/                        ← 你自己的素材（图片 / 音频），不会被改动
-└── .gitignore
+├── _packaged_data_backup/           ⚠ 历次打包前的用户数据备份（别删）
+└── .idea/                           IDE 配置
 ```
 
 > 已删除（改造后不再存在）：`chat_monitor.py`、`keyword_config.py`、
 > `data/keywords.json`。源码里也没有任何残留引用（有测试专门守着）。
+
+**可安全删除**（都会自动重建）：`source_code/build/`、`source_code/.test_tmp/`、
+`source_code/.piptmp/`、任意 `__pycache__/`。
+
+**绝不能删**：`source_code/data/`、`发布包/*/data/`、`_packaged_data_backup/`、
+`source_code/.pylibs/`、`source_code/.devtools/`、`source_code/使用说明.txt`。
 
 所有 `data/*.json` 都支持 **手动编辑或直接删除恢复默认**，改动 **无需重启**。
 
@@ -673,12 +712,23 @@ python main.py --debug
 
 **坐标或识别效果不确定时，先跑 `--capture-debug`，打开 PNG 人工确认，再继续调整。**
 
+`--check` 会逐项报告，其中这几项与本轮修复直接相关：
+
+| 自检项 | 检查什么 |
+|---|---|
+| 监视区域尺寸 | 三个区域是否小到不可能有内容（例如被误框成 10×13 像素）→ 直接 FAIL 并说明建议尺寸 |
+| 全符号玩家名 | 黑名单里的 `?` / `？` 能否被索引、命中、并通过 OCR 名字过滤器 |
+| 游戏友好优先级 / 扫描节流 | 当前的掉帧保护设置 |
+
 日志：`data/logs/app.log` —— 所有会话的开始/结束（含终止原因与耗时）、
-每次命中（玩家、分数、来源、累计次数）、所有异常都会写入。
+每次命中（玩家、分数、来源、累计次数）、**一次命中多个玩家时的整批名单**
+（`[Hit] 本批共命中 N 名黑名单玩家：…`）、所有异常都会写入。
 
 ---
 
 ## 13. 打包成 exe
+
+在**仓库根目录**（= `source_code/`）执行：
 
 ```bat
 python build.py --clean              :: 文件夹版（推荐：启动约 1 秒）
@@ -686,20 +736,29 @@ python build.py --clean --onefile    :: 单文件版（便携，启动要解压 
 python build.py --console            :: 保留控制台，排查问题用
 ```
 
-产物输出到源码目录上一级的 `v1/`，并自动在 exe 旁边放一份 `data/` 种子目录：
+产物写到**上一层的 `发布包/`**，并自动在 exe 旁边放好 `data/` 种子目录、
+`使用说明.txt` 和 `LICENSE.txt`。`发布包/` 同时也是**所有对外分发东西的集中地**：
 
 ```
-v1/
-├── HD2Blacklist/            文件夹版（288 MB，启动 ~1s）
+发布包/                                   ← 一切"给别人用"的东西都在这里（不进仓库）
+├── HD2Blacklist/                        文件夹版产物（build.py 输出，292 MB，启动 ~1s）
 │   ├── HD2Blacklist.exe
 │   ├── _internal/
-│   └── data/
-├── HD2Blacklist.exe         单文件版（120 MB，启动 ~10s）
-├── data/
-└── 使用说明.txt
+│   ├── data/                            ← 用户真实数据长在这里
+│   ├── 使用说明.txt                      ← build.py 自动复制
+│   └── LICENSE.txt                      ← build.py 自动复制
+├── 解压版/HD2Blacklist/                 发布压缩包解开后的样子（自己实测用）
+│   └── （内容同上：exe + _internal + data + 两个文档）
+├── HD2Blacklist.exe                     单文件版（120 MB，启动 ~10s，可选）
+├── HD2Blacklist-v1.0.0-win64.rar        发布压缩包（发给别人用这个）
+└── 使用说明.txt / LICENSE.txt            顶层再放一份，翻目录时一眼可见
 ```
 
-> `--clean` **只清理本次要产出的那一份**，不会把另一种打包形式一起删掉。
+> `--clean` **只清理本次要产出的那一份**（外加 `build/` 构建缓存），
+> 不会动 `发布包/` 里的解压版、发布压缩包和说明书 —— 那里是手工维护的分发区。
+> 文件夹版的 `data/` 在清理前会先搬出来、构建完再搬回去，用户数据不会丢。
+> `使用说明.txt` 与 `LICENSE` 的**源文件在仓库根目录**，打包时复制一份到产物旁边，
+> 所以「GitHub 内容全在 source_code/ 里」和「分发包自带说明书与许可证」同时成立。
 
 #### 体积优化（重要）
 
@@ -726,7 +785,7 @@ PyInstaller 会顺着它把**整个 torch** 拖进包里 —— 实测多出约 
 | 单文件版 | 299 MB | **120 MB** |
 
 > `config.py` 以 **exe 所在目录** 作为根目录，所以 `data/` 必须和 exe 同目录。
-> onedir 模式下就是 `dist/HD2Blacklist/data/`。
+> onedir 模式下就是 `发布包/HD2Blacklist/data/`。
 
 #### 拷到别人电脑上能跑吗
 
@@ -804,23 +863,36 @@ PyInstaller 会顺着它把**整个 torch** 拖进包里 —— 实测多出约 
    └──────────────┘          └────────────────────┘
 ```
 
-### 匹配策略（先精确，再模糊）
+### 匹配策略（先精确，再易混，再模糊，最后符号层）
 
 1. **整段包含检查**：把整段文本归一化后，检查黑名单名字是否为子串 → 100 分
    （覆盖多词玩家名被标点切散的情况）
 2. **分词 + 相邻 2/3 词组合** → 归一化后完全相等 → **100 分**
-3. 否则用 `rapidfuzz.ratio` 比对，**≥ 85** 才返回
+3. **OCR 易混字符容错** → 把 `0↔O`、`1↔l↔I`、`5↔S`、`8↔B`、`2↔Z`、`4↔A`
+   折叠到同一个字符后完全相等 → **100 分**（仅当该折叠键在黑名单中**唯一**时才生效）
+4. 否则用 `rapidfuzz.ratio` 比对，**≥ 85** 才返回
+5. **符号层**：名字**整条就是符号**（例如玩家名就是一个 `?`）时，
+   只按「整段相等 / 某个片段就是该符号串」匹配 → 100 分
 
 关键细节：
 
-- 归一化：转小写、去掉所有非字母数字字符（下划线也算无意义字符），
+- 归一化：`NFKC` 折叠（全角 `？` → 半角 `?`、全角字母数字 → 半角）→ 转小写 →
+  去掉所有非字母数字字符（下划线也算无意义字符），
   因此 `Player_X` 与聊天框里的 `PlayerX` 能精确命中
-- **精确永远优先于模糊**：所有候选先整体跑一遍精确匹配，再跑模糊匹配。
+- **精确永远优先于模糊**：所有候选先整体跑一遍精确 / 易混匹配，再跑模糊匹配。
   否则「较短的候选先被模糊命中」会抢走本该属于「较长候选精确命中」的玩家
+- **全符号名字**单独索引（`Matcher.symbols`）：老实现下 `?` 会被归一化成空串、
+  在 `reload()` 里被整个丢掉，这类名字永远匹配不上。
+  为了不误报，符号层要求**整段符号串相等** —— 聊天里打 `???` 或 `?!` 不会命中 `?`
 - **OCR 拆行自动拼接**：OCR 常把 `SamplePlayer_01` 识别成 `SamplePlayer` + `01`
   两个文本框。`scan_session.group_into_lines()` 按 **纵向重叠 + 横向间距**
   把同一行的碎片拼回完整名字（玩家列表路径），`Matcher.check / match_text`
   也会尝试相邻 2/3 项的拼接作为兜底
+- **UI 噪声过滤**：`小队` / `社交` / `185级|功勋英雄` 这类菜单文字不算玩家名。
+  名字和等级被 OCR 拼成一行（`PlayerX185级|功勋英雄`）时，会砍掉等级段保留 `PlayerX`
+- **黑名单白名单反哺 OCR 过滤**：`Matcher.name_allowlist()` 交给
+  `scan_session.is_valid_player_name()` —— 只要黑名单里真有这个名字，
+  哪怕它"不像名字"也放行
 - 同一次匹配中同一玩家 **只返回一次**（按条目 ID 去重）
 - 返回命中时匹配到的 **原文子串**，用于证据与日志
 
@@ -916,6 +988,27 @@ PyInstaller 会顺着它把**整个 torch** 拖进包里 —— 实测多出约 
    确认框选区域是否真的覆盖了文字
 2. 在 **[校准区域]** 里重新框选，**只框文字本身**，不要框进大片背景
 3. OCR 对小字号、低对比度文字识别率会下降；HUD 缩小倍率太高时可适当放大游戏 UI
+4. 跑 `python main.py --check` 看 **「监视区域尺寸」** —— 区域被框得太小
+   （例如单击一下留下的 10×13 像素）是永远识别不到东西的，自检会直接点名
+5. 姓名被 OCR 认错个别字符（`0`↔`O`、`1`↔`l`/`I`、`5`↔`S`、`8`↔`B`、`2`↔`Z`、`4`↔`A`）
+   时由 **易混字符容错层** 兜住，仍然按 100 分命中；只有该折叠键在黑名单里**唯一**时才启用
+
+**Q：ESC 菜单里明明有玩家名，却什么都没检出？**
+早先的「菜单是否打开」判定用灰度标准差 > 20，而真实菜单截图的标准差是 9.6~23.3
+—— 阈值正好压在中间，一半概率直接判定"菜单没开"、**根本不扫描**。现在改成看
+**平均亮度**（暗色面板 = 菜单开着），判不准还会复查 3 次、最后宁可按开着处理。
+升级到本版本即可，不需要改配置。
+
+**Q：玩家名就是一个问号 `？` / `?`，怎么不响应？**
+以前这类「全符号名字」在两条路上都会被丢掉：归一化会把它变成空串（索引时直接跳过），
+OCR 判读又会认为它"不含字母数字"而不像玩家名。现在：
+
+- 黑名单里存 `?` 或 `？` 都行（全角半角等价，`NFKC` 折叠）；
+- 走独立的 **符号层**，**只按整体相等**匹配 —— 所以聊天里打 "???" 或 "?!"
+  不会误报，只有整个名字/整个片段就是 `?` 时才命中；
+- OCR 判读过滤器带 **黑名单白名单**：只要黑名单里真有这个名字，再"不像名字"也放行。
+
+自检里的 **「全符号玩家名」** 一项会验证这条链路（`python main.py --check`）。
 
 **Q：误报太多？**
 - 提高匹配阈值：`config.py` 里的 `MATCH_THRESHOLD`（默认 85）- 尽量录入 **完整玩家名**，太短的名字（2-3 个字母）容易模糊命中
@@ -941,9 +1034,12 @@ PyInstaller 会顺着它把**整个 torch** 拖进包里 —— 实测多出约 
 若被其它程序占用（例如录屏/外设驱动也用了 F8），换个键或关掉那个程序即可；
 ③ 运行 `python tools/hotkey_probe.py` 做真机探测（会临时独占该键几秒后注销）。
 
-**Q：一次命中好几个玩家，提示音只响了一声？**
-这是设计如此：每个玩家一个通知栏，但 **音效只播一次**，避免连响干扰。
-超过 5 个时只弹前 5 个通知栏，其余照常计数。
+**Q：一次命中好几个玩家，只看见一个通知栏？**
+升级到本版本即可。曾经所有通知栏共用 **一个** 分层窗口，而 `UpdateLayeredWindow`
+会重绘整个窗口并移动它 —— 后画的把先画的整个盖掉，只看得见最后一条。
+现在每个堆叠槽位一个独立窗口，N 个玩家并排显示 N 栏，音效仍然只播一次，
+超过 5 个时最后一个是汇总栏（`等 N 名：A、B、C`）。
+完整名单也会写进 `data/logs/app.log`。
 
 **Q：导入会不会覆盖我现在的数据？**
 取决于你选的策略：默认 **跳过**（什么都不覆盖）；
@@ -1001,9 +1097,25 @@ PyInstaller 会顺着它把**整个 torch** 拖进包里 —— 实测多出约 
 | 连点扫描按钮，30 秒内同一批玩家全部去重跳过 | `_is_recently_hit` | `test_repeated_clicks_are_deduped` |
 | 30 秒后同一玩家再次命中可正常计数 + 弹提示 | 窗口过期即放行 | `test_dedup_expires` |
 | `app.log` 中有 `[Hit] 去重跳过 entry_id=X source=Y` | `_process_hits` | `test_dedup_skip_is_logged` |
-| 堆叠上限 5，超出静默 | `MAX_NOTIFY_STACK` | `test_max_stack_limit` |
+| 堆叠上限 5，超出的命中汇总成一栏列出剩余玩家 | `MAX_NOTIFY_STACK` + `alert_batch` 的汇总栏 | `test_max_stack_limit`、`test_overflow_is_summarised_in_the_last_slot` |
 | 屏幕下沿保护 | `_stacked_position` 返回 `None` 跳过 | `test_offscreen_stack_is_skipped` |
 | 不重写项目 / 不改无焦点样式 / 不改线程安全机制 | 分层窗口 4 样式仍由自检校验；GUI 仍只用两个 `queue.Queue` | `--check` + 全部 GUI 测试 |
+
+### 第四轮修复（实机反馈：ESC 漏检 / 符号名字 / 多命中只播一个）
+
+| 验收项 | 实现 | 测试 |
+|---|---|---|
+| **ESC 菜单开着也被判成"没打开"→ 根本不扫描** | 判定从「灰度标准差 > 20」改为 **平均亮度**（暗色面板 = 菜单开着）：`ESC_MENU_MEAN_MAX = 90`；标准差只用来排除纯黑画面。真实截图实测：菜单开着 mean 10~36 / std 9.6~23.3，菜单没开 mean 140 / std 93 —— 旧阈值正压在中间 | `test_menu_open_with_low_std_still_scans`、`test_menu_closed_skips`、`test_judge_menu_states` |
+| 菜单淡入期判不准 → 复查后再决定 | 最多复查 `ESC_MENU_CHECK_RETRY = 3` 次、间隔 0.35 s；**复查完仍判不准就按"已打开"处理**（多扫一次 << 漏扫） | `test_unknown_state_retries_then_scans` |
+| ESC 会话过早收工 | `max_consecutive_empty` 3→4、`keep_alive_after_hit` 3.0→3.5 | `test_esc_session_params` |
+| **玩家名就是一个问号 `?` / `？` 时不响应** | ① `Matcher.reload()` 把「全符号名字」单独索引到 `symbols`（旧实现归一化成空串后整个丢弃）；② 符号层**只按整体相等**匹配；③ `is_valid_player_name` 接受黑名单白名单，`?` 能过 OCR 过滤器；④ `NFKC` 折叠让全角 `？` 与半角 `?` 等价 | `test_symbol_only_entry_is_indexed`、`test_check_matches_symbol_name`、`test_fullwidth_question_mark_matches_halfwidth_entry`、`test_symbol_name_needs_allowlist`、`--check` 的「全符号玩家名」 |
+| 符号名字不误报（聊天里的问号不触发） | `symbol_keys_in()` 要求**整段符号串相等**：`???` / `?!` 不会命中 `?` | `test_longer_symbol_runs_do_not_false_positive` |
+| OCR 认错字符（`0`↔`O`、`1`↔`l`/`I` …）导致漏检 | 易混字符折叠层（`MATCH_FUZZY_CONFUSABLE`），仅当折叠键在黑名单中**唯一**时生效 | `test_digit_letter_confusion_matches`、`test_ambiguous_confusion_is_refused`、`test_confusion_in_chat_text` |
+| 菜单 UI 文本被当成玩家名（`185级\|功勋英雄`、`小队`） | `is_valid_player_name` 增加等级/头衔行正则与分栏标题词表；名字与等级被拼成一行时砍掉等级段保留名字 | `test_level_line_rejected`、`test_menu_headers_rejected`、`test_merged_name_plus_level_keeps_name_only`、`test_ui_noise_does_not_reach_matcher` |
+| **一次命中多个玩家却只播报一个（且看不出是谁）** | 每个堆叠槽位一个独立 `WS_EX_LAYERED` 窗口（`_OverlaySurface`）。原先共用一个窗口，而 `UpdateLayeredWindow` 会重绘整个窗口并搬走它 → 后画的把先画的整个盖掉 | `test_each_stack_slot_gets_its_own_window`（真建 3 个窗口）/ `test_slot_beyond_limit_is_not_created` |
+| 超过堆叠上限时"还有谁"仍可见 | 最后一栏换成汇总栏：`等 N 名：A、B、C`（放 `player_name`，不会因用户关掉备注字段而消失） | `test_overflow_is_summarised_in_the_last_slot`、`test_no_summary_when_everything_fits` |
+| 事后能核对"这一批到底命中了谁" | `[Hit] 本批共命中 N 名黑名单玩家：…` 一次打进 `app.log` | `test_batch_hit_names_are_logged` |
+| 区域被误框成极小尺寸（永远识别不到东西） | `region_config.region_warnings()`：启动时写 WARNING 日志，`--check` 里独立成一项并给出建议尺寸 | `test_region_size_warning`、`--check` 的「监视区域尺寸」 |
 
 ### 第三轮修复（实机反馈）
 
@@ -1131,7 +1243,7 @@ PyInstaller 会顺着它把**整个 torch** 拖进包里 —— 实测多出约 
 ## 18. 测试
 
 ```bat
-:: 全部（395 个用例）
+:: 全部（491 个用例）
 python -m unittest discover -s tests -v
 
 :: 分类
@@ -1150,6 +1262,9 @@ python tools/ocr_probe.py
 
 :: 全局热键真机验证（注册 F8 → SendInput 模拟按键 → 注销）
 python tools/hotkey_probe.py
+
+:: 拿真实证据截图复盘 OCR 效果（原始碎片 / 合并后名字 / 被丢掉的碎片）
+python tools/diagnose_ocr.py 10          :: 只看最近 10 张
 ```
 
 测试使用 **假的截图器与假的 OCR**，不需要游戏、不需要真实屏幕内容，

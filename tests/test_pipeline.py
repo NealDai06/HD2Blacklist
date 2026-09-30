@@ -41,9 +41,10 @@ TMP_ROOT = os.path.join(_ROOT, ".test_tmp")
 # 测试替身
 # ==========================================================================
 class FakeCapture:
-    def __init__(self, images=None, std=0.0):
+    def __init__(self, images=None, std=0.0, mean=20.0):
         self.images = list(images or [])
         self.std = std
+        self.mean = mean
         self.grab_calls = 0
         self.default = Image.new("RGB", (40, 20), (10, 10, 10))
 
@@ -52,6 +53,14 @@ class FakeCapture:
         if self.images:
             return self.images.pop(0)
         return self.default
+
+    def region_stats(self, img):
+        """(平均亮度, 灰度标准差) —— ESC 菜单判定用。
+
+        默认 mean=20（暗色面板）→ 判定为「菜单已打开」，与旧测试的
+        `std=50.0` 语义一致。
+        """
+        return float(self.mean), float(self.std)
 
     def region_std(self, img):
         return self.std
@@ -182,6 +191,74 @@ class TestPlayerNameFilter(unittest.TestCase):
         self.assertEqual(evaluate_scan(None), [])
         self.assertEqual(evaluate_scan([("x",)]), [])
         self.assertEqual(evaluate_scan([("PlayerX", None)]), [])
+
+
+class TestPlayerNameFilterExtra(TempCase):
+    """本轮补充：符号名字白名单 + ESC 菜单 UI 噪声过滤。
+
+    真实截图里 OCR 会稳定输出这两种噪声，之前都会被当成"玩家名"送进匹配器：
+        "185级|功勋英雄"  —— 紧跟在玩家名下面的等级/头衔行
+        "小队" / "社交" / "游戏" —— 分栏标题
+    """
+
+    def test_symbol_name_needs_allowlist(self):
+        # 没有白名单时，`?` 不像名字 → 丢掉
+        self.assertFalse(is_valid_player_name("?"))
+        self.assertFalse(is_valid_player_name("？"))
+        # 黑名单里真的有 `?` 时必须放行，否则永远匹配不上
+        self.assertTrue(is_valid_player_name("?", {"?"}))
+        self.assertTrue(is_valid_player_name("？", {"?"}))     # NFKC 折叠
+
+    def test_allowlist_does_not_leak_other_symbols(self):
+        self.assertFalse(is_valid_player_name("???", {"?"}))
+        self.assertFalse(is_valid_player_name("★", {"?"}))
+
+    def test_level_line_rejected(self):
+        for n in ("185级|功勋英雄", "42级", "Lv.42", "等级 30"):
+            self.assertFalse(is_valid_player_name(n), n)
+
+    def test_menu_headers_rejected(self):
+        for n in ("小队", "社交", "游戏", "最近玩家", "军需官"):
+            self.assertFalse(is_valid_player_name(n), n)
+
+    def test_merged_name_plus_level_keeps_name_only(self):
+        """OCR 把名字和等级拼成一行时，要救回名字、丢掉等级段。"""
+        boxes = [("PlayerX185级|功勋英雄", 0.96, (100, 100, 400, 140))]
+        self.assertEqual(group_into_lines(boxes), ["PlayerX"])
+        boxes = [("PlayerX 185级|功勋英雄", 0.96, (100, 100, 400, 140))]
+        self.assertEqual(group_into_lines(boxes), ["PlayerX"])
+
+    def test_pure_level_line_yields_nothing(self):
+        boxes = [("185级|功勋英雄", 0.96, (100, 100, 400, 140))]
+        self.assertEqual(group_into_lines(boxes), [])
+        boxes = [("小队", 0.99, (0, 0, 100, 40)),
+                 ("PlayerX", 0.98, (100, 60, 200, 100))]
+        self.assertEqual(group_into_lines(boxes), ["PlayerX"])
+
+    def test_symbol_name_survives_box_grouping_with_allowlist(self):
+        boxes = [("?", 0.90, (100, 100, 130, 140)),
+                 ("PlayerX", 0.98, (100, 160, 230, 200))]
+        self.assertEqual(group_into_lines(boxes), ["PlayerX"])
+        self.assertEqual(group_into_lines(boxes, allowlist={"?"}), ["?", "PlayerX"])
+
+    def test_ui_noise_does_not_reach_matcher(self):
+        """回归：一整屏真实 ESC 菜单文本里只应留下玩家名。"""
+        db = BlacklistDB(self.path("bl.db"))
+        try:
+            db.add("-", "?")
+            db.add("id1", "PlayerX")
+            m = Matcher(db)
+            boxes = [("小队", 0.99, (11, 12, 149, 92)),
+                     ("?", 0.90, (236, 120, 260, 174)),
+                     ("185级|功勋英雄", 0.96, (236, 193, 576, 242)),
+                     ("PlayerX", 0.98, (236, 270, 383, 324))]
+            names = group_into_lines(boxes, allowlist=m.name_allowlist())
+            self.assertEqual(set(names), {"?", "PlayerX"})
+            hits = m.check(names)
+            self.assertEqual({h[0]["player_name"] for h in hits},
+                             {"?", "PlayerX"})
+        finally:
+            db.close()
 
 
 class TestBoxLineGrouping(TempCase):
@@ -981,6 +1058,36 @@ class TestChatScanner(TempCase):
         self.assertEqual(len(notifier.batches), 1)
         self.assertEqual(len(notifier.batches[0]), 1)
 
+    def test_batch_hit_names_are_logged(self):
+        """一次命中多个玩家时，整批名字要写进日志。
+
+        没有这条，用户只能看到逐条 [Hit] 行，很难确认"到底命中了谁、
+        是不是只播了一个"。
+        """
+        notifier = FakeNotifier()
+        ocr = FakeOCR()
+        ocr.default = [("Alpha joined", 0.99), ("Bravo joined", 0.99)]
+        sc, sched, db = self._scanner(
+            ocr=ocr, notifier=notifier,
+            entries=(("a", "Alpha"), ("b", "Bravo")))
+        lines = []
+        sched.log = lines.append
+        sc.scan_now()
+        joined = "\n".join(str(x) for x in lines)
+        self.assertIn("本批共命中 2 名黑名单玩家", joined)
+        self.assertIn("Alpha", joined)
+        self.assertIn("Bravo", joined)
+
+    def test_single_hit_is_not_logged_as_batch(self):
+        notifier = FakeNotifier()
+        ocr = FakeOCR()
+        ocr.default = [("PlayerX", 0.99)]
+        sc, sched, db = self._scanner(ocr=ocr, notifier=notifier)
+        lines = []
+        sched.log = lines.append
+        sc.scan_now()
+        self.assertNotIn("本批共命中", "\n".join(str(x) for x in lines))
+
     def test_on_result_callback(self):
         seen = []
         ocr = FakeOCR()
@@ -1034,7 +1141,8 @@ class TestEscTrigger(TempCase):
         self.assertEqual(t.trigger_count, 1)
 
     def test_menu_open_starts_session(self):
-        cap = FakeCapture(std=50.0)
+        # 真实 ESC 菜单截图：暗色面板 + 文字 → 平均亮度 10~36，标准差 9~23
+        cap = FakeCapture(std=21.0, mean=30.0)
         t = EscTrigger(self.sched, cap, FakeOCR())
         t._on_press()
         time.sleep(0.1)
@@ -1043,13 +1151,50 @@ class TestEscTrigger(TempCase):
         self.assertEqual(self.sched.started[0][1], "esc_menu")
         self.assertEqual(self.sched.stopped, 1)      # 先停旧会话
 
+    def test_menu_open_with_low_std_still_scans(self):
+        """回归：真实菜单截图的灰度标准差可以低到 9.6。
+
+        老实现用「标准差 > 20」判定菜单是否打开，阈值正好压在这批真实样本
+        中间，导致菜单明明开着也被判成"没开"→ 根本不扫描。现在看平均亮度。
+        """
+        cap = FakeCapture(std=9.6, mean=10.0)
+        t = EscTrigger(self.sched, cap, FakeOCR())
+        t._on_press()
+        time.sleep(0.1)
+        self.assertEqual(len(self.sched.started), 1)
+        self.assertEqual(t.skip_count, 0)
+
     def test_menu_closed_skips(self):
-        cap = FakeCapture(std=5.0)
+        # 菜单没打开时同一区域是游戏画面：平均亮度高（实测 140）、细节多
+        cap = FakeCapture(std=93.0, mean=140.0)
         t = EscTrigger(self.sched, cap, FakeOCR())
         t._on_press()
         time.sleep(0.1)
         self.assertEqual(self.sched.started, [])
         self.assertEqual(t.skip_count, 1)
+
+    def test_unknown_state_retries_then_scans(self):
+        """判定不出来时宁可按「已打开」处理，绝不漏扫。"""
+        cap = FakeCapture(std=0.0, mean=200.0)       # 亮但没细节 → unknown
+        t = EscTrigger(self.sched, cap, FakeOCR())
+        t._on_press()
+        time.sleep(0.2 + esc_mod.ESC_MENU_CHECK_RETRY * esc_mod.ESC_MENU_DELAY
+                   + esc_mod.ESC_MENU_RETRY_DELAY * esc_mod.ESC_MENU_CHECK_RETRY)
+        self.assertEqual(len(self.sched.started), 1)
+
+    def test_judge_menu_states(self):
+        self.assertEqual(esc_mod.judge_menu(30.0, 21.0), esc_mod.STATE_OPEN)
+        self.assertEqual(esc_mod.judge_menu(10.0, 9.6), esc_mod.STATE_OPEN)
+        self.assertEqual(esc_mod.judge_menu(140.0, 93.0), esc_mod.STATE_CLOSED)
+        self.assertEqual(esc_mod.judge_menu(30.0, 0.0), esc_mod.STATE_UNKNOWN)
+        self.assertEqual(esc_mod.judge_menu(100.0, 5.0), esc_mod.STATE_UNKNOWN)
+
+    def test_esc_session_params(self):
+        """ESC 会话参数：宁可多扫一会儿，也别在菜单刚开/还在滚动时收工。"""
+        self.assertGreaterEqual(ESC_SESSION["max_consecutive_empty"], 4)
+        self.assertGreaterEqual(ESC_SESSION["keep_alive_after_hit"], 3.0)
+        self.assertGreater(ESC_SESSION["max_duration"], 0)
+        self.assertGreater(ESC_SESSION["interval"], 0)
 
     def test_rising_edge_only(self):
         state = {"v": 0}

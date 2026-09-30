@@ -145,15 +145,18 @@ class OCREngine:
         """
         return [(t, c) for t, c, _ in self.recognize_boxes(img)]
 
-    def recognize_lines(self, img: Image.Image) -> list:
+    def recognize_lines(self, img: Image.Image, allowlist=None) -> list:
         """识别并把「同一行的碎片」拼回完整名字，返回有效玩家名列表。
 
         OCR 经常把 "SamplePlayer_01" 拆成 "SamplePlayer" + "01" 两个框；
         单纯逐框过滤会把名字打散。这里按纵向重叠 + 横向间距把碎片并回一行，
         再交给 is_valid_player_name 过滤。
+
+        allowlist 是「黑名单里确实存在的名字」白名单 —— 让 `?` 这种
+        天生不像名字的名字也能通过过滤器（见 scan_session.is_valid_player_name）。
         """
         from scan_session import evaluate_boxes
-        return evaluate_boxes(self.recognize_boxes(img))
+        return evaluate_boxes(self.recognize_boxes(img), allowlist=allowlist)
 
     def _parse(self, out) -> list:
         """兼容旧接口：只返回 (text, confidence)。"""

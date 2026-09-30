@@ -1,6 +1,10 @@
 # ==========================================================================
 #  HD2 黑名单 —— 哪些东西不进仓库
 #  原则：源码 / 文档 / 测试进仓库；运行期数据、构建产物、个人素材一律不进
+#
+#  ⚠ 本文件就是**仓库根目录**（= source_code/）下的 .gitignore，
+#    下面所有路径都相对仓库根，不带 source_code/ 前缀。
+#    分发包（发布包/）在工作区上一层，不在仓库里。
 # ==========================================================================
 
 # ---- 编辑器 / 虚拟环境 ----
@@ -18,26 +22,21 @@ __pycache__/
 
 # ---- 本地依赖 ----
 # （沙箱环境无法写 site-packages，只能装到项目里，绝不能提交）
-source_code/.pylibs/
-source_code/.devtools/
-source_code/.piptmp/
-source_code/.piptmp2/
-source_code/.test_tmp/
+.pylibs/
+.devtools/
+.piptmp/
+.piptmp2/
+.test_tmp/
 
 # ---- 构建产物（用 python build.py 重新生成）----
-source_code/build/
-v1/*
-# 说明文档不是产物，保留进仓库
-!v1/使用说明.txt
+build/
 
 # ---- 运行期数据（首次启动会自动重建）----
 # ⚠️ 这里含**个人数据**，公开前务必确认没被加进来：
 #    · blacklist.db       你记录的玩家名单（涉及第三方个人信息）
 #    · evidence/*.jpg     游戏截图（含玩家名）
 #    · notification.json  自定义通知图 / 音效（可能是他人版权作品）
-source_code/data/
-_packaged_data_backup/
-resource/
+data/
 
 # ---- 本地临时验证目录（可移植性/克隆测试用，随手就删）----
 _clone_test/

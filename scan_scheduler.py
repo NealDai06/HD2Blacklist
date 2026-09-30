@@ -228,6 +228,15 @@ class ScanScheduler:
         if not updated_list:
             return []
 
+        # 一次扫描命中多个玩家时，把**整批名字**打在一行里。
+        # 之前只有逐条日志，用户很难确认"到底命中了谁、是不是只播了一个"。
+        if len(updated_list) > 1:
+            names = "、".join(
+                str(e.get("player_name") or e.get("player_id") or "?")
+                for e, _s, _u in updated_list
+            )
+            self.log(f"[Hit] 本批共命中 {len(updated_list)} 名黑名单玩家：{names}")
+
         # ---- 4. 合并通知：多个通知栏 + 一次音效 ----
         try:
             self.notifier.alert_batch(

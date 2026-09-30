@@ -15,6 +15,36 @@ from config import DEFAULT_REGIONS, REGION_META, REGION_MIN_SIZE, USER_CONFIG_PA
 
 _REGION_FIELDS = ("left", "top", "width", "height")
 
+#: 各区域「至少得多大才可能装得下内容」的经验下限（像素）。
+#: 低于这个尺寸几乎肯定是校准的时候点歪了（单击一下会留下一个几像素的小框），
+#: 那样扫描永远识别不到任何东西 —— 必须主动提醒用户，而不是静默失败。
+REGION_USABLE_MIN = {
+    "chat_event": (150, 40),
+    "player_list_hud": (80, 30),
+    "menu_player_list": (150, 80),
+}
+
+
+def region_warnings(regions: dict) -> list:
+    """检查区域是否小到不可能有内容，返回人类可读的告警列表。"""
+    out = []
+    for key, (min_w, min_h) in REGION_USABLE_MIN.items():
+        region = (regions or {}).get(key)
+        if not region:
+            continue
+        try:
+            w = int(region.get("width", 0))
+            h = int(region.get("height", 0))
+        except (TypeError, ValueError):
+            continue
+        if w < min_w or h < min_h:
+            out.append(
+                f"{REGION_META.get(key, {}).get('label', key)} 只有 {w}x{h} 像素"
+                f"（建议至少 {min_w}x{min_h}），几乎肯定框错了区域，"
+                f"请重新用 [校准区域] 框选"
+            )
+    return out
+
 
 def _normalize_region(region_dict) -> dict:
     """校验并规范化区域字典，返回 {left, top, width, height} 全 int。"""
@@ -97,6 +127,13 @@ class RegionConfig:
     def source_of(self, key: str) -> str:
         """返回 'user' 或 'default'，供 GUI 显示状态。"""
         return "user" if self.is_customized(key) else "default"
+
+    def warnings(self) -> list:
+        """返回「区域大小明显不对」的告警（启动时打印 / 自检里报）。"""
+        try:
+            return region_warnings(self.get_all())
+        except Exception:                                # noqa: BLE001
+            return []
 
     # --------------------------------------------------------------- 修改
     def set(self, key: str, region_dict) -> dict:
