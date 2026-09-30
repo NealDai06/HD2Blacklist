@@ -501,6 +501,17 @@ JSON 结构：
 `使用默认提示图` / `使用自定义图片` / `不显示图片`，可设显示尺寸。
 自定义图片按 mtime 缓存，改文件后自动重新加载，不会每次弹窗都读盘。
 
+点 **[浏览…]** 时文件对话框默认停在 **`data/assets/`**；选中后会**自动复制一份**
+进 `data/assets/`，配置里记的就是这份副本 —— 原图以后被移走、删掉、U 盘拔掉，
+提示图也不会变空白，而且下次再选直接在默认目录里就能找到。
+
+- 支持 `PNG / JPG / JPEG / BMP / GIF`
+- 选中的文件本来就在 `data/assets/` 里 → 不重复复制
+- 同名且内容相同的文件 → 直接复用，不会越选越多
+- 同名但内容不同 → 存成 `xxx (2).png`，不覆盖旧的
+- 单个文件上限 64 MB（防止误选超大文件卡住界面）；复制失败只弹警告，
+  仍会直接引用原文件
+
 ### 外观
 
 背景色、文字色、标题色（带取色器与色块预览）、透明度、宽高、位置（7 种）、
@@ -539,8 +550,18 @@ JSON 结构：
 | 模式 | 说明 |
 |---|---|
 | `beep` | 系统 Beep，可调频率（37–32767 Hz）与时长（30–2000 ms） |
-| `wav` | 自定义 WAV 文件（pygame.mixer 播放），可 **[试听]** |
+| `wav` | 自定义音频文件（pygame.mixer / SDL2_mixer 播放），可 **[试听]** |
 | `none` | 静音 |
+
+自定义音频支持 **WAV / MP3 / OGG / FLAC**（打包后的 exe 用同一套 SDL2_mixer，
+四种格式同样可用）。和自定义图片一样：对话框默认停在 `data/assets/`，
+选完自动复制一份进去，同名不同内容存成 `xxx (2).mp3`。
+
+> 配置键里模式值仍然叫 `wav`（历史命名），它现在的含义是「自定义音频文件」。
+> WAV 建议 16bit PCM 44.1kHz。
+>
+> **[试听]** 会先检查文件是否存在，路径为空或文件已删掉会直接提示，
+> 不会再出现「点了没反应」。
 
 音效播放始终在独立线程，**绝不阻塞**扫描线程。
 
@@ -556,7 +577,7 @@ JSON 结构：
 ```json
 {
   "appearance": { "opacity": 0.6, "position": "bottom_right" },
-  "sound": { "mode": "wav", "path": "D:/sounds/alert.wav" }
+  "sound": { "mode": "wav", "path": "D:/sounds/alert.mp3" }
 }
 ```
 
@@ -588,7 +609,8 @@ Helldiver_black/                     ← 工作区（不是一个 git 仓库）
 │   │   │   ├── matcher.py           精确 / 易混字符 / 模糊 / 符号层 四层匹配
 │   │   │   ├── priority.py          游戏友好优先级（进程 below_normal + 线程 lowest）
 │   │   │   ├── single_instance.py   单实例互斥（命名 Mutex，重复打开叫回已有窗口）
-│   │   │   └── process_watcher.py   WMI 事件订阅 + 轮询降级
+│   │   │   ├── process_watcher.py   WMI 事件订阅 + 轮询降级
+│   │   │   └── assets.py            data/assets：默认目录、格式白名单、选完复制一份
 │   │   ├── settings/                配置读写层
 │   │   │   ├── region_config.py     监视区域（默认 + 自定义 + 过小告警）
 │   │   │   ├── notification_config.py  提示外观（深合并，热重载）
@@ -611,11 +633,12 @@ Helldiver_black/                     ← 工作区（不是一个 git 仓库）
 │   │       ├── calibrator.py        区域校准器
 │   │       └── hotkey_dialog.py     快捷键设置对话框（按键捕获）
 │   │
-│   ├── tests/                       单元 / 集成 / GUI 测试（491 个用例）
+│   ├── tests/                       单元 / 集成 / GUI 测试（514 个用例）
 │   │   ├── test_core.py             配置 / 数据库 / 匹配（含符号名与易混字符）/ 导入导出
 │   │   ├── test_pipeline.py         截图 / OCR / 会话 / 按需扫描 / 去重 / 批量 / ESC
 │   │   ├── test_notifier.py         模板 / 渲染 / 无焦点窗口池 / 音效 / 堆叠 / 字号
 │   │   ├── test_gui.py              主界面 / 通知设置 / 校准器 / 导入导出 GUI
+│   │   ├── test_assets.py           data/assets：默认目录 / 复制 / 去重 / 改名 / 上限
 │   │   ├── test_theme.py            配色 / ttk 样式 / 应用图标 / 对比度
 │   │   ├── test_hotkey.py           快捷键配置 / 组合键判定 / 按键捕获 / 全局热键
 │   │   ├── test_single.py           单实例互斥 / 唤醒已有窗口
@@ -636,7 +659,8 @@ Helldiver_black/                     ← 工作区（不是一个 git 仓库）
 │       ├── assets/
 │       │   ├── app_icon.png        应用图标（窗口 / 任务栏 / 托盘）
 │       │   ├── app_icon.ico        exe 图标（多尺寸）
-│       │   └── default_icon.png    通知默认提示图（警告三角）
+│       │   ├── default_icon.png    通知默认提示图（警告三角）
+│       │   └── <你的图片 / 音频>    选自定义提示图、音效时自动复制到这里的副本
 │       ├── evidence/               命中证据截图（自动清理，默认保留 500 张）
 │       └── logs/app.log            运行日志（轮转，单文件上限 2 MB）
 │
@@ -732,6 +756,7 @@ python main.py --debug
 |---|---|
 | 监视区域尺寸 | 三个区域是否小到不可能有内容（例如被误框成 10×13 像素）→ 直接 FAIL 并说明建议尺寸 |
 | 全符号玩家名 | 黑名单里的 `?` / `？` 能否被索引、命中、并通过 OCR 名字过滤器 |
+| 自定义资源目录 | `data/assets` 是否存在且**可写**（不可写 = 程序放在了受保护目录），并打印当前支持的音频格式 |
 | 游戏友好优先级 / 扫描节流 | 当前的掉帧保护设置 |
 
 日志：`data/logs/app.log` —— 所有会话的开始/结束（含终止原因与耗时）、
@@ -883,6 +908,7 @@ PyInstaller 会顺着它把**整个 torch** 拖进包里 —— 实测多出约 
 |---|---|---|
 | 进程监控 / 单实例 / 优先级 | `app/core/` | 基础设施：WMI 事件、命名 Mutex、进程与线程优先级 |
 | 数据库 / 匹配 | `app/core/database.py`、`app/core/matcher.py` | 存储与四层匹配 |
+| 自定义图片 / 音效落盘 | `app/core/assets.py` | 默认目录 `data/assets`、格式白名单、选完复制一份 |
 | 配置读写 | `app/settings/` | 区域、通知外观、热键绑定 |
 | 抓屏 / OCR | `app/capture/` | mss 小区域截图、RapidOCR 封装 |
 | 聊天框 / ESC / 冷启动 / ScanSession | `app/scanning/` | 触发、会话生命周期、调度中枢 |
@@ -1047,7 +1073,9 @@ OCR 判读又会认为它"不含字母数字"而不像玩家名。现在：
 
 **Q：提示音不响？**
 检查通知设置 → 音效页是否启用了音效、模式是否为 `none`；
-自定义 WAV 建议用 16bit PCM 44.1kHz。
+自定义音频支持 WAV / MP3 / OGG / FLAC，WAV 建议用 16bit PCM 44.1kHz。
+路径为空或文件已删掉时，[试听] 会直接提示；运行期加载失败也会写进
+`data/logs/app.log`（搜「加载音效失败」）。
 
 **Q：扫描聊天框没反应 / 说"上一次扫描还没结束"？**
 说明上一次扫描仍在跑（OCR 通常 0.3–0.5 秒）。这是 `_busy` 锁在起作用，
@@ -1131,6 +1159,17 @@ OCR 判读又会认为它"不含字母数字"而不像玩家名。现在：
 | 堆叠上限 5，超出的命中汇总成一栏列出剩余玩家 | `MAX_NOTIFY_STACK` + `alert_batch` 的汇总栏 | `test_max_stack_limit`、`test_overflow_is_summarised_in_the_last_slot` |
 | 屏幕下沿保护 | `_stacked_position` 返回 `None` 跳过 | `test_offscreen_stack_is_skipped` |
 | 不重写项目 / 不改无焦点样式 / 不改线程安全机制 | 分层窗口 4 样式仍由自检校验；GUI 仍只用两个 `queue.Queue` | `--check` + 全部 GUI 测试 |
+
+### 第五轮改动（自定义资源：默认目录 / 自动复制 / 音频放宽到 MP3）
+
+| 验收项 | 实现 | 测试 |
+|---|---|---|
+| 选自定义图片 / 音效时对话框默认停在 **`data/assets`** | `app/core/assets.py: assets_dir()` 直接当 `initialdir`，目录不存在会自动创建 | `test_pick_image_defaults_to_assets_and_copies`、`test_pick_sound_accepts_mp3_and_copies`、`test_creates_and_returns_dir` |
+| 选中的文件**自动复制一份**进 `data/assets` | `import_asset()`：已在目录内不复制；同名且内容相同直接复用；同名不同内容存成 `xxx (2).ext`；单文件上限 64 MB；复制失败只弹警告并回退为引用原文件 | `test_copies_into_assets`、`test_second_identical_pick_reuses_existing`、`test_same_name_different_content_gets_suffix`、`test_file_already_in_assets_is_not_copied`、`test_oversized_raises`、`test_import_failure_falls_back_to_original_path` |
+| 音频格式从「只有 WAV」放宽到 **WAV / MP3 / OGG / FLAC** | 过滤器与提示文案集中在 `assets.py`；`SoundPlayer._play_file` 交给 SDL2_mixer 解码（打包后用同一套 wheel）。配置里的模式值仍叫 `wav`（历史命名） | `test_real_mp3_loads_with_pygame`（真编码一段 MP3 再解码）、`test_audio_includes_mp3_and_more`、`test_play_file_accepts_non_wav_extensions` |
+| `[试听]` 不再「点了没反应」 | `_test_sound()` 先检查路径存在性并提示；播放器加载失败改记 WARNING（含支持的格式），写进 `app.log` | `test_missing_mp3_is_silent`、`test_pick_sound_accepts_mp3_and_copies` |
+| 新增自检项 **「自定义资源目录」** | 目录存在 + 可写（写入探针文件再删）+ 打印当前音频格式 | `python main.py --check` |
+| 会话存活 / 超时计时改用 `time.perf_counter()` | Windows 上 `time.time()` 只有 ~15.6 ms 粒度且不单调，拿它比 `keep_alive_after_hit` 会提前收工 | `test_keep_alive_after_hit_stops_early`（同时把该用例的 `max_static_frames` 置 0 —— 原先 6 帧静止收工与 0.15 s 存活期是**竞跑**，谁先到看机器负载，会随机失败） |
 
 ### 第四轮修复（实机反馈：ESC 漏检 / 符号名字 / 多命中只播一个）
 
@@ -1274,7 +1313,7 @@ OCR 判读又会认为它"不含字母数字"而不像玩家名。现在：
 ## 18. 测试
 
 ```bat
-:: 全部（491 个用例）
+:: 全部（514 个用例）
 python -m unittest discover -s tests -v
 
 :: 分类

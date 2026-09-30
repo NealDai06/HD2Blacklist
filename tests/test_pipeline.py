@@ -399,13 +399,19 @@ class TestScanSession(TempCase):
         sched, db = self.make_scheduler()
         sched.ocr = FakeOCR()
         sched.ocr.default = [("PlayerX", 0.99)]
+        # max_static_frames=0：本用例只验证「发现新名字后静默」这一条终止条件。
+        # 否则画面静止的 6 帧（≈0.12s）会和 0.15s 存活期竞跑，谁先到看机器负载，
+        # 测试会随机失败。
         s = ScanSession(sched, "player_list_hud", "test",
                         self._params(interval=0.02, max_consecutive_empty=9999,
-                                     max_duration=10, keep_alive_after_hit=0.15))
-        t0 = time.time()
+                                     max_duration=10, keep_alive_after_hit=0.15,
+                                     max_static_frames=0))
+        # 计时用 perf_counter：time.time() 在 Windows 上只有 ~15.6ms 粒度，
+        # 用它量 0.15s 会把时长读短一个 tick，测试随机失败。
+        t0 = time.perf_counter()
         s.start()
         s._thread.join(timeout=5)
-        elapsed = time.time() - t0
+        elapsed = time.perf_counter() - t0
         self.assertFalse(s.alive)
         self.assertLess(elapsed, 3.0)          # 远小于 max_duration
         self.assertGreaterEqual(elapsed, 0.15)

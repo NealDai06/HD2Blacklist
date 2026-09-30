@@ -327,7 +327,9 @@ class ScanSession:
         return img, valid_names, False
 
     def _run(self):
-        start_time = time.time()
+        # 会话时长判定一律用 perf_counter：Windows 上 time.time() 只有
+        # ~15.6ms 粒度且不单调，拿它比 keep_alive_after_hit 会提前收工。
+        start_time = time.perf_counter()
         empty_streak = 0
         static_streak = 0
         last_new_name_time = None
@@ -340,11 +342,11 @@ class ScanSession:
 
         try:
             while not self._stop.is_set():
-                if time.time() - start_time > self.max_duration:
+                if time.perf_counter() - start_time > self.max_duration:
                     reason = "超时"
                     break
                 if (last_new_name_time is not None
-                        and (time.time() - last_new_name_time)
+                        and (time.perf_counter() - last_new_name_time)
                         > self.keep_alive_after_hit):
                     reason = "发现新名字后静默"
                     break
@@ -389,7 +391,7 @@ class ScanSession:
                 if new_names:
                     # 只有"发现新名字"才刷新存活计时器：
                     # 这样滚动结束后 keep_alive_after_hit 秒就会自动收工。
-                    last_new_name_time = time.time()
+                    last_new_name_time = time.perf_counter()
                     self.seen_names.update(new_names)
                     try:
                         # 一次性批量处理：多个通知栏 + 只播一次音效 + 命中去重
@@ -402,11 +404,12 @@ class ScanSession:
             reason = f"未捕获异常({e})"
             self.logger.exception("[Session] 线程异常终止")
         finally:
+            elapsed = time.perf_counter() - start_time
             self.finished_at = time.time()
             self.scheduler.unregister_session(self)
             self.scheduler.log(
                 f"[Session] 结束 source={self.source} 原因={reason} "
-                f"耗时={self.finished_at - start_time:.1f}s "
+                f"耗时={elapsed:.1f}s "
                 f"识别={len(self.seen_names)}个名字 命中={self.hit_count} "
                 f"静止跳过={self.skipped_frames}帧"
             )

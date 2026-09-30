@@ -11,12 +11,14 @@
 """
 from __future__ import annotations
 
+import os
 import tkinter as tk
 from tkinter import colorchooser, filedialog, messagebox, ttk
 
 from app.config import (DEFAULT_BODY_FONT_SIZE, DEFAULT_TITLE_FONT_SIZE,
-                    FONT_SIZE_MAX, FONT_SIZE_MIN, NOTIFICATION_PLACEHOLDERS,
-                    NOTIFICATION_POSITIONS, get_logger)
+                        FONT_SIZE_MAX, FONT_SIZE_MIN, NOTIFICATION_PLACEHOLDERS,
+                        NOTIFICATION_POSITIONS, get_logger)
+from app.core import assets as asset_store
 from app.ui import theme
 from app.notify.notifier import clamp_font_size, hex_to_rgb
 
@@ -183,8 +185,8 @@ class NotificationSettingsDialog:
                     textvariable=self.image_h_var).pack(side="left")
         ttk.Label(size, text=" 像素").pack(side="left")
 
-        ttk.Label(tab, text="支持 PNG / JPG / BMP / GIF。自定义图片会被缓存，"
-                            "修改文件后自动重新加载。",
+        ttk.Label(tab, text=asset_store.IMAGE_HINT +
+                            "自定义图片会被缓存，修改文件后自动重新加载。",
                   style="Muted.TLabel", wraplength=380, justify="left").grid(
             row=5, column=0, columnspan=3, sticky="w")
 
@@ -302,7 +304,7 @@ class NotificationSettingsDialog:
         ttk.Radiobutton(tab, text="系统 Beep", value="beep",
                         variable=self.sound_mode_var).grid(
             row=1, column=0, sticky="w", pady=2)
-        ttk.Radiobutton(tab, text="自定义 WAV", value="wav",
+        ttk.Radiobutton(tab, text="自定义音频文件", value="wav",
                         variable=self.sound_mode_var).grid(
             row=2, column=0, sticky="w", pady=2)
         ttk.Radiobutton(tab, text="静音", value="none",
@@ -318,18 +320,18 @@ class NotificationSettingsDialog:
         ttk.Spinbox(beep, from_=30, to=2000, increment=10, width=7,
                     textvariable=self.beep_dur_var).pack(side="left")
 
-        ttk.Label(tab, text="WAV 文件：").grid(row=5, column=0, sticky="w",
+        ttk.Label(tab, text="音频文件：").grid(row=5, column=0, sticky="w",
                                               pady=(8, 0))
         ttk.Entry(tab, textvariable=self.sound_path_var, width=30).grid(
             row=5, column=1, sticky="we", pady=(8, 0))
-        ttk.Button(tab, text="浏览…", command=self._pick_wav).grid(
+        ttk.Button(tab, text="浏览…", command=self._pick_sound).grid(
             row=5, column=2, padx=4, pady=(8, 0))
         ttk.Button(tab, text="试听", command=self._test_sound).grid(
             row=6, column=1, sticky="w", pady=6)
 
-        ttk.Label(tab, text="WAV 建议使用 16bit PCM、44.1kHz 单声道/立体声。",
-                  style="Muted.TLabel").grid(row=7, column=0, columnspan=3,
-                                             sticky="w", pady=(8, 0))
+        ttk.Label(tab, text=asset_store.AUDIO_HINT,
+                  style="Muted.TLabel", wraplength=380, justify="left").grid(
+            row=7, column=0, columnspan=3, sticky="w", pady=(8, 0))
 
     # ---- 预览 ----
     def _build_preview(self, parent):
@@ -508,27 +510,58 @@ class NotificationSettingsDialog:
             messagebox.showerror("测试失败", str(e), parent=self.top)
 
     def _test_sound(self):
+        sound = (self._collect().get("sound") or {})
+        if sound.get("mode") == "wav":
+            p = sound.get("path") or ""
+            if not p or not os.path.isfile(p):
+                messagebox.showwarning(
+                    "无法试听", "请先用 [浏览…] 选择一个存在的音频文件。",
+                    parent=self.top)
+                return
         try:
-            self.notifier.play_sound(self._collect().get("sound"))
+            self.notifier.play_sound(sound)
         except Exception as e:                           # noqa: BLE001
             messagebox.showerror("试听失败", str(e), parent=self.top)
 
     # ---------------------------------------------------------------- 动作
+    def _import_asset(self, path, kind):
+        """把选中的文件复制一份进 data/assets，返回最终该写进配置的路径。
+
+        复制失败（文件过大 / 无权限 / 磁盘满）不阻断操作：退回引用原文件，
+        只弹一个警告，用户至少还能正常用。
+        """
+        try:
+            saved = asset_store.import_asset(path)
+        except asset_store.AssetError as e:
+            messagebox.showwarning(
+                "未能复制到 data/assets",
+                f"{e}\n\n将继续直接引用原文件：\n{path}", parent=self.top)
+            self.status_var.set(f"{kind}未能复制，已直接引用原文件")
+            return os.path.abspath(path)
+        if os.path.normcase(saved) != os.path.normcase(os.path.abspath(path)):
+            self.status_var.set(
+                f"{kind}已复制到 data/assets：{os.path.basename(saved)}")
+        else:
+            self.status_var.set(f"{kind}已在 data/assets："
+                                f"{os.path.basename(saved)}")
+        return saved
+
     def _pick_image(self):
         path = filedialog.askopenfilename(
             parent=self.top, title="选择提示图片",
-            filetypes=[("图片", "*.png *.jpg *.jpeg *.bmp *.gif"),
-                       ("所有文件", "*.*")])
+            initialdir=asset_store.assets_dir(),
+            filetypes=list(asset_store.IMAGE_FILETYPES))
         if path:
-            self.image_path_var.set(path)
+            self.image_path_var.set(self._import_asset(path, "图片"))
             self.image_mode_var.set("custom")
 
-    def _pick_wav(self):
+    def _pick_sound(self):
         path = filedialog.askopenfilename(
             parent=self.top, title="选择音效文件",
-            filetypes=[("WAV 音频", "*.wav"), ("所有文件", "*.*")])
+            initialdir=asset_store.assets_dir(),
+            filetypes=list(asset_store.AUDIO_FILETYPES))
         if path:
-            self.sound_path_var.set(path)
+            self.sound_path_var.set(self._import_asset(path, "音效"))
             self.sound_mode_var.set("wav")
 
     def _pick_color(self, var):

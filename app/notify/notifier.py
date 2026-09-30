@@ -670,7 +670,10 @@ class _OverlayWindow:
 # 音效
 # ==========================================================================
 class SoundPlayer:
-    """beep / 自定义 wav / 静音。播放永远不阻塞调用线程。"""
+    """beep / 自定义音频文件（WAV / MP3 / OGG / FLAC）/ 静音。
+
+    播放永远不阻塞调用线程。
+    """
 
     def __init__(self):
         self.log = get_logger("sound")
@@ -690,8 +693,9 @@ class SoundPlayer:
 
     def _play_sync(self, cfg, mode):
         try:
+            # 历史值：模式名一直叫 "wav"，现在它表示「自定义音频文件」
             if mode == "wav":
-                self._play_wav(cfg.get("path") or "")
+                self._play_file(cfg.get("path") or "")
             else:
                 self._play_beep(int(cfg.get("beep_freq", 1200)),
                                 int(cfg.get("beep_duration", 120)))
@@ -705,9 +709,13 @@ class SoundPlayer:
         duration = max(30, min(2000, int(duration)))
         winsound.Beep(freq, duration)
 
-    def _play_wav(self, path: str):
-        if not path or not os.path.exists(path):
-            self.log.debug("wav 文件不存在: %s", path)
+    def _play_file(self, path: str):
+        """播放自定义音频文件（WAV / MP3 / OGG / FLAC 都由 SDL2_mixer 解码）。"""
+        if not path:
+            self.log.debug("未设置自定义音效文件")
+            return
+        if not os.path.exists(path):
+            self.log.warning("自定义音效文件不存在: %s", path)
             return
         import pygame
         with self._lock:
@@ -723,7 +731,8 @@ class SoundPlayer:
                 try:
                     sound = pygame.mixer.Sound(path)
                 except Exception as e:                   # noqa: BLE001
-                    self.log.warning("加载 wav 失败 %s: %s", path, e)
+                    self.log.warning("加载音效失败 %s: %s"
+                                     "（支持 WAV/MP3/OGG/FLAC）", path, e)
                     return
                 if len(self._sound_cache) > 8:
                     self._sound_cache.clear()

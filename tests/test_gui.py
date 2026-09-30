@@ -14,6 +14,7 @@ import shutil
 import sys
 import time
 import unittest
+from unittest import mock
 
 _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _ROOT not in sys.path:
@@ -533,6 +534,90 @@ class TestNotificationDialog(TempCase):
             self.assertGreaterEqual(data["appearance"]["height"], 60)
             self.assertLessEqual(data["appearance"]["opacity"], 1.0)
             self.assertLessEqual(data["sound"]["beep_freq"], 32767)
+        finally:
+            d.close()
+
+    # ---- 自定义资源：默认目录 = data/assets，选完自动复制一份 ----
+    def _pick_with(self, dialog, method, src):
+        """把文件对话框替换成「返回 src」，并把 data/assets 指向临时目录。"""
+        import tkinter.filedialog as fd
+        from app.core import assets as astore
+        seen = {}
+
+        def fake(**kw):
+            seen.update(kw)
+            return src
+
+        with mock.patch.object(astore, "ASSETS_DIR", self.path("assets")), \
+                mock.patch.object(fd, "askopenfilename", fake):
+            getattr(dialog, method)()
+        return seen
+
+    def test_pick_image_defaults_to_assets_and_copies(self):
+        d = self._dialog()
+        try:
+            d.top.withdraw()
+            src = self.path("外链图.png")
+            with open(src, "wb") as f:
+                f.write(b"IMG")
+            seen = self._pick_with(d, "_pick_image", src)
+            self.assertEqual(seen.get("initialdir"), self.path("assets"))
+            self.assertEqual(d.image_mode_var.get(), "custom")
+            got = d.image_path_var.get()
+            self.assertEqual(got, self.path("assets", "外链图.png"))
+            self.assertTrue(os.path.isfile(got))
+            self.assertIn("assets", d.status_var.get())
+        finally:
+            d.close()
+
+    def test_pick_sound_accepts_mp3_and_copies(self):
+        d = self._dialog()
+        try:
+            d.top.withdraw()
+            src = self.path("预警.mp3")
+            with open(src, "wb") as f:
+                f.write(b"ID3")
+            seen = self._pick_with(d, "_pick_sound", src)
+            self.assertEqual(seen.get("initialdir"), self.path("assets"))
+            pattern = dict(seen.get("filetypes"))["音频"]
+            self.assertIn("*.mp3", pattern)
+            self.assertEqual(d.sound_mode_var.get(), "wav")
+            self.assertEqual(d.sound_path_var.get(),
+                             self.path("assets", "预警.mp3"))
+        finally:
+            d.close()
+
+    def test_pick_cancelled_changes_nothing(self):
+        d = self._dialog()
+        try:
+            d.top.withdraw()
+            before = (d.image_path_var.get(), d.image_mode_var.get())
+            self._pick_with(d, "_pick_image", "")          # 用户点了取消
+            self.assertEqual((d.image_path_var.get(), d.image_mode_var.get()),
+                             before)
+        finally:
+            d.close()
+
+    def test_import_failure_falls_back_to_original_path(self):
+        d = self._dialog()
+        try:
+            d.top.withdraw()
+            src = self.path("big.png")
+            with open(src, "wb") as f:
+                f.write(b"x" * 64)
+            import tkinter.filedialog as fd
+            from tkinter import messagebox
+            from app.core import assets as astore
+            shown = []
+            with mock.patch.object(astore, "ASSETS_DIR", self.path("assets")), \
+                    mock.patch.object(astore, "MAX_ASSET_BYTES", 8), \
+                    mock.patch.object(fd, "askopenfilename",
+                                      lambda **kw: src), \
+                    mock.patch.object(messagebox, "showwarning",
+                                      lambda *a, **k: shown.append(a)):
+                d._pick_image()
+            self.assertTrue(shown)                          # 弹了警告
+            self.assertEqual(d.image_path_var.get(), os.path.abspath(src))
         finally:
             d.close()
 

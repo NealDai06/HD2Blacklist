@@ -436,6 +436,39 @@ class TestSound(TempCase):
         s = nt.SoundPlayer()
         s._play_sync({"path": self.path("nope.wav")}, "wav")   # 不抛异常
 
+    def test_missing_mp3_is_silent(self):
+        s = nt.SoundPlayer()
+        s._play_sync({"path": self.path("nope.mp3")}, "wav")
+
+    def test_play_file_accepts_non_wav_extensions(self):
+        """放宽音频限制后，后缀不再是 .wav 也必须走同一条播放路径。"""
+        s = nt.SoundPlayer()
+        for name in ("a.mp3", "a.ogg", "a.flac", "a.wav"):
+            s._play_file(self.path(name))                  # 文件不存在 → 静默
+
+    def test_real_mp3_loads_with_pygame(self):
+        """真机验证：SDL2_mixer 能解码 MP3（打包后同一套 wheel）。"""
+        try:
+            import numpy as np
+            import soundfile as sf
+            import pygame
+        except Exception as e:                             # noqa: BLE001
+            self.skipTest(f"缺少编码/解码依赖: {e}")
+        ext = ".mp3"
+        path = self.path("probe" + ext)
+        sr = 44100
+        t = np.linspace(0, 0.25, int(sr * 0.25), False)
+        try:
+            sf.write(path, (np.sin(2 * np.pi * 440 * t) * 0.3).astype("float32"),
+                     sr, format="MP3")
+        except Exception as e:                             # noqa: BLE001
+            self.skipTest(f"libsndfile 不支持写 MP3: {e}")
+        if not pygame.mixer.get_init():
+            pygame.mixer.init()
+        sound = pygame.mixer.Sound(path)
+        self.assertGreater(sound.get_length(), 0.1)
+        nt.SoundPlayer()._play_file(path)                  # 走真实播放分支
+
     def test_invalid_beep_params_clamped(self):
         s = nt.SoundPlayer()
         s._play_sync({"beep_freq": 999999, "beep_duration": 5}, "beep")

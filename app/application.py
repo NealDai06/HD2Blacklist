@@ -361,6 +361,19 @@ def run_self_check() -> int:
     check("区域配置读取", lambda: f"{len(RegionConfig().get_all())} 个区域")
     check("通知配置读取", lambda: NotificationConfig().get()["image_mode"])
 
+    def _assets_check():
+        """自定义图片 / 音效的默认目录：既要存在，也要能写进去。"""
+        from app.core import assets as asset_store
+        d = asset_store.assets_dir()
+        probe = os.path.join(d, ".write_probe.tmp")
+        with open(probe, "wb") as f:
+            f.write(b"ok")
+        os.remove(probe)
+        return (f"{d} 可写；音频格式 " +
+                "/".join(e.lstrip(".") for e in asset_store.AUDIO_EXTS))
+
+    check("自定义资源目录", _assets_check)
+
     def _chat_scanner_check():
         from app.scanning.chat_scanner import ChatScanner
         ChatScanner(None, None, None)          # 构造即可用，无循环无定时器
