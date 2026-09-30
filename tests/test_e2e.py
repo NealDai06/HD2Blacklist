@@ -26,13 +26,13 @@ _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _ROOT not in sys.path:
     sys.path.insert(0, _ROOT)
 
-import database as db_mod                        # noqa: E402
-import main as main_mod                          # noqa: E402
-import notification_config as nc_mod             # noqa: E402
-import region_config as rc_mod                   # noqa: E402
-import scan_scheduler as sched_mod               # noqa: E402
-from config import COLD_START_SESSION            # noqa: E402
-from process_watcher import ProcessWatcher, list_process_names   # noqa: E402
+from app.core import database as db_mod  # noqa: E402
+from app import application as main_mod  # noqa: E402
+from app.settings import notification_config as nc_mod  # noqa: E402
+from app.settings import region_config as rc_mod  # noqa: E402
+from app.scanning import scan_scheduler as sched_mod  # noqa: E402
+from app.config import COLD_START_SESSION            # noqa: E402
+from app.core.process_watcher import ProcessWatcher, list_process_names   # noqa: E402
 
 TMP_ROOT = os.path.join(_ROOT, ".test_tmp")
 
@@ -79,7 +79,7 @@ class FakeOCR:
         return True
 
     def preprocess(self, img):
-        from ocr_engine import OCREngine
+        from app.capture.ocr_engine import OCREngine
         return OCREngine().preprocess(img)
 
 
@@ -250,8 +250,8 @@ class TestAppEndToEnd(TempCase):
         打包版一点「启用热键扫描」下次启动就弹 PyInstaller 报错框。
         """
         import json
-        import chat_hotkey as chat_hotkey_mod
-        import hotkey_config as hkc_mod
+        from app.scanning import chat_hotkey as chat_hotkey_mod
+        from app.settings import hotkey_config as hkc_mod
         self._patch(hkc_mod.HotkeyConfig.__init__, "__defaults__",
                     (self.path("hotkey.json"),))
         with open(self.path("hotkey.json"), "w", encoding="utf-8") as f:
@@ -431,8 +431,8 @@ class TestAppDefaults(TempCase):
     """不重定向路径，验证首次启动会生成示例配置。"""
 
     def test_first_run_generates_example_configs(self):
-        import config
-        from notification_config import ensure_notification_file
+        from app import config
+        from app.settings.notification_config import ensure_notification_file
 
         backups = []
         for p in (config.NOTIFICATION_PATH,):
@@ -481,25 +481,27 @@ class TestDeletedModulesAreGone(unittest.TestCase):
             for prefix in ("import ", "from "):
                 needles.append(prefix + mod)
 
+        # 源码现在收在 app/ 包里，必须**递归**扫，否则这个守卫会形同虚设
+        skip_dirs = {".pylibs", ".devtools", ".test_tmp", "build", "data",
+                     "__pycache__", ".git"}
         offenders = []
-        for folder in (_ROOT, os.path.join(_ROOT, "tests"),
-                       os.path.join(_ROOT, "tools")):
-            if not os.path.isdir(folder):
-                continue
-            for fn in sorted(os.listdir(folder)):
+        for root, dirnames, filenames in os.walk(_ROOT):
+            dirnames[:] = [d for d in dirnames if d not in skip_dirs]
+            for fn in sorted(filenames):
                 if not fn.endswith(".py"):
                     continue
-                path = os.path.join(folder, fn)
+                path = os.path.join(root, fn)
+                rel = os.path.relpath(path, _ROOT)
                 with open(path, encoding="utf-8") as f:
                     text = f.read()
                 for needle in needles:
                     if needle in text:
-                        offenders.append(f"{fn}: {needle}")
+                        offenders.append(f"{rel}: {needle}")
         self.assertEqual(offenders, [], f"仍有残留引用: {offenders}")
 
     def test_chat_scanner_and_hotkey_exist(self):
-        import chat_hotkey
-        import chat_scanner
+        from app.scanning import chat_hotkey
+        from app.scanning import chat_scanner
         self.assertTrue(hasattr(chat_scanner, "ChatScanner"))
         self.assertTrue(hasattr(chat_hotkey, "ChatScanHotkey"))
 

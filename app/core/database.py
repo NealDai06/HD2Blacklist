@@ -19,7 +19,7 @@ import sqlite3
 import threading
 from datetime import datetime
 
-from config import DB_PATH
+from app.config import DB_PATH
 
 _DT_FMT = "%Y-%m-%d %H:%M:%S"
 

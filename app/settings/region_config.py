@@ -11,7 +11,7 @@ import json
 import os
 import threading
 
-from config import DEFAULT_REGIONS, REGION_META, REGION_MIN_SIZE, USER_CONFIG_PATH
+from app.config import DEFAULT_REGIONS, REGION_META, REGION_MIN_SIZE, USER_CONFIG_PATH
 
 _REGION_FIELDS = ("left", "top", "width", "height")
 

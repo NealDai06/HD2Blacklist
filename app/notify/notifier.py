@@ -23,7 +23,7 @@ from datetime import datetime
 
 from PIL import Image, ImageDraw, ImageFont
 
-from config import (ASSETS_DIR, DEFAULT_BODY_FONT_SIZE, DEFAULT_ICON_PATH,
+from app.config import (ASSETS_DIR, DEFAULT_BODY_FONT_SIZE, DEFAULT_ICON_PATH,
                     DEFAULT_TITLE_FONT_SIZE, FONT_SIZE_MAX, FONT_SIZE_MIN,
                     MAX_NOTIFY_STACK, NOTIFICATION_POSITIONS,
                     NOTIFY_STACK_BASE_Y, NOTIFY_STACK_GAP, get_logger)

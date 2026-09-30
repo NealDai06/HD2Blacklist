@@ -576,31 +576,41 @@ Helldiver_black/                     ← 工作区（不是一个 git 仓库）
 │   ├── .git/                        仓库本体
 │   ├── .gitignore  LICENSE  README.md
 │   ├── 使用说明.txt                  分发给用户看的说明（打包时复制进发布包）
-│   ├── main.py                      入口（--check / --capture-debug / --preview-notification）
-│   ├── single_instance.py           单实例互斥（命名 Mutex，重复打开只会叫回已有窗口）
-│   ├── priority.py                  游戏友好优先级（进程 below_normal + 扫描线程 lowest）
-│   ├── config.py                    常量、路径解析、日志工厂、DPI 感知
-│   ├── theme.py                     暗色主题（配色 / ttk 样式 / 窗口与托盘图标）
-│   ├── region_config.py             区域配置（默认 + 用户自定义 + 过小告警）
-│   ├── notification_config.py       提示配置（深合并，热重载）
-│   ├── hotkey_config.py             扫描热键配置（可自定义 + 按键名映射）
-│   ├── hotkey_dialog.py             快捷键设置对话框（按键捕获）
-│   ├── database.py                  SQLite（WAL，原子命中更新 + 导入导出）
-│   ├── process_watcher.py           WMI 事件订阅 + 轮询降级
-│   ├── screen_capture.py            mss 小区域截图（按线程缓存实例）
-│   ├── ocr_engine.py                RapidOCR 封装（懒加载 + 预处理）
-│   ├── matcher.py                   精确 / 易混字符 / 模糊 / 符号层 四层匹配
-│   ├── notifier.py                  无焦点分层窗口 Overlay（每栏一窗）+ 音效 + 批量堆叠
-│   ├── scan_session.py              扫描会话（三个终止条件）+ 玩家名过滤器
-│   ├── chat_scanner.py              聊天框**按需**扫描（点按钮才跑，无循环无定时）
-│   ├── chat_hotkey.py               聊天框扫描热键（系统全局 RegisterHotKey + 轮询兜底）
-│   ├── esc_trigger.py               ESC 触发 + 菜单打开判定
-│   ├── scan_scheduler.py            调度中枢（命中去重 / 批量处理 / 会话 / 证据 / 日志）
-│   ├── gui.py                       主界面（Treeview + 三行工具栏 + 托盘 + 导入导出）
-│   ├── gui_notification.py          通知设置对话框
-│   ├── calibrator.py                区域校准器
-│   ├── build.py                     PyInstaller 打包脚本（产物输出到 ../发布包/）
 │   ├── requirements.txt
+│   ├── main.py                      入口薄壳（把仓库根塞进 sys.path 后转交 app.application）
+│   ├── build.py                     PyInstaller 打包脚本（产物输出到 ../发布包/）
+│   │
+│   ├── app/                         ★ 应用代码（全部在这里，根目录不再平铺模块）
+│   │   ├── config.py                常量、路径解析、日志工厂、DPI 感知
+│   │   ├── application.py           应用装配（HD2BlacklistApp + 自检 + 命令行）
+│   │   ├── core/                    基础设施层
+│   │   │   ├── database.py          SQLite（WAL，原子命中更新 + 导入导出）
+│   │   │   ├── matcher.py           精确 / 易混字符 / 模糊 / 符号层 四层匹配
+│   │   │   ├── priority.py          游戏友好优先级（进程 below_normal + 线程 lowest）
+│   │   │   ├── single_instance.py   单实例互斥（命名 Mutex，重复打开叫回已有窗口）
+│   │   │   └── process_watcher.py   WMI 事件订阅 + 轮询降级
+│   │   ├── settings/                配置读写层
+│   │   │   ├── region_config.py     监视区域（默认 + 自定义 + 过小告警）
+│   │   │   ├── notification_config.py  提示外观（深合并，热重载）
+│   │   │   └── hotkey_config.py     扫描热键绑定（可自定义 + 按键名映射）
+│   │   ├── capture/                 采集层
+│   │   │   ├── screen_capture.py    mss 小区域截图（按线程缓存实例）
+│   │   │   └── ocr_engine.py        RapidOCR 封装（懒加载 + 预处理）
+│   │   ├── scanning/                扫描层
+│   │   │   ├── scan_session.py      扫描会话（三个终止条件）+ 玩家名过滤器
+│   │   │   ├── scan_scheduler.py    调度中枢（去重 / 批量 / 会话 / 证据 / 日志）
+│   │   │   ├── chat_scanner.py      聊天框**按需**扫描（点按钮才跑，无循环无定时）
+│   │   │   ├── chat_hotkey.py       聊天框热键（系统全局 RegisterHotKey + 轮询兜底）
+│   │   │   └── esc_trigger.py       ESC 触发 + 菜单打开判定
+│   │   ├── notify/
+│   │   │   └── notifier.py          无焦点分层窗口 Overlay（每栏一窗）+ 音效 + 堆叠
+│   │   └── ui/
+│   │       ├── theme.py             暗色主题（配色 / ttk 样式 / 窗口与托盘图标）
+│   │       ├── gui.py               主界面（Treeview + 三行工具栏 + 托盘 + 导入导出）
+│   │       ├── gui_notification.py  通知设置对话框
+│   │       ├── calibrator.py        区域校准器
+│   │       └── hotkey_dialog.py     快捷键设置对话框（按键捕获）
+│   │
 │   ├── tests/                       单元 / 集成 / GUI 测试（491 个用例）
 │   │   ├── test_core.py             配置 / 数据库 / 匹配（含符号名与易混字符）/ 导入导出
 │   │   ├── test_pipeline.py         截图 / OCR / 会话 / 按需扫描 / 去重 / 批量 / ESC
@@ -611,11 +621,13 @@ Helldiver_black/                     ← 工作区（不是一个 git 仓库）
 │   │   ├── test_single.py           单实例互斥 / 唤醒已有窗口
 │   │   ├── test_priority.py         进程与线程优先级
 │   │   └── test_e2e.py              端到端装配与数据流
-│   ├── tools/
+│   │
+│   ├── tools/                       开发诊断脚本（不属于交付物）
 │   │   ├── ocr_probe.py             真实 OCR 验证脚本（渲染样图 → 识别 → 匹配）
 │   │   ├── perf_probe.py            抓屏 / OCR 的 CPU 与墙钟成本实测
 │   │   ├── hotkey_probe.py          全局热键真机探测（注册 → 模拟按键 → 注销）
 │   │   └── diagnose_ocr.py          拿真实证据截图复盘 OCR 识别效果
+│   │
 │   └── data/                        ⚠ 运行期数据（git 忽略，别删）
 │       ├── blacklist.db            SQLite 数据库
 │       ├── user_config.json        区域配置
@@ -634,18 +646,20 @@ Helldiver_black/                     ← 工作区（不是一个 git 仓库）
 │   ├── HD2Blacklist-v1.0.0-win64.rar  发给别人的压缩包
 │   └── 使用说明.txt / LICENSE.txt    build.py 自动从仓库复制过来
 │
-├── _packaged_data_backup/           ⚠ 历次打包前的用户数据备份（别删）
-└── .idea/                           IDE 配置
+└── _packaged_data_backup/           ⚠ 历次打包前的用户数据备份（别删）
 ```
 
+> **包名约定**：所有跨模块导入一律写绝对路径（`from app.core.matcher import Matcher`），
+> 不写相对导入，也不依赖“当前目录正好在 sys.path 上”。这样 `python main.py`、
+> `python -m unittest`、PyInstaller 三种跑法都一致。
+>
 > 已删除（改造后不再存在）：`chat_monitor.py`、`keyword_config.py`、
-> `data/keywords.json`。源码里也没有任何残留引用（有测试专门守着）。
+> `data/keywords.json`。源码里也没有任何残留引用（有测试递归守着）。
 
-**可安全删除**（都会自动重建）：`source_code/build/`、`source_code/.test_tmp/`、
-`source_code/.piptmp/`、任意 `__pycache__/`。
+**可安全删除**（都会自动重建）：`build/`、`.test_tmp/`、`.piptmp/`、任意 `__pycache__/`。
 
-**绝不能删**：`source_code/data/`、`发布包/*/data/`、`_packaged_data_backup/`、
-`source_code/.pylibs/`、`source_code/.devtools/`、`source_code/使用说明.txt`。
+**绝不能删**：`data/`、`../发布包/*/data/`、`../_packaged_data_backup/`、
+`.pylibs/`、`.devtools/`、`使用说明.txt`。
 
 所有 `data/*.json` 都支持 **手动编辑或直接删除恢复默认**，改动 **无需重启**。
 
@@ -862,6 +876,23 @@ PyInstaller 会顺着它把**整个 torch** 拖进包里 —— 实测多出约 
    │ 分层窗口堆叠 │          │ 逐行闪烁 + 汇总统计 │
    └──────────────┘          └────────────────────┘
 ```
+
+数据流里的每个角色，对应到 `app/` 下的哪个包：
+
+| 图里的角色 | 代码位置 | 职责 |
+|---|---|---|
+| 进程监控 / 单实例 / 优先级 | `app/core/` | 基础设施：WMI 事件、命名 Mutex、进程与线程优先级 |
+| 数据库 / 匹配 | `app/core/database.py`、`app/core/matcher.py` | 存储与四层匹配 |
+| 配置读写 | `app/settings/` | 区域、通知外观、热键绑定 |
+| 抓屏 / OCR | `app/capture/` | mss 小区域截图、RapidOCR 封装 |
+| 聊天框 / ESC / 冷启动 / ScanSession | `app/scanning/` | 触发、会话生命周期、调度中枢 |
+| Notifier（Overlay） | `app/notify/notifier.py` | 无焦点分层窗口 + 音效 |
+| GUI 主线程 | `app/ui/` | 主窗口、通知设置、校准器、快捷键对话框、主题 |
+| 装配与命令行 | `app/application.py`（入口薄壳 `main.py`） | 把上面这些接起来 |
+
+> 下文为简洁起见用**短模块名**指代文件，实际路径都在 `app/` 下按层分目录，
+> 例如 `matcher.py` = `app/core/matcher.py`、`gui.py` = `app/ui/gui.py`、
+> `scan_session.py` = `app/scanning/scan_session.py`。
 
 ### 匹配策略（先精确，再易混，再模糊，最后符号层）
 
@@ -1190,7 +1221,7 @@ OCR 判读又会认为它"不含字母数字"而不像玩家名。现在：
 | 黑名单 CRUD 正常持久化 | `database.py` + `gui.py` |
 | 游戏启停正确响应 | `process_watcher.py` → `_on_game_start/_on_game_stop` |
 | 聊天框按需扫描（按钮 / F8） | `chat_scanner.py`（+ `chat_hotkey.py`） |
-| ESC 触发扫描会话，菜单未开时跳过 | `esc_trigger.py`（std > 20 判定） |
+| ESC 触发扫描会话，菜单未开时跳过 | `esc_trigger.py`（平均亮度 + 标准差双信号判定，判不准复查 3 次后保守扫描） |
 | 冷启动扫描正常触发 | `main._cold_start_scan`（12 秒） |
 | 命中弹出无焦点 Overlay + 音效 | `notifier.py` |
 | 提示不抢焦点、不卡顿、不拦鼠标 | 分层窗口 + 4 个扩展样式（自检会校验） |
@@ -1230,8 +1261,8 @@ OCR 判读又会认为它"不含字母数字"而不像玩家名。现在：
 
 | 验收项 | 实现 |
 |---|---|
-| ESC 设置菜单，会话 1 秒内自动终止 | 连续 3 次 × 0.3 s 无结果 ≈ 0.9 s |
-| ESC 玩家列表，滚动结束后 3 秒终止 | `keep_alive_after_hit = 3.0` |
+| ESC 设置菜单，会话数秒内自动终止 | 连续 4 次 × 0.5 s 无结果 ≈ 2 s |
+| ESC 玩家列表，滚动结束后约 3.5 秒终止 | `keep_alive_after_hit = 3.5` |
 | ESC 会话不超 8 秒 | `max_duration = 8.0` |
 | 会话内同一玩家不重复提示 | `seen_names` 去重 + 每会话只匹配一次 |
 | OCR 异常不会导致线程挂死 | 每轮 try/except + 连续异常计数终止 |

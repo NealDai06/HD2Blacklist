@@ -18,10 +18,10 @@ sys.path.insert(0, _ROOT)
 
 from PIL import Image, ImageDraw, ImageFont          # noqa: E402
 
-import config                                        # noqa: E402
-from database import BlacklistDB                     # noqa: E402
-from matcher import Matcher                          # noqa: E402
-from ocr_engine import OCREngine                     # noqa: E402
+from app import config  # noqa: E402
+from app.core.database import BlacklistDB                     # noqa: E402
+from app.core.matcher import Matcher                          # noqa: E402
+from app.capture.ocr_engine import OCREngine                     # noqa: E402
 
 OUT_DIR = os.path.join(config.LOG_DIR, "ocr_probe")
 FONT_CANDIDATES = (r"C:\Windows\Fonts\msyh.ttc", r"C:\Windows\Fonts\simhei.ttf",

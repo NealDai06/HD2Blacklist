@@ -19,12 +19,12 @@ _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _ROOT not in sys.path:
     sys.path.insert(0, _ROOT)
 
-import config                                    # noqa: E402
-import gui as gui_mod                            # noqa: E402
-from database import BlacklistDB                 # noqa: E402
-from matcher import Matcher                      # noqa: E402
-from notification_config import NotificationConfig   # noqa: E402
-from region_config import RegionConfig           # noqa: E402
+from app import config  # noqa: E402
+from app.ui import gui as gui_mod  # noqa: E402
+from app.core.database import BlacklistDB                 # noqa: E402
+from app.core.matcher import Matcher                      # noqa: E402
+from app.settings.notification_config import NotificationConfig   # noqa: E402
+from app.settings.region_config import RegionConfig           # noqa: E402
 
 TMP_ROOT = os.path.join(_ROOT, ".test_tmp")
 
@@ -76,7 +76,7 @@ class TestEntryDialogValidation(TempCase):
 
     def _dialog(self, entry=None):
         import tkinter as tk
-        from gui import EntryDialog
+        from app.ui.gui import EntryDialog
         # 不进入 wait_window：直接构造内部状态
         dlg = EntryDialog.__new__(EntryDialog)
         dlg.master = self.root
@@ -148,7 +148,7 @@ class TestBlacklistGUI(TempCase):
         self.matcher = Matcher(self.db)
         self.scheduler = None
 
-        from gui import BlacklistGUI
+        from app.ui.gui import BlacklistGUI
         self.gui = BlacklistGUI(self.db, self.notif_cfg, self.region_cfg,
                                 matcher=self.matcher)
         self.gui.root.withdraw()
@@ -162,7 +162,7 @@ class TestBlacklistGUI(TempCase):
         super().tearDown()
 
     def test_tree_columns(self):
-        from gui import COLUMNS, HEADERS
+        from app.ui.gui import COLUMNS, HEADERS
         self.assertEqual(tuple(self.gui.tree["columns"]), COLUMNS)
         for col in COLUMNS:
             self.assertEqual(self.gui.tree.heading(col)["text"], HEADERS[col])
@@ -335,14 +335,16 @@ class TestBlacklistGUI(TempCase):
 
     def test_export_list(self):
         import csv
+        import importlib
+        # 注意：__import__("a.b.c") 返回的是顶层包 a，拿子模块要用 import_module
+        gui_mod = importlib.import_module("app.ui.gui")
         out = self.path("out.csv")
         rows = self.db.get_all()
         with open(out, "w", newline="", encoding="utf-8-sig") as f:
             w = csv.writer(f)
-            w.writerow([__import__("gui").HEADERS[c]
-                        for c in __import__("gui").COLUMNS])
+            w.writerow([gui_mod.HEADERS[c] for c in gui_mod.COLUMNS])
             for r in rows:
-                w.writerow(__import__("gui").BlacklistGUI._row_values(r))
+                w.writerow(gui_mod.BlacklistGUI._row_values(r))
         with open(out, encoding="utf-8-sig") as f:
             self.assertEqual(len(list(csv.reader(f))), 3)
 
@@ -380,7 +382,7 @@ class TestBlacklistGUI(TempCase):
 
     def test_toolbar_fits_at_min_width(self):
         """最小宽度下两行工具栏与底部栏都不能被挤掉。"""
-        import gui as gui_mod
+        from app.ui import gui as gui_mod
         min_w, min_h = 960, 480
         self.gui.root.minsize(min_w, min_h)
         self.gui.root.geometry(f"{min_w}x{min_h}+0+0")
@@ -417,7 +419,7 @@ class TestNotificationDialog(TempCase):
     def setUp(self):
         super().setUp()
         import tkinter as tk
-        from notifier import Notifier
+        from app.notify.notifier import Notifier
         self.root = tk.Tk()
         self.root.withdraw()
         self.cfg = NotificationConfig(self.path("notification.json"))
@@ -436,7 +438,7 @@ class TestNotificationDialog(TempCase):
         super().tearDown()
 
     def _dialog(self):
-        from gui_notification import NotificationSettingsDialog
+        from app.ui.gui_notification import NotificationSettingsDialog
         return NotificationSettingsDialog(self.root, self.cfg, self.notifier)
 
     def test_build_and_load_defaults(self):
@@ -697,7 +699,7 @@ class TestCalibratorDialog(TempCase):
             return Image.new("RGB", (200, 100), (30, 30, 30))
 
     def test_build_and_show_current(self):
-        from calibrator import CalibratorDialog
+        from app.ui.calibrator import CalibratorDialog
         d = CalibratorDialog(self.root, self.region_cfg, self.FakeCapture())
         try:
             d.top.withdraw()
@@ -707,7 +709,7 @@ class TestCalibratorDialog(TempCase):
             d.close()
 
     def test_reset_region(self):
-        from calibrator import CalibratorDialog
+        from app.ui.calibrator import CalibratorDialog
         self.region_cfg.set("chat_event", {"left": 1, "top": 2,
                                            "width": 30, "height": 40})
         d = CalibratorDialog(self.root, self.region_cfg, self.FakeCapture())
@@ -722,7 +724,7 @@ class TestCalibratorDialog(TempCase):
 
     def test_reset_all(self):
         import tkinter.messagebox as mb
-        from calibrator import CalibratorDialog
+        from app.ui.calibrator import CalibratorDialog
         self.region_cfg.set("chat_event", {"left": 1, "top": 2,
                                            "width": 30, "height": 40})
         d = CalibratorDialog(self.root, self.region_cfg, self.FakeCapture())
@@ -737,7 +739,7 @@ class TestCalibratorDialog(TempCase):
             d.close()
 
     def test_preview_creates_window(self):
-        from calibrator import CalibratorDialog
+        from app.ui.calibrator import CalibratorDialog
         d = CalibratorDialog(self.root, self.region_cfg, self.FakeCapture())
         try:
             d.top.withdraw()
@@ -749,7 +751,7 @@ class TestCalibratorDialog(TempCase):
 
     def test_preview_capture_failure_shows_message(self):
         import tkinter.messagebox as mb
-        from calibrator import CalibratorDialog
+        from app.ui.calibrator import CalibratorDialog
 
         class Boom:
             def grab(self, key):
@@ -768,7 +770,7 @@ class TestCalibratorDialog(TempCase):
             d.close()
 
     def test_switch_region_updates_coords(self):
-        from calibrator import CalibratorDialog
+        from app.ui.calibrator import CalibratorDialog
         d = CalibratorDialog(self.root, self.region_cfg, self.FakeCapture())
         try:
             d.top.withdraw()
@@ -920,8 +922,8 @@ class TestChatScanAndIOGui(TempCase):
         self.region_cfg = RegionConfig(self.path("user_config.json"))
         self.notif_cfg = NotificationConfig(self.path("notification.json"))
         self.scanner = self.FakeScanner()
-        from hotkey_config import HotkeyConfig
-        from gui import BlacklistGUI
+        from app.settings.hotkey_config import HotkeyConfig
+        from app.ui.gui import BlacklistGUI
         self.hotkey_cfg = HotkeyConfig(self.path("hotkey.json"))
         self.gui = BlacklistGUI(self.db, self.notif_cfg, self.region_cfg,
                                 matcher=Matcher(self.db),

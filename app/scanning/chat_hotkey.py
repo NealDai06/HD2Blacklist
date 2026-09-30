@@ -28,7 +28,7 @@ import threading
 import time
 from ctypes import wintypes
 
-from config import (CHAT_SCAN_HOTKEY_DEBOUNCE, CHAT_SCAN_HOTKEY_SOURCE,
+from app.config import (CHAT_SCAN_HOTKEY_DEBOUNCE, CHAT_SCAN_HOTKEY_SOURCE,
                     CHAT_SCAN_HOTKEY_VK, get_logger)
 
 VK_CONTROL = 0x11
@@ -227,7 +227,7 @@ class ChatScanHotkey:
     # ---------------------------------------------------------------- 控制
     @property
     def display_name(self) -> str:
-        from hotkey_config import combo_name
+        from app.settings.hotkey_config import combo_name
         return combo_name(self.vk, self.ctrl, self.alt, self.shift)
 
     def start(self):

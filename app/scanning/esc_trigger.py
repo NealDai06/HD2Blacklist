@@ -26,7 +26,7 @@ from __future__ import annotations
 import threading
 import time
 
-from config import (ESC_DEBOUNCE, ESC_MENU_CHECK_RETRY, ESC_MENU_DELAY,
+from app.config import (ESC_DEBOUNCE, ESC_MENU_CHECK_RETRY, ESC_MENU_DELAY,
                     ESC_MENU_MEAN_MAX, ESC_MENU_MEAN_MIN_BRIGHT,
                     ESC_MENU_RETRY_DELAY, ESC_MENU_STD_MIN,
                     ESC_MENU_STD_THRESHOLD, ESC_POLL_INTERVAL, ESC_SESSION,

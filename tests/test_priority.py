@@ -14,8 +14,8 @@ _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _ROOT not in sys.path:
     sys.path.insert(0, _ROOT)
 
-import config                                    # noqa: E402
-import priority                                  # noqa: E402
+from app import config  # noqa: E402
+from app.core import priority  # noqa: E402
 
 
 class TestProcessPriority(unittest.TestCase):

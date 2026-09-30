@@ -25,7 +25,7 @@ import contextlib
 import ctypes
 import os
 
-from config import get_logger
+from app.config import get_logger
 
 # ---- 进程优先级类 ----
 IDLE_PRIORITY_CLASS = 0x00000040

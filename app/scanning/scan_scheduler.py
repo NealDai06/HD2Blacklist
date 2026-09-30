@@ -19,7 +19,7 @@ import threading
 import time
 from datetime import datetime
 
-from config import (EVIDENCE_DIR, EVIDENCE_JPEG_QUALITY, EVIDENCE_MAX_FILES,
+from app.config import (EVIDENCE_DIR, EVIDENCE_JPEG_QUALITY, EVIDENCE_MAX_FILES,
                     HIT_DEDUP_WINDOW, get_logger)
 
 _SAFE_NAME_RE = re.compile(r"[^\w\u4e00-\u9fff-]+")
@@ -96,7 +96,7 @@ class ScanScheduler:
 
     def start_session(self, region_key: str, source: str, params: dict):
         """启动一个新会话；若已有会话在跑，先终止它（同一时刻最多一个）。"""
-        from scan_session import ScanSession       # 局部导入避免循环依赖
+        from app.scanning.scan_session import ScanSession       # 局部导入避免循环依赖
 
         if self._shutdown:
             return None

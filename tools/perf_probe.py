@@ -27,13 +27,13 @@ try:
 except Exception:                                        # noqa: BLE001
     pass
 
-import priority                                          # noqa: E402
-from config import (ESC_SESSION, OCR_INTRA_OP_THREADS,   # noqa: E402
+from app.core import priority  # noqa: E402
+from app.config import (ESC_SESSION, OCR_INTRA_OP_THREADS,   # noqa: E402
                     SESSION_DIFF_TOLERANCE, SESSION_SKIP_UNCHANGED)
-from ocr_engine import OCREngine                         # noqa: E402
-from region_config import RegionConfig                   # noqa: E402
-from scan_session import ScanSession                     # noqa: E402
-from screen_capture import ScreenCapture                 # noqa: E402
+from app.capture.ocr_engine import OCREngine                         # noqa: E402
+from app.settings.region_config import RegionConfig                   # noqa: E402
+from app.scanning.scan_session import ScanSession                     # noqa: E402
+from app.capture.screen_capture import ScreenCapture                 # noqa: E402
 
 
 def _line(title=""):

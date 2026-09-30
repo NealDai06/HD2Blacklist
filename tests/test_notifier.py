@@ -21,10 +21,10 @@ _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _ROOT not in sys.path:
     sys.path.insert(0, _ROOT)
 
-import notifier as nt                          # noqa: E402
-import config                                  # noqa: E402
-from config import DEFAULT_NOTIFICATION        # noqa: E402
-from notification_config import NotificationConfig   # noqa: E402
+from app.notify import notifier as nt  # noqa: E402
+from app import config  # noqa: E402
+from app.config import DEFAULT_NOTIFICATION        # noqa: E402
+from app.settings.notification_config import NotificationConfig   # noqa: E402
 
 TMP_ROOT = os.path.join(_ROOT, ".test_tmp")
 
@@ -622,7 +622,7 @@ class TestAlertBatch(TempCase):
 
     # ---- 上限 ----
     def test_max_stack_limit(self):
-        import config as cfg_mod
+        from app import config as cfg_mod
         n = self._notifier()
         try:
             hits = [(e, 100.0, "chat") for e in self._entries(9)]
@@ -653,7 +653,7 @@ class TestAlertBatch(TempCase):
 
         没有这条，用户只知道"命中了"，却不知道还有谁没显示出来。
         """
-        import config as cfg_mod
+        from app import config as cfg_mod
         limit = cfg_mod.MAX_NOTIFY_STACK
         n = self._notifier()
         try:
@@ -684,7 +684,7 @@ class TestAlertBatch(TempCase):
 
     def test_no_summary_when_everything_fits(self):
         """刚好占满堆叠上限时不应出现汇总栏（每个玩家都有自己的栏）。"""
-        import config as cfg_mod
+        from app import config as cfg_mod
         limit = cfg_mod.MAX_NOTIFY_STACK
         n = self._notifier()
         try:

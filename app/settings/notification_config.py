@@ -11,7 +11,7 @@ import json
 import os
 import threading
 
-from config import DEFAULT_NOTIFICATION, NOTIFICATION_PATH
+from app.config import DEFAULT_NOTIFICATION, NOTIFICATION_PATH
 
 
 def _deep_copy(obj):

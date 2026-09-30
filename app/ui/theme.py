@@ -22,7 +22,7 @@ import os
 import tkinter as tk
 from tkinter import ttk
 
-from config import APP_ICON_ICO, APP_ICON_PATH, get_logger
+from app.config import APP_ICON_ICO, APP_ICON_PATH, get_logger
 
 # ==========================================================================
 # 配色

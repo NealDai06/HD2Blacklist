@@ -15,9 +15,9 @@ _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _ROOT not in sys.path:
     sys.path.insert(0, _ROOT)
 
-import config                                    # noqa: E402
-import main as main_mod                          # noqa: E402
-import single_instance as si                     # noqa: E402
+from app import config  # noqa: E402
+from app import application as main_mod  # noqa: E402
+from app.core import single_instance as si  # noqa: E402
 
 
 def _unique_name() -> str:
@@ -304,7 +304,8 @@ class TestMainWiring(unittest.TestCase):
     def test_window_title_is_shared_constant(self):
         self.assertEqual(config.WINDOW_TITLE,
                          f"{config.APP_NAME} v{config.VERSION}")
-        gui_src = open(os.path.join(_ROOT, "gui.py"), encoding="utf-8").read()
+        gui_src = open(os.path.join(_ROOT, "app", "ui", "gui.py"),
+                       encoding="utf-8").read()
         self.assertIn("config.WINDOW_TITLE", gui_src)
 
 

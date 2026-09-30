@@ -18,9 +18,9 @@ from __future__ import annotations
 import threading
 import time
 
-from config import (CHAT_SCAN_REGION_KEY, CHAT_SCAN_SOURCE,
+from app.config import (CHAT_SCAN_REGION_KEY, CHAT_SCAN_SOURCE,
                     OCR_CONFIDENCE_MIN, SCAN_THREAD_PRIORITY, get_logger)
-from priority import low_priority
+from app.core.priority import low_priority
 
 
 class ChatScanner:

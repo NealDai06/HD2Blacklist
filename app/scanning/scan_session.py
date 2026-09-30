@@ -20,11 +20,11 @@ import time
 
 import numpy as np
 
-from config import (OCR_CONFIDENCE_MIN, SCAN_THREAD_PRIORITY,
+from app.config import (OCR_CONFIDENCE_MIN, SCAN_THREAD_PRIORITY,
                     SESSION_DIFF_TOLERANCE, SESSION_MAX_STATIC_FRAMES,
                     SESSION_SKIP_UNCHANGED, get_logger)
-from matcher import fold as _fold_name
-from priority import low_priority
+from app.core.matcher import fold as _fold_name
+from app.core.priority import low_priority
 
 # 明显的 UI 文字，避免把菜单项当成玩家名
 UI_BLACKLIST = {

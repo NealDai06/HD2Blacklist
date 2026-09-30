@@ -23,7 +23,7 @@ import ctypes
 import os
 from ctypes import wintypes
 
-from config import WINDOW_TITLE, get_logger
+from app.config import WINDOW_TITLE, get_logger
 
 #: 互斥体名字（Local\ = 当前登录会话内有效）
 MUTEX_NAME = r"Local\hd2_blacklist_single_instance"

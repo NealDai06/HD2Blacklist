@@ -20,18 +20,18 @@ _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _ROOT not in sys.path:
     sys.path.insert(0, _ROOT)
 
-import config                                   # noqa: E402
-import esc_trigger as esc_mod                   # noqa: E402
-import scan_scheduler as sched_mod              # noqa: E402
-from chat_scanner import ChatScanner            # noqa: E402
-from config import COLD_START_SESSION, ESC_SESSION   # noqa: E402
-from database import BlacklistDB                # noqa: E402
-from esc_trigger import EscTrigger              # noqa: E402
-from matcher import Matcher                     # noqa: E402
-from ocr_engine import OCREngine                # noqa: E402
-from region_config import RegionConfig          # noqa: E402
-from scan_scheduler import ScanScheduler        # noqa: E402
-from scan_session import (ScanSession, evaluate_scan, group_into_lines,   # noqa: E402
+from app import config  # noqa: E402
+from app.scanning import esc_trigger as esc_mod  # noqa: E402
+from app.scanning import scan_scheduler as sched_mod  # noqa: E402
+from app.scanning.chat_scanner import ChatScanner            # noqa: E402
+from app.config import COLD_START_SESSION, ESC_SESSION   # noqa: E402
+from app.core.database import BlacklistDB                # noqa: E402
+from app.scanning.esc_trigger import EscTrigger              # noqa: E402
+from app.core.matcher import Matcher                     # noqa: E402
+from app.capture.ocr_engine import OCREngine                # noqa: E402
+from app.settings.region_config import RegionConfig          # noqa: E402
+from app.scanning.scan_scheduler import ScanScheduler        # noqa: E402
+from app.scanning.scan_session import (ScanSession, evaluate_scan, group_into_lines,   # noqa: E402
                           is_valid_player_name)
 
 TMP_ROOT = os.path.join(_ROOT, ".test_tmp")

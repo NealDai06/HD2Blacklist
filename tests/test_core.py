@@ -17,11 +17,11 @@ _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _ROOT not in sys.path:
     sys.path.insert(0, _ROOT)
 
-import config                                   # noqa: E402
-from database import BlacklistDB                # noqa: E402
-from matcher import Matcher                     # noqa: E402
-from notification_config import NotificationConfig, ensure_notification_file  # noqa: E402
-from region_config import RegionConfig          # noqa: E402
+from app import config  # noqa: E402
+from app.core.database import BlacklistDB                # noqa: E402
+from app.core.matcher import Matcher                     # noqa: E402
+from app.settings.notification_config import NotificationConfig, ensure_notification_file  # noqa: E402
+from app.settings.region_config import RegionConfig          # noqa: E402
 
 TMP_ROOT = os.path.join(_ROOT, ".test_tmp")
 
@@ -202,7 +202,7 @@ class TestRegionConfig(TempCase):
         self.assertEqual(self.cfg.warnings(), [])
 
     def test_region_warnings_helper_handles_garbage(self):
-        from region_config import region_warnings
+        from app.settings.region_config import region_warnings
         self.assertEqual(region_warnings({}), [])
         self.assertEqual(region_warnings({"chat_event": None}), [])
         self.assertEqual(region_warnings({"chat_event": {"width": "x"}}), [])
@@ -822,7 +822,7 @@ class TestSymbolNames(TempCase):
                          {"PlayerX", "?", "playery"})
 
     def test_symbol_key_helper(self):
-        from matcher import fold, symbol_key
+        from app.core.matcher import fold, symbol_key
         self.assertEqual(symbol_key("?"), "?")
         self.assertEqual(symbol_key("？"), "?")
         self.assertEqual(symbol_key("★☆"), "★☆")

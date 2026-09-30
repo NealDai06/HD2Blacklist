@@ -12,7 +12,7 @@ import threading
 import mss
 from PIL import Image
 
-from config import get_logger
+from app.config import get_logger
 
 
 class ScreenCapture:

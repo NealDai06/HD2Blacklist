@@ -21,9 +21,9 @@ sys.path.insert(0, _ROOT)
 
 from PIL import Image                                   # noqa: E402
 
-import config                                           # noqa: E402
-from ocr_engine import OCREngine                         # noqa: E402
-from scan_session import group_into_lines, is_valid_player_name  # noqa: E402
+from app import config  # noqa: E402
+from app.capture.ocr_engine import OCREngine                         # noqa: E402
+from app.scanning.scan_session import group_into_lines, is_valid_player_name  # noqa: E402
 
 
 def main() -> int:

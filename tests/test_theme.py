@@ -14,8 +14,8 @@ _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _ROOT not in sys.path:
     sys.path.insert(0, _ROOT)
 
-import config                                    # noqa: E402
-import theme                                     # noqa: E402
+from app import config  # noqa: E402
+from app.ui import theme  # noqa: E402
 
 TMP_ROOT = os.path.join(_ROOT, ".test_tmp")
 

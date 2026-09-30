@@ -12,7 +12,7 @@ import threading
 import numpy as np
 from PIL import Image, ImageOps
 
-from config import (OCR_INTRA_OP_THREADS, OCR_UPSCALE, OCR_USE_ANGLE_CLS,
+from app.config import (OCR_INTRA_OP_THREADS, OCR_UPSCALE, OCR_USE_ANGLE_CLS,
                     get_logger)
 
 # 预处理后允许的最大边长（避免超大图拖慢 OCR）
@@ -155,7 +155,7 @@ class OCREngine:
         allowlist 是「黑名单里确实存在的名字」白名单 —— 让 `?` 这种
         天生不像名字的名字也能通过过滤器（见 scan_session.is_valid_player_name）。
         """
-        from scan_session import evaluate_boxes
+        from app.scanning.scan_session import evaluate_boxes
         return evaluate_boxes(self.recognize_boxes(img), allowlist=allowlist)
 
     def _parse(self, out) -> list:

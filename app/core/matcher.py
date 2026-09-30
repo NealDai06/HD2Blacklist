@@ -35,7 +35,7 @@ except ImportError:                     # 降级：标准库 difflib，保证可
 
     BACKEND = "difflib"
 
-from config import MATCH_FUZZY_CONFUSABLE, MATCH_SYMBOL_NAMES, MATCH_THRESHOLD
+from app.config import MATCH_FUZZY_CONFUSABLE, MATCH_SYMBOL_NAMES, MATCH_THRESHOLD
 
 # 分词分隔符：空白 + 中英文标点
 _SPLIT_RE = re.compile(r"[\s,，。.、!！?？:：;；|/\\\-_\[\]【】()（）\"'“”‘’*#>]+")

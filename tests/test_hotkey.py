@@ -18,12 +18,12 @@ _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _ROOT not in sys.path:
     sys.path.insert(0, _ROOT)
 
-import chat_hotkey as hk_mod                     # noqa: E402
-import config                                    # noqa: E402
-import hotkey_config as hkc                      # noqa: E402
-import hotkey_dialog as hkd                      # noqa: E402
-import main as main_mod                          # noqa: E402
-from hotkey_config import (HotkeyConfig, combo_name, keysym_to_vk,   # noqa: E402
+from app.scanning import chat_hotkey as hk_mod  # noqa: E402
+from app import config  # noqa: E402
+from app.settings import hotkey_config as hkc  # noqa: E402
+from app.ui import hotkey_dialog as hkd  # noqa: E402
+from app import application as main_mod  # noqa: E402
+from app.settings.hotkey_config import (HotkeyConfig, combo_name, keysym_to_vk,   # noqa: E402
                            modifier_of_keysym, vk_to_name)
 
 TMP_ROOT = os.path.join(_ROOT, ".test_tmp")
@@ -617,7 +617,7 @@ class TestHotkeyDialog(TempCase):
     def _dialog(self, mods=None, on_saved=None):
         """构造对话框（不进入 wait_window）。"""
         import tkinter as tk
-        from hotkey_dialog import HotkeyDialog
+        from app.ui.hotkey_dialog import HotkeyDialog
         dlg = HotkeyDialog.__new__(HotkeyDialog)
         dlg.cfg = self.cfg
         dlg.on_saved = on_saved

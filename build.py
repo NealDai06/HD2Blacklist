@@ -55,10 +55,10 @@ def which_rapidocr():
 def ensure_seed_files():
     """确保 data/ 里有示例配置、默认提示图和应用图标，供打包一起带走。"""
     sys.path.insert(0, ROOT)
-    import config                                    # noqa: E402
+    from app import config  # noqa: E402
     config.ensure_dirs()
-    from notification_config import ensure_notification_file   # noqa: E402
-    from notifier import ensure_default_icon          # noqa: E402
+    from app.settings.notification_config import ensure_notification_file   # noqa: E402
+    from app.notify.notifier import ensure_default_icon          # noqa: E402
     ensure_notification_file()
     ensure_default_icon()
     ensure_app_icon()
@@ -70,7 +70,7 @@ def ensure_app_icon() -> bool:
 
     有 PNG 没 ICO 时自动生成多尺寸 ICO。
     """
-    import config                                    # noqa: E402
+    from app import config  # noqa: E402
     if os.path.exists(config.APP_ICON_ICO):
         return True
     if not os.path.exists(config.APP_ICON_PATH):
@@ -105,7 +105,7 @@ def build_command(onefile: bool, console: bool) -> list:
     cmd.append("--console" if console else "--noconsole")
 
     # ---- exe 图标 ----
-    import config                                    # noqa: E402
+    from app import config  # noqa: E402
     if os.path.exists(config.APP_ICON_ICO):
         cmd += ["--icon", config.APP_ICON_ICO]
 
@@ -137,7 +137,7 @@ def build_command(onefile: bool, console: bool) -> list:
     # ---- 静态资源 ----
     # 这三个都要打进 _internal/data/assets：用户删掉 data/ 目录重置后，
     # config.ensure_dirs() 会把它们补回去（否则图标丢失、自检报错）。
-    import config                                    # noqa: E402
+    from app import config  # noqa: E402
     for asset in (config.DEFAULT_ICON_PATH, config.APP_ICON_PATH,
                   config.APP_ICON_ICO):
         if os.path.exists(asset):

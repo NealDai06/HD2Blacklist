@@ -28,12 +28,14 @@ TARGET_PROCESS_NAMES = ("helldivers2.exe",)
 def _resolve_base_dir() -> str:
     """返回程序根目录。
 
-    - 开发态：config.py 所在目录
+    - 开发态：**仓库根目录**（= app/ 的上一级，也就是 source_code/）——
+      data/ 与源码同级，方便直接编辑与备份
     - frozen（PyInstaller）：exe 所在目录（data/ 与 exe 同级，便于用户编辑）
     """
     if getattr(sys, "frozen", False):
         return os.path.dirname(os.path.abspath(sys.executable))
-    return os.path.dirname(os.path.abspath(__file__))
+    # 本文件在 app/config.py → 上跳两级才是仓库根
+    return os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
 BASE_DIR = _resolve_base_dir()

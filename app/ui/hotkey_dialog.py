@@ -12,9 +12,9 @@ from __future__ import annotations
 import tkinter as tk
 from tkinter import messagebox, ttk
 
-import theme
-from config import get_logger
-from hotkey_config import (FORBIDDEN_VK, combo_name, keysym_to_vk,
+from app.ui import theme
+from app.config import get_logger
+from app.settings.hotkey_config import (FORBIDDEN_VK, combo_name, keysym_to_vk,
                            modifier_of_keysym)
 
 VK_CONTROL = 0x11
@@ -193,7 +193,7 @@ class HotkeyDialog:
 
     # ---------------------------------------------------------------- 动作
     def restore_default(self):
-        from config import DEFAULT_HOTKEY
+        from app.config import DEFAULT_HOTKEY
         self.vk_var.set(DEFAULT_HOTKEY["vk"])
         self.ctrl_var.set(False)
         self.alt_var.set(False)

@@ -23,8 +23,8 @@ try:                                        # 控制台默认 GBK，装不下 �
 except Exception:                           # noqa: BLE001
     pass
 
-import chat_hotkey as hk                                    # noqa: E402
-from hotkey_config import keysym_to_vk                      # noqa: E402
+from app.scanning import chat_hotkey as hk  # noqa: E402
+from app.settings.hotkey_config import keysym_to_vk                      # noqa: E402
 
 
 class _Probe:

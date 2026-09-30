@@ -13,7 +13,7 @@ import os
 import re
 import threading
 
-from config import (CHAT_SCAN_HOTKEY_VK, DEFAULT_HOTKEY, HOTKEY_PATH,
+from app.config import (CHAT_SCAN_HOTKEY_VK, DEFAULT_HOTKEY, HOTKEY_PATH,
                     get_logger)
 
 #: 一些不允许绑定的键（会和其它功能打架）

@@ -17,7 +17,7 @@ import ctypes.wintypes as wt
 import threading
 import time
 
-from config import TARGET_PROCESS_NAMES, get_logger
+from app.config import TARGET_PROCESS_NAMES, get_logger
 
 _POLL_FALLBACK_INTERVAL = 5.0
 
