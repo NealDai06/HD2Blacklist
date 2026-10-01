@@ -55,7 +55,20 @@ USER_DATA_FILES = ("blacklist.db", "notification.json", "user_config.json",
 
 
 def log(msg):
-    print(f"[build] {msg}")
+    """打印构建日志。
+
+    ⚠ 控制台编码可能是 GBK（中文版 Windows 的 cmd / PowerShell 默认如此），
+    这时 `print("…✅")` 会抛 UnicodeEncodeError。以前它发生在**打包已经成功
+    之后**的收尾步骤里，用户看到的就是"构建失败"，其实产物是好的 ——
+    真实踩过一次（打包完成，最后一行日志把脚本打断了）。这里退化成
+    编码安全的输出，绝不因为一个字符中断整个构建。
+    """
+    text = f"[build] {msg}"
+    try:
+        print(text)
+    except UnicodeEncodeError:
+        enc = sys.stdout.encoding or "ascii"
+        print(text.encode(enc, "replace").decode(enc, "replace"))
 
 
 def which_rapidocr():
