@@ -328,6 +328,50 @@ class TestNotificationConfig(TempCase):
 
 
 # ==========================================================================
+class TestVendoredLibPath(TempCase):
+    """回归：`python main.py` 直接跑（不设 PYTHONPATH）也要能找到自带依赖。
+
+    真实故障：源码运行没带上 .pylibs → 没有 rapidocr → OCR 全程不可用 →
+    每轮扫描"识别 0 个名字"，界面上就是"扫描功能失效"。
+    """
+
+    def test_adds_both_dirs_to_sys_path(self):
+        from app._bootstrap import add_vendored_libs
+        root = self.path("fake_root")
+        os.makedirs(os.path.join(root, ".pylibs"))
+        os.makedirs(os.path.join(root, ".devtools"))
+        before = list(sys.path)
+        try:
+            added = add_vendored_libs(root)
+            self.assertEqual(len(added), 2)
+            self.assertIn(os.path.join(root, ".pylibs"), sys.path[:2])
+            self.assertIn(os.path.join(root, ".devtools"), sys.path[:2])
+            # 再调一次不会重复插入
+            self.assertEqual(add_vendored_libs(root), [])
+        finally:
+            sys.path[:] = before
+
+    def test_missing_dirs_are_skipped_quietly(self):
+        from app._bootstrap import add_vendored_libs, vendored_libs_missing
+        root = self.path("empty_root")
+        os.makedirs(root)
+        before = list(sys.path)
+        try:
+            self.assertEqual(add_vendored_libs(root), [])
+            self.assertTrue(vendored_libs_missing(root))
+        finally:
+            sys.path[:] = before
+
+    def test_main_py_calls_the_bootstrap(self):
+        """入口脚本必须在导入 app.application **之前**补路径。"""
+        with open(os.path.join(_ROOT, "main.py"), encoding="utf-8") as f:
+            src = f.read()
+        self.assertIn("add_vendored_libs", src)
+        self.assertLess(src.index("add_vendored_libs(_ROOT)"),
+                        src.index("from app.application import main"))
+
+
+# ==========================================================================
 class TestDatabase(TempCase):
     def setUp(self):
         super().setUp()
@@ -338,39 +382,47 @@ class TestDatabase(TempCase):
         super().tearDown()
 
     def test_add_get(self):
-        eid = self.db.add("76561198000000001", "PlayerX", "恶意TK", 3)
+        eid = self.db.add("PlayerX", "恶意TK")
         row = self.db.get(eid)
-        self.assertEqual(row["player_id"], "76561198000000001")
         self.assertEqual(row["player_name"], "PlayerX")
         self.assertEqual(row["note"], "恶意TK")
-        self.assertEqual(row["tk_count"], 3)
-        self.assertEqual(row["encounter_count"], 0)
-        self.assertIsNone(row["last_seen"])
         self.assertTrue(row["created_at"])
 
+    def test_no_legacy_fields_anymore(self):
+        """玩家ID / TK次数 / 遇到次数 / 最后遇见 必须彻底消失。"""
+        row = self.db.get(self.db.add("PlayerX"))
+        for gone in ("player_id", "tk_count", "encounter_count", "last_seen"):
+            self.assertNotIn(gone, row)
+        cols = {r[1] for r in
+                self.db.conn.execute("PRAGMA table_info(blacklist)")}
+        self.assertEqual(cols, {"id", "player_name", "note", "created_at"})
+
     def test_unique_constraint(self):
-        self.db.add("id1", "Name1")
+        self.db.add("Name1")
         with self.assertRaises(ValueError):
-            self.db.add("id1", "Name1")
+            self.db.add("Name1")
 
-    def test_requires_id_or_name(self):
-        with self.assertRaises(ValueError):
-            self.db.add("", "")
-
-    def test_name_only_entry(self):
-        eid = self.db.add("", "只有名字")
-        self.assertEqual(self.db.get(eid)["player_id"], "-")
+    def test_requires_name(self):
+        for bad in ("", "   ", None):
+            with self.assertRaises(ValueError):
+                self.db.add(bad)
 
     def test_update(self):
-        eid = self.db.add("id1", "Name1", "n", 1)
-        self.assertTrue(self.db.update(eid, note="改过了", tk_count=9))
-        row = self.db.get(eid)
-        self.assertEqual(row["note"], "改过了")
-        self.assertEqual(row["tk_count"], 9)
-        self.assertFalse(self.db.update(eid,))
+        eid = self.db.add("Name1", "n")
+        self.assertTrue(self.db.update(eid, note="改过了"))
+        self.assertEqual(self.db.get(eid)["note"], "改过了")
+        self.assertTrue(self.db.update(eid, player_name="Name2"))
+        self.assertEqual(self.db.get(eid)["player_name"], "Name2")
+        self.assertFalse(self.db.update(eid))
+
+    def test_update_rejects_empty_name(self):
+        eid = self.db.add("Name1")
+        with self.assertRaises(ValueError):
+            self.db.update(eid, player_name="  ")
+        self.assertEqual(self.db.get(eid)["player_name"], "Name1")
 
     def test_delete_cascades_encounters(self):
-        eid = self.db.add("id1", "Name1")
+        eid = self.db.add("Name1")
         self.db.record_encounter(eid, 100.0, "chat", "Name1", "")
         self.assertEqual(len(self.db.get_encounters(eid)), 1)
         self.assertTrue(self.db.delete(eid))
@@ -378,32 +430,32 @@ class TestDatabase(TempCase):
         self.assertEqual(self.db.get_total_encounter_count(), 0)
 
     def test_search(self):
-        self.db.add("id1", "Alpha", "备注A")
-        self.db.add("id2", "Beta", "备注B")
-        self.db.add("id3", "gamma", "特殊")
+        self.db.add("Alpha", "备注A")
+        self.db.add("Beta", "备注B")
+        self.db.add("gamma", "特殊")
         self.assertEqual(len(self.db.search("alph")), 1)
         self.assertEqual(len(self.db.search("备注")), 2)
         self.assertEqual(len(self.db.search("GAMMA")), 1)   # 大小写不敏感
         self.assertEqual(len(self.db.search("")), 3)
 
-    def test_record_encounter_updates_atomically(self):
-        eid = self.db.add("id1", "Name1")
+    def test_record_encounter_writes_facts(self):
+        """命中只"写事实"：一条 encounters 记录，不再累加到名单上。"""
+        eid = self.db.add("Name1")
         r1 = self.db.record_encounter(eid, 100.0, "chat", "Name1", "a.jpg")
-        self.assertEqual(r1["encounter_count"], 1)
-        self.assertIsNotNone(r1["last_seen"])
+        self.assertTrue(r1["seen_at"])
+        self.assertEqual(r1["today_count"], 1)
         r2 = self.db.record_encounter(eid, 92.5, "esc_menu", "Name12", "b.jpg")
-        self.assertEqual(r2["encounter_count"], 2)
+        self.assertEqual(r2["today_count"], 2)
         rows = self.db.get_encounters(eid)
         self.assertEqual(len(rows), 2)
         self.assertEqual(rows[0]["name_seen"], "Name12")
         self.assertEqual(rows[0]["match_score"], 92.5)
         self.assertEqual(rows[0]["source"], "esc_menu")
         self.assertEqual(rows[0]["screenshot_path"], "b.jpg")
-        # blacklist.last_seen 与 encounters 一致
-        self.assertEqual(self.db.get(eid)["last_seen"], r2["last_seen"])
+        self.assertEqual(self.db.get_total_encounter_count(), 2)
 
-    def test_record_encounter_concurrent_no_lost_update(self):
-        eid = self.db.add("id1", "Name1")
+    def test_record_encounter_concurrent_no_lost_rows(self):
+        eid = self.db.add("Name1")
         n_threads, per_thread = 8, 25
         errors = []
 
@@ -423,50 +475,44 @@ class TestDatabase(TempCase):
 
         self.assertEqual(errors, [])
         expected = n_threads * per_thread
-        self.assertEqual(self.db.get(eid)["encounter_count"], expected)
         self.assertEqual(len(self.db.get_encounters(eid, limit=1000)), expected)
+        self.assertEqual(self.db.get_total_encounter_count(), expected)
 
     def test_record_encounter_missing_entry_rolls_back(self):
         with self.assertRaises(ValueError):
             self.db.record_encounter(99999, 100.0, "chat", "x", "")
         self.assertEqual(self.db.get_total_encounter_count(), 0)
 
-    def test_reset_helpers(self):
-        eid = self.db.add("id1", "Name1")
-        other = self.db.add("id2", "Name2")
-        self.db.record_encounter(eid, 100.0, "chat", "Name1", "")
-        self.db.record_encounter(other, 100.0, "chat", "Name2", "")
-        self.db.reset_encounter_count(eid)
-        self.db.reset_last_seen(eid)
-        self.assertEqual(self.db.get(eid)["encounter_count"], 0)
-        self.assertIsNone(self.db.get(eid)["last_seen"])
-        # 只影响当前条目
-        self.assertEqual(self.db.get(other)["encounter_count"], 1)
-        self.assertIsNotNone(self.db.get(other)["last_seen"])
-
     def test_today_count(self):
-        eid = self.db.add("id1", "Name1")
+        eid = self.db.add("Name1")
         self.assertEqual(self.db.get_today_encounter_count(), 0)
         self.db.record_encounter(eid, 100.0, "chat", "Name1", "")
         self.db.record_encounter(eid, 100.0, "chat", "Name1", "")
         self.assertEqual(self.db.get_today_encounter_count(), 2)
 
-    def test_ordering_never_seen_last(self):
-        a = self.db.add("id1", "A")
-        b = self.db.add("id2", "B")
-        self.db.record_encounter(b, 100.0, "chat", "B", "")
+    def test_ordering_is_newest_first(self):
+        a = self.db.add("A")
+        b = self.db.add("B")
         rows = self.db.get_all()
-        self.assertEqual(rows[0]["id"], b)
+        self.assertEqual(rows[0]["id"], b)            # 默认按添加时间倒序
         self.assertEqual(rows[-1]["id"], a)
 
+    def test_sort_matches_counters_are_gone(self):
+        """按遇到次数 / 最后遇见排序的入口必须一起删掉（字段已经不存在）。"""
+        self.db.add("A")
+        rows = self.db.get_all(order_by="encounter_count")   # 白名单外 → 回退
+        self.assertEqual(len(rows), 1)
+        rows = self.db.get_all(order_by="last_seen")
+        self.assertEqual(len(rows), 1)
+
     def test_sort_whitelist_blocks_injection(self):
-        self.db.add("id1", "A")
+        self.db.add("A")
         rows = self.db.get_all(order_by="id; DROP TABLE blacklist;--")
         self.assertEqual(len(rows), 1)
         self.assertEqual(self.db.get_count(), 1)
 
     def test_persistence_across_reopen(self):
-        eid = self.db.add("id1", "Persist")
+        eid = self.db.add("Persist")
         self.db.close()
         db2 = BlacklistDB(self.path("blacklist.db"))
         try:
@@ -481,107 +527,92 @@ class TestDatabase(TempCase):
 
     # ------------------------------------------------------ 导入导出
     def test_export_all_fields(self):
-        eid = self.db.add("id1", "Name1", "备注", 2, "ev.jpg")
-        self.db.record_encounter(eid, 100.0, "chat", "Name1", "a.jpg")
+        self.db.add("Name1", "备注")
         rows = self.db.export_all()
         self.assertEqual(len(rows), 1)
         row = rows[0]
-        for field in ("player_id", "player_name", "note", "tk_count",
-                      "encounter_count", "created_at", "last_seen"):
-            self.assertIn(field, row)
-        self.assertEqual(row["player_id"], "id1")
+        self.assertEqual(set(row), {"player_name", "note", "created_at"})
         self.assertEqual(row["player_name"], "Name1")
         self.assertEqual(row["note"], "备注")
-        self.assertEqual(row["tk_count"], 2)
-        self.assertEqual(row["encounter_count"], 1)
-        self.assertIsNotNone(row["last_seen"])
 
     def test_export_all_ordering_is_stable(self):
-        self.db.add("id1", "A")
-        self.db.add("id2", "B")
-        self.db.add("id3", "C")
+        self.db.add("A")
+        self.db.add("B")
+        self.db.add("C")
         self.assertEqual([r["player_name"] for r in self.db.export_all()],
                          ["A", "B", "C"])
 
     def test_import_skip_strategy(self):
-        self.db.add("id1", "Name1", "原始备注", 1)
+        self.db.add("Name1", "原始备注")
         res = self.db.import_entries(
-            [{"player_id": "id1", "player_name": "Name1", "note": "新备注",
-              "tk_count": 9}], strategy="skip")
+            [{"player_name": "Name1", "note": "新备注"}], strategy="skip")
         self.assertEqual(res, {"inserted": 0, "skipped": 1, "updated": 0})
         self.assertEqual(self.db.get_all()[0]["note"], "原始备注")
 
-    def test_import_update_note_keeps_counters(self):
-        eid = self.db.add("id1", "Name1", "原始备注", 1)
-        self.db.record_encounter(eid, 100.0, "chat", "Name1", "")
-        last_seen = self.db.get(eid)["last_seen"]
+    def test_import_update_note_keeps_created_at(self):
+        eid = self.db.add("Name1", "原始备注")
+        created = self.db.get(eid)["created_at"]
 
         res = self.db.import_entries(
-            [{"player_id": "id1", "player_name": "Name1", "note": "新备注",
-              "tk_count": 7, "encounter_count": 999,
-              "last_seen": "2000-01-01 00:00:00"}],
+            [{"player_name": "Name1", "note": "新备注",
+              "created_at": "2000-01-01 00:00:00"}],
             strategy="update_note")
         self.assertEqual(res, {"inserted": 0, "skipped": 0, "updated": 1})
         row = self.db.get(eid)
         self.assertEqual(row["note"], "新备注")
-        self.assertEqual(row["tk_count"], 7)
-        self.assertEqual(row["encounter_count"], 1)      # 保留
-        self.assertEqual(row["last_seen"], last_seen)    # 保留
+        self.assertEqual(row["created_at"], created)     # 添加时间保持本机的
 
     def test_import_overwrite_strategy(self):
-        eid = self.db.add("id1", "Name1", "原始", 1)
-        self.db.record_encounter(eid, 100.0, "chat", "Name1", "")
+        eid = self.db.add("Name1", "原始")
         res = self.db.import_entries(
-            [{"player_id": "id1", "player_name": "Name1", "note": "覆盖",
-              "tk_count": 5, "encounter_count": 42,
-              "last_seen": "2000-01-01 00:00:00"}],
+            [{"player_name": "Name1", "note": "覆盖",
+              "created_at": "2000-01-01 00:00:00"}],
             strategy="overwrite")
         self.assertEqual(res["updated"], 1)
         row = self.db.get(eid)
         self.assertEqual(row["note"], "覆盖")
-        self.assertEqual(row["tk_count"], 5)
-        self.assertEqual(row["encounter_count"], 42)
-        self.assertEqual(row["last_seen"], "2000-01-01 00:00:00")
+        self.assertEqual(row["created_at"], "2000-01-01 00:00:00")
 
     def test_import_inserts_new_entries(self):
         res = self.db.import_entries(
-            [{"player_id": "new1", "player_name": "NewOne", "note": "n",
-              "tk_count": 3, "encounter_count": 2,
-              "created_at": "2020-01-01 00:00:00",
-              "last_seen": "2020-02-02 00:00:00"}],
+            [{"player_name": "NewOne", "note": "n",
+              "created_at": "2020-01-01 00:00:00"}],
             strategy="skip")
         self.assertEqual(res, {"inserted": 1, "skipped": 0, "updated": 0})
         row = self.db.get_all()[0]
         self.assertEqual(row["player_name"], "NewOne")
-        self.assertEqual(row["tk_count"], 3)
-        self.assertEqual(row["encounter_count"], 2)
         self.assertEqual(row["created_at"], "2020-01-01 00:00:00")
-        self.assertEqual(row["last_seen"], "2020-02-02 00:00:00")
 
-    def test_import_skips_empty_player_id(self):
+    def test_import_skips_rows_without_name(self):
         res = self.db.import_entries(
-            [{"player_id": "", "player_name": "NoId"},
-             {"player_name": "AlsoNoId"},
-             {"player_id": "  ", "player_name": "Blank"}],
+            [{"player_name": ""}, {"note": "只有备注"}, {"player_name": "  "}],
             strategy="skip")
         self.assertEqual(res, {"inserted": 0, "skipped": 3, "updated": 0})
         self.assertEqual(self.db.get_count(), 0)
 
-    def test_import_distinguishes_same_id_different_name(self):
-        self.db.add("id1", "NameA")
+    def test_import_same_name_case_insensitive_is_duplicate(self):
+        self.db.add("NameA")
         res = self.db.import_entries(
-            [{"player_id": "id1", "player_name": "NameB"}], strategy="skip")
-        self.assertEqual(res["inserted"], 1)          # 名字不同 → 新条目
+            [{"player_name": "namea"}], strategy="skip")
+        self.assertEqual(res["skipped"], 1)
+        self.assertEqual(self.db.get_count(), 1)
+        # 不同名字 → 新条目
+        res2 = self.db.import_entries(
+            [{"player_name": "NameB"}], strategy="skip")
+        self.assertEqual(res2["inserted"], 1)
         self.assertEqual(self.db.get_count(), 2)
 
-    def test_import_handles_bad_numbers(self):
+    def test_import_ignores_legacy_fields(self):
+        """老文件的 player_id / tk_count / encounter_count / last_seen 一律无视。"""
         res = self.db.import_entries(
             [{"player_id": "x", "player_name": "N", "tk_count": "abc",
-              "encounter_count": None}], strategy="skip")
+              "encounter_count": 99, "last_seen": "2020-01-01 00:00:00"}],
+            strategy="skip")
         self.assertEqual(res["inserted"], 1)
         row = self.db.get_all()[0]
-        self.assertEqual(row["tk_count"], 0)
-        self.assertEqual(row["encounter_count"], 0)
+        self.assertEqual(row["player_name"], "N")
+        self.assertNotIn("tk_count", row)
+        self.assertNotIn("last_seen", row)
 
     def test_import_ignores_non_dict_rows(self):
         res = self.db.import_entries(["junk", 42, None], strategy="skip")
@@ -589,18 +620,18 @@ class TestDatabase(TempCase):
 
     def test_import_rejects_unknown_strategy(self):
         with self.assertRaises(ValueError):
-            self.db.import_entries([{"player_id": "x"}], strategy="nope")
+            self.db.import_entries([{"player_name": "x"}], strategy="nope")
 
     def test_import_rolls_back_on_error(self):
         """整批导入中任一条出错 → 全部回滚，数据库保持原状。"""
-        self.db.add("keep", "KeepMe")
+        self.db.add("KeepMe")
         before = self.db.get_count()
 
         class Boom:
             """先给出一条合法数据，再抛异常 —— 用来验证整批回滚。"""
 
             def __iter__(self):
-                yield {"player_id": "ok1", "player_name": "WillRollback"}
+                yield {"player_name": "WillRollback"}
                 raise RuntimeError("模拟导入中断")
 
         with self.assertRaises(RuntimeError):
@@ -611,8 +642,7 @@ class TestDatabase(TempCase):
                          ["KeepMe"])
 
     def test_export_import_roundtrip(self):
-        eid = self.db.add("id1", "Name1", "备注", 2)
-        self.db.record_encounter(eid, 95.0, "chat", "Name1", "")
+        self.db.add("Name1", "备注")
         exported = self.db.export_all()
 
         other = BlacklistDB(self.path("other.db"))
@@ -620,14 +650,10 @@ class TestDatabase(TempCase):
             res = other.import_entries(exported, strategy="skip")
             self.assertEqual(res["inserted"], 1)
             row = other.get_all()[0]
-            self.assertEqual(row["player_id"], "id1")
             self.assertEqual(row["player_name"], "Name1")
             self.assertEqual(row["note"], "备注")
-            self.assertEqual(row["tk_count"], 2)
-            self.assertEqual(row["encounter_count"], 1)
             # 与源库完全一致（时间字段也一致）
             self.assertEqual(row["created_at"], exported[0]["created_at"])
-            self.assertEqual(row["last_seen"], exported[0]["last_seen"])
         finally:
             other.close()
 
@@ -639,13 +665,107 @@ class TestDatabase(TempCase):
 
 
 # ==========================================================================
+class TestLegacyMigration(TempCase):
+    """老库（含玩家ID与统计字段）自动升级，且名字不丢。"""
+
+    def _make_legacy_db(self):
+        """手写一份老结构 + 老数据（模拟用户升级前的 blacklist.db）。"""
+        import sqlite3
+        path = self.path("legacy.db")
+        conn = sqlite3.connect(path)
+        conn.executescript("""
+            CREATE TABLE blacklist (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                player_id TEXT NOT NULL,
+                player_name TEXT,
+                note TEXT,
+                tk_count INTEGER DEFAULT 0,
+                encounter_count INTEGER DEFAULT 0,
+                evidence_path TEXT,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                last_seen DATETIME,
+                UNIQUE(player_id, player_name)
+            );
+            CREATE TABLE encounters (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                blacklist_id INTEGER,
+                name_seen TEXT,
+                match_score REAL,
+                source TEXT,
+                screenshot_path TEXT,
+                seen_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            );
+        """)
+        conn.executemany(
+            "INSERT INTO blacklist (player_id, player_name, note, tk_count, "
+            "encounter_count, created_at, last_seen) VALUES (?,?,?,?,?,?,?)",
+            [
+                ("PlayerX", "", "名字填在ID栏", 0, 5, "2026-01-01 10:00:00",
+                 "2026-01-02 10:00:00"),
+                ("？", "", "", 0, 0, "2026-01-01 11:00:00", None),
+                ("76561198000000001", "PlayerX", "正常条目", 2, 7,
+                 "2026-01-01 12:00:00", "2026-01-03 10:00:00"),
+                ("-", "", "", 0, 0, "2026-01-01 13:00:00", None),   # 无名占位
+            ],
+        )
+        conn.execute(
+            "INSERT INTO encounters (blacklist_id, name_seen, match_score, "
+            "source, screenshot_path, seen_at) VALUES (1,'PlayerX',100,'chat',"
+            "'a.jpg','2026-01-02 10:00:00')")
+        conn.commit()
+        conn.close()
+        return path
+
+    def test_legacy_db_is_upgraded(self):
+        path = self._make_legacy_db()
+        db = BlacklistDB(path)
+        try:
+            cols = {r[1] for r in db.conn.execute("PRAGMA table_info(blacklist)")}
+            self.assertEqual(cols, {"id", "player_name", "note", "created_at"})
+            names = sorted(r["player_name"] for r in db.get_all())
+            # 名称栏为空的条目用 player_id 补名字；没有名字的占位行丢弃
+            self.assertEqual(names, ["PlayerX", "PlayerX", "？"])
+            # 备注与添加时间保留
+            by_name = {r["player_name"]: r for r in db.get_all()}
+            self.assertEqual(by_name["PlayerX"]["note"], "名字填在ID栏")
+            self.assertEqual(by_name["PlayerX"]["created_at"],
+                             "2026-01-01 10:00:00")
+            # 历史统计一并清空
+            self.assertEqual(db.get_total_encounter_count(), 0)
+            self.assertEqual(db.get_today_encounter_count(), 0)
+            # 名单里的 ? 依然可索引可命中
+            m = Matcher(db)
+            self.assertEqual(len(m.check(["？"])), 1)
+        finally:
+            db.close()
+
+    def test_migration_is_idempotent(self):
+        path = self._make_legacy_db()
+        for _ in range(2):
+            db = BlacklistDB(path)
+            try:
+                self.assertEqual(db.get_count(), 3)
+            finally:
+                db.close()
+
+    def test_migration_keeps_evidence_untouched(self):
+        """证据截图是磁盘上的文件，迁移不碰它（只是不再有 DB 索引行）。"""
+        path = self._make_legacy_db()
+        db = BlacklistDB(path)
+        try:
+            self.assertEqual(db.get_recent_encounters(), [])
+        finally:
+            db.close()
+
+
+# ==========================================================================
 class TestMatcher(TempCase):
     def setUp(self):
         super().setUp()
         self.db = BlacklistDB(self.path("blacklist.db"))
-        self.db.add("id1", "PlayerX", "老TK", 2)
-        self.db.add("id2", "John Doe", "空格名", 1)
-        self.db.add("id3", "阴影猎手", "中文名", 0)
+        self.db.add("PlayerX", "老TK")
+        self.db.add("John Doe", "空格名")
+        self.db.add("阴影猎手", "中文名")
         self.matcher = Matcher(self.db)
 
     def tearDown(self):
@@ -718,7 +838,7 @@ class TestMatcher(TempCase):
 
     def test_check_joins_ocr_split_name(self):
         """OCR 把一个名字拆成两行时，拼接后仍应精确命中。"""
-        self.db.add("id7", "SamplePlayer_01")
+        self.db.add("SamplePlayer_01")
         self.matcher.reload()
         hits = self.matcher.check(["SamplePlayer", "01", "RandomGuy"])
         self.assertEqual([h[0]["player_name"] for h in hits],
@@ -737,8 +857,8 @@ class TestMatcher(TempCase):
 
     def test_exact_match_outranks_fuzzy_prefix(self):
         """较短的模糊候选不能抢走较长的精确候选。"""
-        self.db.add("id7", "SamplePlayer_01")
-        self.db.add("id8", "SamplePlayer_02")
+        self.db.add("SamplePlayer_01")
+        self.db.add("SamplePlayer_02")
         self.matcher.reload()
         hits = self.matcher.check(["SamplePlayer", "01"])
         self.assertEqual(hits[0][0]["player_name"], "SamplePlayer_01")
@@ -749,7 +869,7 @@ class TestMatcher(TempCase):
 
     def test_reload_picks_up_new_entries(self):
         self.assertEqual(self.matcher.check(["NewGuy"]), [])
-        self.db.add("id9", "NewGuy")
+        self.db.add("NewGuy")
         self.matcher.reload()
         self.assertEqual(len(self.matcher.check(["NewGuy"])), 1)
 
@@ -774,9 +894,9 @@ class TestSymbolNames(TempCase):
     def setUp(self):
         super().setUp()
         self.db = BlacklistDB(self.path("b.db"))
-        self.db.add("-", "?")
-        self.db.add("idn", "PlayerX")
-        self.db.add("idw", "playery")
+        self.db.add("?")
+        self.db.add("PlayerX")
+        self.db.add("PlayerY")
         self.matcher = Matcher(self.db)
 
     def tearDown(self):
@@ -817,9 +937,9 @@ class TestSymbolNames(TempCase):
                          "PlayerX")
 
     def test_symbol_entry_coexists_with_normal_ones(self):
-        hits = self.matcher.check(["PlayerX", "?", "playery"])
+        hits = self.matcher.check(["PlayerX", "?", "PlayerY"])
         self.assertEqual({h[0]["player_name"] for h in hits},
-                         {"PlayerX", "?", "playery"})
+                         {"PlayerX", "?", "PlayerY"})
 
     def test_symbol_key_helper(self):
         from app.core.matcher import fold, symbol_key
@@ -828,7 +948,64 @@ class TestSymbolNames(TempCase):
         self.assertEqual(symbol_key("★☆"), "★☆")
         self.assertEqual(symbol_key("PlayerX"), "")
         self.assertEqual(symbol_key(""), "")
-        self.assertEqual(fold("Ｎｅａｌ"), "playerx")
+        self.assertEqual(fold("ＰｌａｙｅｒＸ"), "playerx")
+
+
+# ==========================================================================
+class TestSymbolAndNormalNamesTogether(TempCase):
+    """一行里同时出现普通名字与纯符号名字时，**两条都要报**。
+
+    回归：用户实测「聊天里明明出现了 `？`，却只报了 PlayerX」。除了索引问题，
+    还要确认匹配本身不会"报了一个就收工"。
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.db = BlacklistDB(self.path("b.db"))
+        self.db.add("？")
+        self.db.add("PlayerX")
+        self.matcher = Matcher(self.db)
+
+    def tearDown(self):
+        self.db.close()
+        super().tearDown()
+
+    def test_index_count_matches_entry_count(self):
+        self.assertEqual(len(self.db.get_all()), 2)
+        self.assertEqual(self.matcher.reload(), 2)
+
+    def test_symbol_name_is_indexed(self):
+        self.assertIn("?", self.matcher.symbol_names())
+        self.assertIn("?", self.matcher.name_allowlist())
+
+    def test_check_matches_symbol_name(self):
+        hits = self.matcher.check(["?"])
+        self.assertEqual(len(hits), 1)
+        self.assertEqual(hits[0][0]["player_name"], "？")
+        self.assertEqual(hits[0][1], 100.0)
+
+    def test_match_text_finds_both_symbol_and_normal_name(self):
+        hits = self.matcher.match_text("PlayerX: asd PlayerX: ? PlayerX: PlayerY")
+        self.assertEqual({h[0]["player_name"] for h in hits}, {"PlayerX", "？"})
+
+    def test_fullwidth_and_halfwidth_both_hit(self):
+        self.assertEqual(len(self.matcher.match_text("？ : 你好")), 1)
+        self.assertEqual(len(self.matcher.match_text("? : hi")), 1)
+
+    def test_entry_without_name_is_reported_not_silently_dropped(self):
+        """没有名字的条目既不静默丢，也不假装索引成功。
+
+        正常路径下 database.add() 会拦住这种行，但历史/手改过的库里可能有，
+        所以索引时必须自己兜住并说出来。
+        """
+        self.db.conn.execute(
+            "INSERT INTO blacklist (player_name) VALUES ('')")
+        self.db.conn.commit()
+        with self.assertLogs("matcher", level="WARNING") as captured:
+            count = self.matcher.reload()
+        self.assertEqual(count, 2)
+        self.assertTrue(any("无法参与匹配" in line
+                            for line in captured.output), captured.output)
 
 
 # ==========================================================================
@@ -838,7 +1015,7 @@ class TestConfusableNames(TempCase):
     def setUp(self):
         super().setUp()
         self.db = BlacklistDB(self.path("b.db"))
-        self.db.add("id1", "Player_01")
+        self.db.add("Player_01")
         self.matcher = Matcher(self.db)
 
     def tearDown(self):
@@ -859,7 +1036,7 @@ class TestConfusableNames(TempCase):
 
     def test_ambiguous_confusion_is_refused(self):
         """两个不同条目折叠到同一个键时，宁可不认也不能认错。"""
-        self.db.add("id2", "Player_0l")          # 与 Player_01 折叠后同键
+        self.db.add("Player_0l")          # 与 Player_01 折叠后同键
         self.matcher.reload()
         hits = self.matcher.check(["PlayerO1"])
         self.assertFalse([h for h in hits if h[1] >= 100.0],

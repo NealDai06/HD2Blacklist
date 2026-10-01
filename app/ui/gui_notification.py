@@ -7,6 +7,10 @@
 - [恢复默认] 删除 data/notification.json
 - [保存] 深合并写入 data/notification.json，无需重启即生效
 
+提供两层：
+    * ``NotificationPanel``  —— 可嵌入任意容器的 Frame（主界面设置分页用它）
+    * ``NotificationSettingsDialog`` —— 薄薄的 Toplevel 包装，保留给旧调用方
+
 所有 tkinter 操作都在主线程。
 """
 from __future__ import annotations
@@ -29,42 +33,40 @@ _POSITION_LABELS = {
 }
 
 
-class NotificationSettingsDialog:
-    """通知设置对话框。"""
+class NotificationPanel(ttk.Frame):
+    """通知设置面板（可嵌入）。
 
-    def __init__(self, master, notification_config, notifier, on_saved=None):
-        self.master = master
+    既能独立成对话框（``NotificationSettingsDialog`` 包一层 Toplevel），
+    也能直接嵌进主界面的「设置 → 通知」分页。嵌入模式下 [取消] 变成
+    [放弃修改]（从配置重新读一遍），不会去销毁任何窗口。
+    """
+
+    def __init__(self, master, notification_config, notifier, on_saved=None,
+                 embedded=False):
+        super().__init__(master)
         self.cfg = notification_config
         self.notifier = notifier
         self.on_saved = on_saved
+        self.embedded = bool(embedded)
         self.log = get_logger("gui_notify")
 
         self.preview_photo = None
         self._preview_job = None
         self._loading = True
-
-        self.top = tk.Toplevel(master)
-        self.top.title("通知设置")
-        self.top.transient(master)
-        self.top.configure(bg=theme.PALETTE["bg"])
-        theme.apply_window_icon(self.top)
-        self.top.protocol("WM_DELETE_WINDOW", self.close)
-        self.top.resizable(False, False)
+        self.top = self                      # 统一容器别名（历史代码用 self.top）
 
         self._init_vars()
         self._build()
         self._load_from_config()
         self._loading = False
         self._schedule_preview()
-        self._center()
 
     # ---------------------------------------------------------------- 变量
     def _init_vars(self):
         d = self.cfg.get()
         self.title_var = tk.StringVar()
         self.show_vars = {k: tk.BooleanVar() for k in
-                          ("note", "tk_count", "match_score", "time",
-                           "source", "last_seen")}
+                          ("note", "match_score", "time", "source")}
         self.image_mode_var = tk.StringVar()
         self.image_path_var = tk.StringVar()
         self.image_w_var = tk.IntVar()
@@ -104,6 +106,11 @@ class NotificationSettingsDialog:
 
     # ---------------------------------------------------------------- 构建
     def _build(self):
+        # 嵌入主界面时动作条放最上面：表单比可视区高的时候，[保存] 也永远
+        # 在视野里，不用先滚到底。
+        if self.embedded:
+            self._build_buttons()
+            self._build_extra_hint()
         body = ttk.Frame(self.top)
         body.pack(fill="both", expand=True, padx=10, pady=8)
 
@@ -120,7 +127,8 @@ class NotificationSettingsDialog:
         self._build_sound_tab(nb)
 
         self._build_preview(right)
-        self._build_buttons()
+        if not self.embedded:
+            self._build_buttons()
 
     # ---- 文案 ----
     def _build_text_tab(self, nb):
@@ -145,9 +153,8 @@ class NotificationSettingsDialog:
 
         box = ttk.LabelFrame(tab, text="字段显示开关")
         box.grid(row=4, column=0, columnspan=2, sticky="we", pady=(10, 0))
-        names = {"note": "备注", "tk_count": "TK次数",
-                 "match_score": "匹配度", "time": "时间",
-                 "source": "来源", "last_seen": "最后遇见"}
+        names = {"note": "备注", "match_score": "匹配度", "time": "时间",
+                 "source": "来源"}
         for i, (k, label) in enumerate(names.items()):
             ttk.Checkbutton(box, text=label, variable=self.show_vars[k]).grid(
                 row=i // 3, column=i % 3, sticky="w", padx=8, pady=2)
@@ -345,13 +352,13 @@ class NotificationSettingsDialog:
 
     def _build_buttons(self):
         bar = ttk.Frame(self.top)
-        bar.pack(fill="x", padx=10, pady=(0, 6))
+        bar.pack(fill="x", padx=10, pady=(6 if self.embedded else 0, 6))
         ttk.Label(bar, textvariable=self.status_var,
                   foreground="#0a6").pack(side="left")
-        ttk.Button(bar, text="取消", command=self.close).pack(side="right",
-                                                             padx=3)
-        ttk.Button(bar, text="保存", command=self.save).pack(side="right",
-                                                            padx=3)
+        ttk.Button(bar, text="放弃修改" if self.embedded else "取消",
+                   command=self.close).pack(side="right", padx=3)
+        ttk.Button(bar, text="保存", style="Accent.TButton",
+                   command=self.save).pack(side="right", padx=3)
         ttk.Button(bar, text="恢复默认", command=self.reset).pack(side="right",
                                                                 padx=3)
         ttk.Button(bar, text="测试通知", command=self.test_alert).pack(
@@ -359,12 +366,21 @@ class NotificationSettingsDialog:
         ttk.Button(bar, text="实时预览", command=self.show_overlay_preview
                    ).pack(side="right", padx=3)
 
+    def _build_extra_hint(self):
+        ttk.Label(self.top,
+                  text="改完点 [保存] 立即生效（写入 data/notification.json）；"
+                       "内容较高时可滚动查看。",
+                  style="Muted.TLabel").pack(anchor="w", padx=12)
+
     def _center(self):
-        self.top.update_idletasks()
-        w, h = self.top.winfo_width(), self.top.winfo_height()
-        x = self.master.winfo_rootx() + (self.master.winfo_width() - w) // 2
-        y = self.master.winfo_rooty() + (self.master.winfo_height() - h) // 3
-        self.top.geometry(f"+{max(0, x)}+{max(0, y)}")
+        """（仅对话框模式使用）把窗口居中到父窗口。"""
+        win = self.winfo_toplevel()
+        win.update_idletasks()
+        w, h = win.winfo_width(), win.winfo_height()
+        master = win.master
+        x = master.winfo_rootx() + (master.winfo_width() - w) // 2
+        y = master.winfo_rooty() + (master.winfo_height() - h) // 3
+        win.geometry(f"+{max(0, x)}+{max(0, y)}")
 
     # ------------------------------------------------------------ 读写配置
     def _load_from_config(self):
@@ -499,7 +515,7 @@ class NotificationSettingsDialog:
             self.status_var.set("已发送实时预览" if ok
                                 else "Overlay 不可用，无法预览")
         except Exception as e:                           # noqa: BLE001
-            messagebox.showerror("预览失败", str(e), parent=self.top)
+            messagebox.showerror("预览失败", str(e), parent=self.winfo_toplevel())
 
     def test_alert(self):
         try:
@@ -507,7 +523,7 @@ class NotificationSettingsDialog:
             self.notifier.play_sound(self._collect().get("sound"))
             self.status_var.set("已发送测试通知（含音效）")
         except Exception as e:                           # noqa: BLE001
-            messagebox.showerror("测试失败", str(e), parent=self.top)
+            messagebox.showerror("测试失败", str(e), parent=self.winfo_toplevel())
 
     def _test_sound(self):
         sound = (self._collect().get("sound") or {})
@@ -516,12 +532,12 @@ class NotificationSettingsDialog:
             if not p or not os.path.isfile(p):
                 messagebox.showwarning(
                     "无法试听", "请先用 [浏览…] 选择一个存在的音频文件。",
-                    parent=self.top)
+                    parent=self.winfo_toplevel())
                 return
         try:
             self.notifier.play_sound(sound)
         except Exception as e:                           # noqa: BLE001
-            messagebox.showerror("试听失败", str(e), parent=self.top)
+            messagebox.showerror("试听失败", str(e), parent=self.winfo_toplevel())
 
     # ---------------------------------------------------------------- 动作
     def _import_asset(self, path, kind):
@@ -535,7 +551,7 @@ class NotificationSettingsDialog:
         except asset_store.AssetError as e:
             messagebox.showwarning(
                 "未能复制到 data/assets",
-                f"{e}\n\n将继续直接引用原文件：\n{path}", parent=self.top)
+                f"{e}\n\n将继续直接引用原文件：\n{path}", parent=self.winfo_toplevel())
             self.status_var.set(f"{kind}未能复制，已直接引用原文件")
             return os.path.abspath(path)
         if os.path.normcase(saved) != os.path.normcase(os.path.abspath(path)):
@@ -548,7 +564,7 @@ class NotificationSettingsDialog:
 
     def _pick_image(self):
         path = filedialog.askopenfilename(
-            parent=self.top, title="选择提示图片",
+            parent=self.winfo_toplevel(), title="选择提示图片",
             initialdir=asset_store.assets_dir(),
             filetypes=list(asset_store.IMAGE_FILETYPES))
         if path:
@@ -557,7 +573,7 @@ class NotificationSettingsDialog:
 
     def _pick_sound(self):
         path = filedialog.askopenfilename(
-            parent=self.top, title="选择音效文件",
+            parent=self.winfo_toplevel(), title="选择音效文件",
             initialdir=asset_store.assets_dir(),
             filetypes=list(asset_store.AUDIO_FILETYPES))
         if path:
@@ -566,7 +582,7 @@ class NotificationSettingsDialog:
 
     def _pick_color(self, var):
         cur = var.get() or "#ffffff"
-        rgb, _ = colorchooser.askcolor(color=cur, parent=self.top,
+        rgb, _ = colorchooser.askcolor(color=cur, parent=self.winfo_toplevel(),
                                        title="选择颜色")
         if rgb:
             var.set("#%02x%02x%02x" % tuple(int(c) for c in rgb))
@@ -579,12 +595,12 @@ class NotificationSettingsDialog:
             if self.on_saved:
                 self.on_saved()
         except Exception as e:                           # noqa: BLE001
-            messagebox.showerror("保存失败", str(e), parent=self.top)
+            messagebox.showerror("保存失败", str(e), parent=self.winfo_toplevel())
 
     def reset(self):
         if not messagebox.askyesno("确认", "恢复全部通知设置为默认值？\n"
                                           "（会删除 data/notification.json）",
-                                   parent=self.top):
+                                   parent=self.winfo_toplevel()):
             return
         try:
             self.cfg.reset()
@@ -596,17 +612,68 @@ class NotificationSettingsDialog:
             if self.on_saved:
                 self.on_saved()
         except Exception as e:                           # noqa: BLE001
-            messagebox.showerror("恢复失败", str(e), parent=self.top)
+            messagebox.showerror("恢复失败", str(e), parent=self.winfo_toplevel())
 
     def close(self):
-        # 取消挂起的预览任务：否则窗口销毁后 Tcl 还会去调用已消失的回调，
-        # 控制台会刷 `invalid command name "..."`。
+        """对话框模式：关窗；嵌入模式：丢弃未保存的改动。"""
+        self._cancel_preview_job()
+        if self.embedded:
+            self._loading = True
+            self._load_from_config()
+            self._loading = False
+            self._refresh_preview()
+            self.status_var.set("已放弃未保存的修改")
+            return
+        try:
+            self.winfo_toplevel().destroy()
+        except tk.TclError:
+            pass
+
+    def _cancel_preview_job(self):
+        """取消挂起的预览任务。
+
+        否则窗口销毁后 Tcl 还会去调用已消失的回调，控制台会刷
+        `invalid command name "..."`。
+        """
         if self._preview_job is not None:
             try:
-                self.top.after_cancel(self._preview_job)
+                self.after_cancel(self._preview_job)
             except Exception:                            # noqa: BLE001
                 pass
             self._preview_job = None
+
+
+class NotificationSettingsDialog:
+    """独立窗口版。保留给第三方 / 旧调用方。"""
+
+    def __init__(self, master, notification_config, notifier, on_saved=None):
+        self.master = master
+        self.top = tk.Toplevel(master)
+        self.top.title("通知设置")
+        self.top.transient(master)
+        self.top.configure(bg=theme.PALETTE["bg"])
+        theme.apply_window_icon(self.top)
+        self.top.protocol("WM_DELETE_WINDOW", self.close)
+        self.top.resizable(False, False)
+
+        self.panel = NotificationPanel(self.top, notification_config, notifier,
+                                       on_saved=on_saved, embedded=False)
+        self.panel.pack(fill="both", expand=True)
+        self.panel._center()
+
+    def __getattr__(self, name):
+        """把 title_var / _collect / save 之类的访问转发给内部面板。"""
+        panel = self.__dict__.get("panel")
+        if panel is not None:
+            return getattr(panel, name)
+        raise AttributeError(name)
+
+    def close(self):
+        """显式实现：protocol() 绑定时面板可能还没建好。"""
+        panel = self.__dict__.get("panel")
+        if panel is not None:
+            panel.close()
+            return
         try:
             self.top.destroy()
         except tk.TclError:

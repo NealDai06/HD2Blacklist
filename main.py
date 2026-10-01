@@ -1,8 +1,9 @@
 # -*- coding: utf-8 -*-
 """main.py —— 入口脚本（薄壳）。
 
-真正的应用在 `app/application.py`。这里只做两件事：
-把仓库根放进 `sys.path`，然后把控制权交给 `app.application.main()`。
+真正的应用在 `app/application.py`。这里只做三件事：
+把仓库根放进 `sys.path`、补上仓库自带的依赖目录（`.pylibs` / `.devtools`），
+然后把控制权交给 `app.application.main()`。
 
 用法：
     python main.py                      正常启动 GUI
@@ -10,6 +11,10 @@
     python main.py --capture-debug      抓三个监视区域 + OCR，输出调试图
     python main.py --preview-notification   离线渲染一张通知预览图
     python main.py --debug              打开 DEBUG 日志
+
+**不需要**先设 PYTHONPATH：仓库根与自带的依赖目录都会在这里补上
+（见 app/_bootstrap.py —— 少了这一步就会出现"OCR 不可用 → 扫描永远
+识别 0 个名字"的假故障）。
 
 PyInstaller 也以本文件为入口（见 build.py），
 `from app.application import ...` 会被静态分析顺着收进包里。
@@ -23,6 +28,11 @@ import sys
 _ROOT = os.path.dirname(os.path.abspath(__file__))
 if _ROOT not in sys.path:
     sys.path.insert(0, _ROOT)
+
+# 仓库自带的第三方库（.pylibs / .devtools）——必须在导入 app.* 之前加
+from app._bootstrap import add_vendored_libs                     # noqa: E402
+
+add_vendored_libs(_ROOT)
 
 from app.application import main                     # noqa: E402
 

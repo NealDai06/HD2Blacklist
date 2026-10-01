@@ -107,6 +107,10 @@ class HD2BlacklistApp:
         # ChatScanner 需要 scheduler 才能匹配 / 计数 / 弹提示
         self.chat_scanner.scheduler = self.scheduler
 
+        # 调度器的"给用户看的动态"（游戏启动/退出、命中、去重、会话结束…）
+        # 直接进界面状态栏的「最近动态」，而不是只躺在 app.log 里。
+        self.scheduler.on_event = self._on_scheduler_event
+
         if self.gui is not None:
             self.gui.scheduler = self.scheduler
             self.gui.app = self
@@ -204,6 +208,13 @@ class HD2BlacklistApp:
         return self.chat_hotkey.status_text()
 
     # ---------------------------------------------------------------- 工具
+    def _on_scheduler_event(self, text: str, level: str = "info"):
+        """ScanScheduler.report() 的回调（**在后台线程里**执行）。
+
+        只做转发：真正的界面更新由 GUI 排进主线程队列。
+        """
+        self._gui_call("notify_event", text, level)
+
     def _gui_call(self, method: str, *args, **kwargs):
         """把 GUI 调用排到主线程（后台线程只能这么做）。"""
         if self.gui is None:
@@ -260,9 +271,19 @@ class HD2BlacklistApp:
         ok = self.ocr.warmup()
         if ok:
             self.log.info("OCR 引擎预热完成")
-        else:
-            self.log.warning("OCR 引擎不可用（未安装 rapidocr？），"
-                             "匹配功能仍可手工测试")
+            return
+        # OCR 不可用 = 扫描永远识别不到东西。这事必须**在界面上**说出来，
+        # 否则用户看到的只是"扫描没反应/识别 0 个名字"，根本猜不到原因
+        # （真实故障：源码运行时没带上 .pylibs，少了 rapidocr）。
+        reason = ""
+        try:
+            reason = self.ocr.unavailable_reason
+        except Exception:                                # noqa: BLE001
+            reason = ""
+        text = f"OCR 引擎不可用，扫描不会有任何结果：{reason or '未安装 rapidocr'}"
+        self.log.error("%s", text)
+        self._gui_call("notify_event", text, "warn")
+        self._gui_call("set_status", "OCR 引擎不可用 —— 扫描不会识别出任何内容")
 
     # ---------------------------------------------------------------- 关闭
     def shutdown(self):
@@ -463,7 +484,7 @@ def run_self_check() -> int:
             pass
         db = DB(tmp)
         try:
-            db.add("selftest", "自检条目", "导入导出自检", 1)
+            db.add("自检条目", "导入导出自检")
             rows = db.export_all()
             if len(rows) != 1:
                 raise RuntimeError(f"导出条数异常: {len(rows)}")
@@ -471,13 +492,12 @@ def run_self_check() -> int:
             if res["skipped"] != 1:
                 raise RuntimeError(f"重复导入应全部跳过，实际 {res}")
             res2 = db.import_entries(
-                [{"player_id": "new", "player_name": "新增",
-                  "note": "x", "tk_count": "3"}], strategy="skip")
+                [{"player_name": "新增", "note": "x"}], strategy="skip")
             if res2["inserted"] != 1:
                 raise RuntimeError(f"新条目应被插入，实际 {res2}")
-            res3 = db.import_entries([{"player_id": "", "note": "no id"}])
+            res3 = db.import_entries([{"player_name": "", "note": "no name"}])
             if res3["skipped"] != 1:
-                raise RuntimeError("空 player_id 应被跳过")
+                raise RuntimeError("没有名字的行应被跳过")
             return "export_all / import_entries 就绪"
         finally:
             db.close()
@@ -514,14 +534,22 @@ def run_self_check() -> int:
         os.close(fd)
         db = DB(tmp)
         try:
-            db.add("-", "?")
+            db.add("?")
+            db.add("★")
+            db.add("PlayerX")
             m = M(db)
+            if m.reload() != 3:
+                raise RuntimeError("三个名字没能全部进索引")
             if not m.check(["?"]):
                 raise RuntimeError("黑名单里的 `?` 无法被 check() 命中")
             if not m.check(["？"]):                 # 全角也要能对上
                 raise RuntimeError("全角 `？` 无法命中半角 `?` 条目")
+            if not m.check(["★"]):
+                raise RuntimeError("纯符号名 `★` 无法被命中")
             if not m.match_text("? : hello"):
                 raise RuntimeError("聊天文本里的 `?` 无法命中")
+            if not m.match_text("PlayerX: asd PlayerX: ?"):
+                raise RuntimeError("一行里同时出现普通名字与 `?` 时漏检")
             if not is_valid_player_name("?", m.name_allowlist()):
                 raise RuntimeError("OCR 名字过滤器会把 `?` 丢掉")
             if is_valid_player_name("???", m.name_allowlist()):
@@ -589,7 +617,7 @@ def run_self_check() -> int:
         from PIL import Image
         eng = OCREngine()
         if not eng.warmup():
-            raise RuntimeError("RapidOCR 不可用（未安装或模型缺失）")
+            raise RuntimeError(eng.unavailable_reason or "RapidOCR 不可用")
         out = eng.recognize_raw(Image.new("RGB", (200, 40), (0, 0, 0)))
         return f"RapidOCR 就绪，空图返回 {len(out)} 个结果"
 
@@ -725,9 +753,8 @@ def run_notification_preview() -> int:
     ap = cfg.get("appearance") or {}
     width = max(160, int(ap.get("width", 360)))
     height = max(60, int(ap.get("height", 100)))
-    entry = {"player_name": "SamplePlayer_01", "player_id": "76561198000000001",
-             "note": "示例条目：疑似故意 TK 队友", "tk_count": 2,
-             "last_seen": "2026-01-02 03:04:05"}
+    entry = {"player_name": "SamplePlayer_01",
+             "note": "示例条目：疑似故意 TK 队友"}
     img = render_overlay(cfg, entry, 94.0, "chat", width, height)
     out = os.path.join(config.LOG_DIR, "notification_preview.png")
     os.makedirs(config.LOG_DIR, exist_ok=True)

@@ -1,6 +1,16 @@
 # -*- coding: utf-8 -*-
 """gui.py —— 主界面。
 
+布局（单页五段，每个功能只有一个入口）：
+    ① 运行状态带   应用标识 + 监控灯 + 统计 + F8 开关 + [扫描聊天框]/[暂停]/[退出]
+    ② 名单工具带   增删改查 + 搜索 + 排序 + 导入导出
+    ③ 名单主区     表格（占满剩余空间）
+    ④ 设置分页     扫描与触发 / 通知 / 监视区域 / 数据 / 帮助（默认收起，可拖拽分隔）
+    ⑤ 状态栏       「最近动态」事件流（3 行，带时间戳）+ 当前状态 + 统计
+
+没有菜单栏：菜单里曾经和工具栏重复的入口全部收敛到 ①②④，避免"同一个设置
+在两处出现、两处不一致"。
+
 红线：**所有 tkinter 操作都在主线程**。
 后台线程（扫描会话 / 进程监控 / ESC / 托盘）只能往两个 queue 里塞东西：
     * _update_queue —— 命中数据（enqueue_encounter_update）
@@ -9,11 +19,13 @@
 """
 from __future__ import annotations
 
+import collections
 import csv
 import json
 import os
 import queue
 import threading
+import time
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
@@ -21,18 +33,57 @@ from app import config
 from app.ui import theme
 from app.config import GUI_QUEUE_POLL_MS, get_logger
 
-COLUMNS = ("player_id", "player_name", "note", "tk_count",
-           "encounter_count", "created_at", "last_seen")
-HEADERS = {
-    "player_id": "玩家ID", "player_name": "名称", "note": "备注",
-    "tk_count": "TK次数", "encounter_count": "遇到次数",
-    "created_at": "添加时间", "last_seen": "最后遇见",
-}
-WIDTHS = {"player_id": 170, "player_name": 150, "note": 240, "tk_count": 70,
-          "encounter_count": 80, "created_at": 145, "last_seen": 145}
+#: 名单只有三列：名字 / 备注 / 添加时间。
+#: 玩家ID、TK次数、遇到次数、最后遇见都删掉了（v1.1.2）—— 名单只回答
+#: "这个名字要不要提醒"，统计去 app.log 和 evidence/ 里看。
+COLUMNS = ("player_name", "note", "created_at")
+HEADERS = {"player_name": "名称", "note": "备注", "created_at": "添加时间"}
+WIDTHS = {"player_name": 220, "note": 520, "created_at": 165}
 
-SORT_OPTIONS = (("last_seen", "按最后遇见"), ("encounter_count", "按遇到次数"),
-                ("created_at", "按添加时间"), ("tk_count", "按TK次数"))
+SORT_OPTIONS = (("created_at", "按添加时间"), ("player_name", "按名称"))
+
+# --------------------------------------------------------------------------
+# 布局常量
+# --------------------------------------------------------------------------
+#: 默认窗口尺寸与最小尺寸（原来 1120x660 装不下「名单 + 展开的设置区」）
+DEFAULT_WIDTH, DEFAULT_HEIGHT = 1280, 820
+#: 1060 = 名单工具带自然宽度（约 1030）+ 余量；再窄按钮就会被 pack 挤扁
+MIN_WIDTH, MIN_HEIGHT = 1060, 640
+
+#: 下方设置区分页（key, 标签）。顺序 = 标签栏从左到右的顺序
+SETTINGS_TABS = (
+    ("scan", "扫描与触发"),
+    ("notify", "通知"),
+    ("region", "监视区域"),
+    ("data", "数据"),
+    ("help", "帮助"),
+)
+#: 设置区展开时占的高度
+SETTINGS_HEIGHT = 330
+#: 设置区收起时只剩一条标签栏
+SETTINGS_COLLAPSED_HEIGHT = 38
+#: 名单主区至少留这么高，免得设置区把列表挤没
+MIN_LIST_HEIGHT = 160
+#: 面板高度变化不超过这个像素数就当成"自己挪分隔条造成的抖动"，不再重摆
+JITTER_TOLERANCE = 4
+#: 收起态高度的上限（标签栏一行；超过说明控件还没被摆成一行、reqheight 虚高）
+MAX_COLLAPSED_HEIGHT = 96
+#: 状态栏里「最近动态」保留几行（最新在最上面）
+EVENT_ROWS = 3
+
+HELP_TEXT = (
+    "触发扫描的方式：\n"
+    "  · 聊天框（按需）：点顶部 [扫描聊天框] 或按你自己设的快捷键，才抓一次图\n"
+    "    + 跑一次 OCR；平时完全不扫聊天框，不占 CPU。\n"
+    f"  · 冷启动：游戏启动后自动扫一次 HUD 玩家列表。\n"
+    "  · ESC：按 ESC 打开菜单时自动扫一次菜单玩家列表。\n\n"
+    f"命中去重：同一玩家 {config.HIT_DEDUP_WINDOW} 秒内只计数一次、只提示一次。\n"
+    "批量命中：一次扫到多个黑名单玩家时，每人一个通知栏、只播一次音效\n"
+    "  （最多同时弹 5 个，超出的汇总在最后一栏）。\n\n"
+    "本工具不注入、不读内存、不改包，仅截图 + OCR + 本地比对。\n"
+    "重复打开不会多开进程：会把已经运行的那个窗口叫到前台。\n"
+    "关闭窗口 = 最小化到托盘，监控继续；要退出请点顶部 [退出]。"
+)
 
 
 # ==========================================================================
@@ -52,49 +103,31 @@ class EntryDialog:
         self.top.grab_set()
 
         self.vars = {
-            "player_id": tk.StringVar(value=(entry or {}).get("player_id") or ""),
             "player_name": tk.StringVar(value=(entry or {}).get("player_name") or ""),
-            "tk_count": tk.StringVar(value=str((entry or {}).get("tk_count") or 0)),
-            "evidence_path": tk.StringVar(
-                value=(entry or {}).get("evidence_path") or ""),
         }
 
         frm = ttk.Frame(self.top, padding=12)
         frm.pack(fill="both", expand=True)
         frm.columnconfigure(1, weight=1)
 
-        ttk.Label(frm, text="玩家ID：").grid(row=0, column=0, sticky="w", pady=4)
-        ttk.Entry(frm, textvariable=self.vars["player_id"], width=38).grid(
+        ttk.Label(frm, text="玩家名称：").grid(row=0, column=0, sticky="w", pady=4)
+        ttk.Entry(frm, textvariable=self.vars["player_name"], width=38).grid(
             row=0, column=1, columnspan=2, sticky="we", pady=4)
 
-        ttk.Label(frm, text="玩家名称：").grid(row=1, column=0, sticky="w", pady=4)
-        ttk.Entry(frm, textvariable=self.vars["player_name"], width=38).grid(
-            row=1, column=1, columnspan=2, sticky="we", pady=4)
-
-        ttk.Label(frm, text="TK次数：").grid(row=2, column=0, sticky="w", pady=4)
-        ttk.Spinbox(frm, from_=0, to=9999, width=8,
-                    textvariable=self.vars["tk_count"]).grid(
-            row=2, column=1, sticky="w", pady=4)
-
-        ttk.Label(frm, text="备注描述：").grid(row=3, column=0, sticky="nw", pady=4)
+        ttk.Label(frm, text="备注描述：").grid(row=1, column=0, sticky="nw", pady=4)
         self.note_text = tk.Text(frm, width=40, height=5, wrap="word")
         theme.style_text(self.note_text)
-        self.note_text.grid(row=3, column=1, columnspan=2, sticky="we", pady=4)
+        self.note_text.grid(row=1, column=1, columnspan=2, sticky="we", pady=4)
         if entry and entry.get("note"):
             self.note_text.insert("1.0", entry["note"])
 
-        ttk.Label(frm, text="证据截图：").grid(row=4, column=0, sticky="w", pady=4)
-        ttk.Entry(frm, textvariable=self.vars["evidence_path"]).grid(
-            row=4, column=1, sticky="we", pady=4)
-        ttk.Button(frm, text="浏览…", command=self._pick).grid(
-            row=4, column=2, padx=4)
-
-        ttk.Label(frm, text="玩家ID 与 名称 至少填一项；(ID, 名称) 组合不可重复。",
-                  foreground="#888888").grid(row=5, column=0, columnspan=3,
-                                             sticky="w", pady=(6, 0))
+        ttk.Label(frm, text="只需填玩家名称（就是游戏里显示的那个名字）；同名只能有一条。\n"
+                            "命中时的证据截图由程序自动保存到 data\\evidence\\，不用手填。",
+                  foreground="#888888", justify="left").grid(
+            row=2, column=0, columnspan=3, sticky="w", pady=(6, 0))
 
         bar = ttk.Frame(frm)
-        bar.grid(row=6, column=0, columnspan=3, sticky="e", pady=(10, 0))
+        bar.grid(row=3, column=0, columnspan=3, sticky="e", pady=(10, 0))
         ttk.Button(bar, text="取消", command=self._cancel).pack(side="right",
                                                                padx=4)
         ttk.Button(bar, text="确定", command=self._ok).pack(side="right")
@@ -107,27 +140,13 @@ class EntryDialog:
         self.top.geometry(f"+{max(0, x)}+{max(0, y)}")
         self.top.wait_window()
 
-    def _pick(self):
-        path = filedialog.askopenfilename(
-            parent=self.top, title="选择证据截图",
-            filetypes=[("图片", "*.png *.jpg *.jpeg *.bmp"), ("所有文件", "*.*")])
-        if path:
-            self.vars["evidence_path"].set(path)
-
     def _ok(self):
         data = {
-            "player_id": self.vars["player_id"].get().strip(),
             "player_name": self.vars["player_name"].get().strip(),
             "note": self.note_text.get("1.0", "end-1c").strip(),
-            "evidence_path": self.vars["evidence_path"].get().strip(),
         }
-        try:
-            data["tk_count"] = max(0, int(self.vars["tk_count"].get() or 0))
-        except ValueError:
-            messagebox.showwarning("输入有误", "TK次数必须是整数", parent=self.top)
-            return
-        if not data["player_id"] and not data["player_name"]:
-            messagebox.showwarning("输入有误", "玩家ID 与 名称 至少填一项",
+        if not data["player_name"]:
+            messagebox.showwarning("输入有误", "玩家名称不能为空（就是你看到的那个名字）",
                                    parent=self.top)
             return
         self.result = data
@@ -142,8 +161,7 @@ class EntryDialog:
 # 名单导入导出（模块级函数，方便单独测试）
 # ==========================================================================
 #: 导出/导入字段顺序（与 database.export_all 一致）
-IO_FIELDS = ("player_id", "player_name", "note", "tk_count",
-             "encounter_count", "created_at", "last_seen")
+IO_FIELDS = ("player_name", "note", "created_at")
 
 
 def write_csv(path: str, rows) -> None:
@@ -201,11 +219,11 @@ class ImportStrategyDialog:
 
     STRATEGIES = (
         ("skip", "跳过已存在的条目（推荐）",
-         "只新增文件里有、数据库里没有的；(player_id, 名称) 相同就跳过"),
-        ("update_note", "更新备注与 TK 次数",
-         "保留本机已累积的「遇到次数」与「最后遇见」，只覆盖备注 / TK次数"),
+         "只新增文件里有、这里没有的名字；同名就跳过"),
+        ("update_note", "只更新备注",
+         "同名条目的备注用文件里的覆盖，添加时间保持本机的"),
         ("overwrite", "完全覆盖",
-         "连「遇到次数」「最后遇见」也一起用文件里的值覆盖"),
+         "同名条目的备注与添加时间都用文件里的值覆盖"),
     )
 
     def __init__(self, master, filename: str = ""):
@@ -224,7 +242,7 @@ class ImportStrategyDialog:
 
         ttk.Label(frm, text=f"文件：{filename}", style="Muted.TLabel",
                   wraplength=420, justify="left").pack(anchor="w")
-        ttk.Label(frm, text="遇到 (玩家ID, 名称) 相同的条目时：",
+        ttk.Label(frm, text="遇到同名条目时：",
                   font=theme.FONT_BOLD).pack(anchor="w", pady=(10, 4))
 
         self.var = tk.StringVar(value="skip")
@@ -259,6 +277,75 @@ class ImportStrategyDialog:
 
 
 # ==========================================================================
+class _ScrollArea(ttk.Frame):
+    """竖向滚动容器（内容装得下就自动隐藏滚动条）。
+
+    设置分页的内容高度是固定的（通知页要摆一整个表单），而设置区高度会随
+    窗口大小 / 用户拖拽变化 —— 没有滚动的话，[保存] 这类按钮会被裁到可视区
+    之外，点都点不到。
+    """
+
+    def __init__(self, master):
+        super().__init__(master)
+        # width/height=1 不是摆设：tk.Canvas 的默认尺寸是 378x265，会把收起态
+        # 面板的请求高度撑到 ~350px，于是启动时能看见分隔条先窜上去再落回来。
+        self.canvas = tk.Canvas(self, highlightthickness=0, bd=0,
+                                width=1, height=1, bg=theme.PALETTE["bg"])
+        self.vsb = ttk.Scrollbar(self, orient="vertical",
+                                 command=self.canvas.yview)
+        self.canvas.configure(yscrollcommand=self.vsb.set)
+        # 滚动条常驻：不做"需要才显示"的自动隐藏 —— 显示/隐藏会改变画布宽度，
+        # 画布宽度又会影响换行后的内容高度，来回抖动会变成死循环。宁可常驻。
+        self.vsb.pack(side="right", fill="y")
+        self.canvas.pack(side="left", fill="both", expand=True)
+
+        self.inner = ttk.Frame(self.canvas)
+        self._win = self.canvas.create_window((0, 0), window=self.inner,
+                                              anchor="nw")
+        self._sync_job = None
+        for w in (self.inner, self.canvas):
+            w.bind("<Configure>", self._schedule_sync, add="+")
+
+    def _schedule_sync(self, _event=None):
+        """合并连续的 Configure：每轮空闲只重算一次滚动区域。"""
+        if self._sync_job is not None:
+            return
+        try:
+            self._sync_job = self.after_idle(self._sync)
+        except tk.TclError:
+            self._sync_job = None
+
+    def _sync(self):
+        self._sync_job = None
+        try:
+            self.canvas.configure(scrollregion=self.canvas.bbox("all"))
+            width = self.canvas.winfo_width()
+            if width > 1:
+                self.canvas.itemconfigure(self._win, width=width)
+        except tk.TclError:
+            pass
+
+    def bind_wheel(self):
+        """给容器内所有控件绑滚轮（Tk 只把滚轮事件发给指针下的控件）。"""
+        def bind_all_children(w):
+            try:
+                w.bind("<MouseWheel>", self._on_wheel)
+            except tk.TclError:
+                return
+            for c in w.winfo_children():
+                bind_all_children(c)
+
+        bind_all_children(self.inner)
+
+    def _on_wheel(self, event):
+        try:
+            self.canvas.yview_scroll(int(-event.delta / 120), "units")
+        except tk.TclError:
+            pass
+        return "break"
+
+
+# ==========================================================================
 class BlacklistGUI:
     """主窗口。"""
 
@@ -287,7 +374,9 @@ class BlacklistGUI:
 
         self.session_hit_count = 0
         self.paused = False
-        self.sort_key = "last_seen"
+        self.game_active = False
+        self.game_reason = ""
+        self.sort_key = "created_at"
         self.sort_desc = True
         self.search_text = ""
         self._tray = None
@@ -299,34 +388,56 @@ class BlacklistGUI:
 
         self.root = tk.Tk()
         self.root.title(config.WINDOW_TITLE)
-        self.root.geometry("1120x660")
-        # 最小宽度 960：保证三行工具栏 + 底部汇总栏都不会被挤掉
-        self.root.minsize(960, 520)
+        self.root.geometry(f"{DEFAULT_WIDTH}x{DEFAULT_HEIGHT}")
+        self.root.minsize(MIN_WIDTH, MIN_HEIGHT)
 
         theme.apply_theme(self.root)
         theme.apply_window_icon(self.root)
 
-        self._build_header()
-        self._build_menu()
-        self._build_toolbar()
-        self._build_tree()
-        self._build_statusbar()
+        # 运行状态带上的开关变量（建好窗口后立刻创建，按钮直接绑定）
+        self.chat_hotkey_var = tk.BooleanVar(
+            value=bool(hotkey_config.enabled)
+            if hotkey_config is not None else False)
+        self.pause_var = tk.BooleanVar(value=False)
+        self.data_info_var = tk.StringVar(value="")
+        self.settings_expanded = False          # 设置区默认收起
+        self.settings_page = SETTINGS_TABS[0][0]
+        self.settings_pages = {}
+        self.settings_tab_btns = {}
+        self._last_paned_h = 0
+        self._placed_h = 0            # 上次定高度时的面板高度（防抖用）
+        self._resync_job = None
+
+        self._build_header()          # ① 运行状态带
+        self._build_toolbar()         # ② 名单工具带
+        self._build_body()            # ③④ 名单 + 设置分页（可拖拽分隔）
+        self._build_statusbar()       # ⑤ 状态栏
+        self._sync_hotkey_ui()
+
+        # 聊天框扫描的结果统一由扫描器回调上报：**按钮和 F8 热键走同一条路**，
+        # 否则按热键触发的那次扫描在界面上什么都不显示（实测反馈）。
+        if self.chat_scanner is not None:
+            self.chat_scanner.on_result = self._chat_scan_event
 
         self._load_data()
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
         self._drain_job = self.root.after(GUI_QUEUE_POLL_MS, self._drain_queues)
 
-    # ------------------------------------------------------------ 顶部标题栏
+    # ------------------------------------------------------- ① 运行状态带
     def _build_header(self):
-        """一条细细的标题带：应用图标 + 名称 + 版本 + 监控状态。"""
+        """顶部一条：应用标识 + 运行状态 + 高频动作。
+
+        这条带子取代了原来的「标题带 + 设置菜单」：F8 开关、暂停、扫描这些
+        随时要看、要点的东西现在一直露在外面，不用翻菜单。
+        """
         p = theme.PALETTE
         bar = ttk.Frame(self.root, style="Panel.TFrame", padding=(10, 6))
         bar.pack(fill="x")
 
-        # 应用图标
+        # ---- 左：应用标识 ----
         try:
             from PIL import ImageTk
-            icon = theme.load_icon_image(26)
+            icon = theme.load_icon_image(24)
             if icon is not None:
                 self._header_icon = ImageTk.PhotoImage(icon)
                 tk.Label(bar, image=self._header_icon, bg=p["panel"],
@@ -339,147 +450,418 @@ class BlacklistGUI:
         ttk.Label(bar, text=f"v{config.VERSION}", style="Version.TLabel").pack(
             side="left", padx=(8, 0), pady=(6, 0))
 
+        # ---- 中：监控指示灯 ----
         self.monitor_var = tk.StringVar(value="● 监控中")
         self.monitor_label = ttk.Label(bar, textvariable=self.monitor_var,
                                        style="Hit.TLabel")
-        self.monitor_label.pack(side="right")
+        self.monitor_label.pack(side="left", padx=(16, 0))
 
-    # ---------------------------------------------------------------- 菜单
-    def _build_menu(self):
-        menubar = theme.make_menu(self.root)
+        # ---- 右：高频动作（pack 顺序 = 从右往左）----
+        ttk.Button(bar, text="退出", style="Bar.TButton",
+                   command=self.quit_app).pack(side="right")
+        self.pause_btn = ttk.Button(bar, text="暂停监控", style="Bar.TButton",
+                                    command=self.toggle_pause)
+        self.pause_btn.pack(side="right", padx=(0, 6))
+        self.scan_chat_btn = ttk.Button(bar, text="扫描聊天框",
+                                        style="Accent.TButton",
+                                        command=self.scan_chat_now)
+        self.scan_chat_btn.pack(side="right", padx=(0, 6))
+        ttk.Separator(bar, orient="vertical").pack(side="right", fill="y",
+                                                   padx=10)
+        # 热键开关：文字写"动作"（启用/停用 X 扫描），金色 = 已启用。
+        # 原来是 textvariable 的"热键扫描：关"，在深色面板上看就是一段灰字，
+        # 用户根本不知道那是个按钮（实测反馈）。
+        self.hotkey_btn = ttk.Button(bar, text="启用扫描热键",
+                                     style="Bar.TButton",
+                                     command=self.toggle_hotkey)
+        self.hotkey_btn.pack(side="right", padx=(0, 6))
 
-        m_file = theme.make_menu(menubar)
-        m_file.add_command(label="添加条目", command=self.add_entry)
-        m_file.add_command(label="导出列表…", command=self.export_list)
-        m_file.add_separator()
-        m_file.add_command(label="最小化到托盘", command=self.hide_to_tray)
-        m_file.add_command(label="退出", command=self.quit_app)
-        menubar.add_cascade(label="文件", menu=m_file)
-
-        m_set = theme.make_menu(menubar)
-        m_set.add_command(label="校准区域…", command=self.open_calibrator)
-        m_set.add_command(label="恢复全部默认区域", command=self.reset_regions)
-        m_set.add_command(label="通知设置…", command=self.open_notification_settings)
-        m_set.add_separator()
-
-        # 聊天框扫描快捷键子菜单
-        m_chat = theme.make_menu(m_set)
-        m_chat.add_command(label="立即扫描聊天框", command=self.scan_chat_now)
-        m_chat.add_separator()
-        self.chat_hotkey_var = tk.BooleanVar(
-            value=bool(self.hotkey_config.enabled)
-            if self.hotkey_config is not None else False)
-        m_chat.add_checkbutton(label="启用热键扫描",
-                               variable=self.chat_hotkey_var,
-                               command=self._toggle_chat_hotkey)
-        self._hotkey_menu_index = m_chat.index("end")
-        m_chat.add_command(label="自定义快捷键…",
-                           command=self.open_hotkey_settings)
-        m_chat.add_separator()
-        m_chat.add_command(label="清空命中去重缓存",
-                           command=self._clear_dedup_cache)
-        m_set.add_cascade(label="聊天框扫描快捷键", menu=m_chat)
-        self.chat_menu = m_chat          # 便于测试与后续扩展
-        self._sync_hotkey_menu_label()
-
-        m_set.add_separator()
-        self.pause_var = tk.BooleanVar(value=False)
-        m_set.add_checkbutton(label="暂停监控", variable=self.pause_var,
-                              command=self.toggle_pause)
-        m_set.add_separator()
-        m_set.add_command(label="打开数据目录", command=self.open_data_dir)
-        m_set.add_command(label="打开日志", command=self.open_log)
-        menubar.add_cascade(label="设置", menu=m_set)
-
-        m_help = theme.make_menu(menubar)
-        m_help.add_command(label="使用说明", command=self.show_help)
-        m_help.add_command(label="关于", command=self.show_about)
-        menubar.add_cascade(label="帮助", menu=m_help)
-
-        self.root.config(menu=menubar)
-
-    # ---------------------------------------------------------------- 工具栏
+    # ------------------------------------------------------- ② 名单工具带
     def _build_toolbar(self):
-        """三行工具栏。
+        """一条：黑名单的增删改查 + 排序 + 导入导出。
 
-        ttk 按钮在 clam 主题下比较宽，挤在一行会被裁掉，所以按功能分行：
-            第一行：增删改 + 搜索
-            第二行：排序 + 升降序 ............ 扫描聊天框 / 导入 / 导出
-            第三行：......................... 校准 / 恢复默认 / 通知 / 托盘
-        窗口最小宽度 960px，保证三行都不会被挤掉。
+        原来三行、混着运行控制和低频设置；现在只放「对这张名单的操作」，
+        运行控制在上面 ①，低频设置收进下面 ④。
         """
         outer = ttk.Frame(self.root, style="Panel.TFrame",
-                          padding=(10, 8, 10, 6))
+                          padding=(10, 6, 10, 6))
         outer.pack(fill="x")
-
-        # ---- 第一行：黑名单增删改查 ----
         bar = ttk.Frame(outer, style="Panel.TFrame")
         bar.pack(fill="x")
 
-        ttk.Button(bar, text="添加", command=self.add_entry).pack(side="left")
-        ttk.Button(bar, text="编辑", command=self.edit_selected).pack(
-            side="left", padx=3)
+        ttk.Button(bar, text="添加", style="Bar.TButton",
+                   command=self.add_entry).pack(side="left")
+        ttk.Button(bar, text="编辑", style="Bar.TButton",
+                   command=self.edit_selected).pack(side="left", padx=3)
         ttk.Button(bar, text="删除", style="Danger.TButton",
                    command=self.delete_selected).pack(side="left")
         ttk.Separator(bar, orient="vertical").pack(side="left", fill="y",
                                                    padx=10)
+
         ttk.Label(bar, text="搜索：", style="PanelMuted.TLabel").pack(
             side="left")
         self.search_var = tk.StringVar()
         ent = ttk.Entry(bar, textvariable=self.search_var, width=14)
         ent.pack(side="left", padx=4)
         ent.bind("<Return>", lambda e: self.do_search())
-        ttk.Button(bar, text="搜索", command=self.do_search).pack(side="left")
-        ttk.Button(bar, text="清空", command=self.clear_search).pack(
-            side="left", padx=3)
+        ttk.Button(bar, text="搜索", style="Bar.TButton",
+                   command=self.do_search).pack(side="left")
+        ttk.Label(bar, text="（按名称 / 备注）", style="PanelMuted.TLabel").pack(
+            side="left", padx=(6, 0))
+        ttk.Button(bar, text="清空", style="Bar.TButton",
+                   command=self.clear_search).pack(side="left", padx=3)
+        ttk.Separator(bar, orient="vertical").pack(side="left", fill="y",
+                                                   padx=10)
 
-        # ---- 第二行：排序 + 聊天框按需扫描 + 导入导出 ----
-        bar2 = ttk.Frame(outer, style="Panel.TFrame")
-        bar2.pack(fill="x", pady=(6, 0))
-
-        ttk.Button(bar2, text="导出", command=self.export_list).pack(
-            side="right")
-        ttk.Button(bar2, text="导入", command=self.import_list).pack(
-            side="right", padx=3)
-        self.scan_chat_btn = ttk.Button(bar2, text="扫描聊天框",
-                                        style="Accent.TButton",
-                                        command=self.scan_chat_now)
-        self.scan_chat_btn.pack(side="right", padx=(0, 3))
-        ttk.Separator(bar2, orient="vertical").pack(side="right", fill="y",
-                                                    padx=10)
-
-        ttk.Label(bar2, text="排序：", style="PanelMuted.TLabel").pack(
+        ttk.Label(bar, text="排序：", style="PanelMuted.TLabel").pack(
             side="left")
-        self.sort_var = tk.StringVar(value=dict(SORT_OPTIONS)["last_seen"])
-        combo = ttk.Combobox(bar2, state="readonly", width=13,
+        self.sort_var = tk.StringVar(value=dict(SORT_OPTIONS)["created_at"])
+        combo = ttk.Combobox(bar, state="readonly", width=12,
                              textvariable=self.sort_var,
                              values=[label for _, label in SORT_OPTIONS])
         combo.pack(side="left", padx=4)
         combo.bind("<<ComboboxSelected>>", lambda e: self._on_sort_selected())
-        self.sort_dir_btn = ttk.Button(bar2, text="↓ 降序",
+        self.sort_dir_btn = ttk.Button(bar, text="↓ 降序", style="Bar.TButton",
                                        command=self.toggle_sort_dir)
         self.sort_dir_btn.pack(side="left")
 
-        # ---- 第三行：区域 / 通知 / 托盘 ----
-        bar3 = ttk.Frame(outer, style="Panel.TFrame")
-        bar3.pack(fill="x", pady=(6, 0))
-        ttk.Button(bar3, text="最小化到托盘",
-                   command=self.hide_to_tray).pack(side="right")
-        ttk.Button(bar3, text="通知设置",
-                   command=self.open_notification_settings).pack(side="right",
-                                                                 padx=3)
-        ttk.Button(bar3, text="恢复全部默认", command=self.reset_regions).pack(
-            side="right")
-        ttk.Button(bar3, text="校准区域", command=self.open_calibrator).pack(
-            side="right", padx=3)
-        ttk.Label(bar3, style="PanelMuted.TLabel",
-                  text="聊天框为按需扫描：点 [扫描聊天框] 才抓图 + OCR").pack(
+        ttk.Button(bar, text="导出", style="Bar.TButton",
+                   command=self.export_list).pack(side="right")
+        ttk.Button(bar, text="导入", style="Bar.TButton",
+                   command=self.import_list).pack(side="right", padx=3)
+
+    # --------------------------------------- ③④ 名单 + 设置（可拖拽分隔）
+    def _build_body(self):
+        """下半部分：上面是名单主区，下面是设置分页，中间分隔条可以拖。
+
+        设置区默认收起成一条标签栏，把高度全让给名单；点标签或 [展开设置]
+        才展开。用经典 tk.PanedWindow 而不是 ttk 的，因为只有它能把面板
+        压到比内容请求尺寸更小（收起时只留标签栏）。
+        """
+        self.paned = tk.PanedWindow(
+            self.root, orient="vertical", sashwidth=6, sashrelief="flat",
+            bd=0, bg=theme.PALETTE["border"],
+            opaqueresize=True, showhandle=False)
+        self.paned.pack(fill="both", expand=True, padx=10, pady=(0, 4))
+
+        list_frame = ttk.Frame(self.paned)
+        self.paned.add(list_frame, stretch="always", minsize=140)
+        self._build_tree(list_frame)
+
+        self.settings_frame = ttk.Frame(self.paned)
+        self.paned.add(self.settings_frame, stretch="never",
+                       minsize=SETTINGS_COLLAPSED_HEIGHT)
+        self._build_settings(self.settings_frame)
+        self.paned.paneconfigure(self.settings_frame, minsize=self._collapsed_h)
+        self.set_settings_expanded(False)          # 默认收起：高度全给名单
+
+        self.paned.bind("<Configure>", self._on_paned_configure)
+        self.paned.bind("<ButtonRelease-1>", self._on_sash_released)
+        # 建好首屏分页内容，但**保持收起**（默认折叠）
+        self.root.after(150, lambda: self.show_settings_page(
+            self.settings_page, expand=False))
+
+    # ------------------------------------------------------------ ④ 设置区
+    def _build_settings(self, parent):
+        """下方设置区：一条始终可见的分页标签栏 + 可折叠的内容区。"""
+        self.settings_bar = ttk.Frame(parent, style="Panel.TFrame",
+                                      padding=(6, 4))
+        self.settings_bar.pack(fill="x", side="top")
+
+        self.settings_toggle_btn = ttk.Button(
+            self.settings_bar, text="▴ 展开设置", width=12,
+            style="Bar.TButton", command=self.toggle_settings)
+        self.settings_toggle_btn.pack(side="right", padx=(8, 4))
+
+        for key, label in SETTINGS_TABS:
+            btn = ttk.Button(self.settings_bar, text=label, width=10,
+                             style="Bar.TButton",
+                             command=lambda k=key: self.show_settings_page(k))
+            btn.pack(side="left", padx=2)
+            self.settings_tab_btns[key] = btn
+
+        # 分页内容放在滚动容器里：页面再高也不会把按钮裁到看不见的地方
+        self.settings_content = _ScrollArea(parent)
+        self.settings_content.pack(fill="both", expand=True)
+        self.settings_body = self.settings_content.inner
+        # 收起时的高度按标签栏的**实际**请求高度算，否则会被切掉半行。
+        # 首次计算时控件可能还没完成尺寸推导，_sync_settings_layout 里会再纠正。
+        self._collapsed_h = max(SETTINGS_COLLAPSED_HEIGHT,
+                                self.settings_bar.winfo_reqheight() + 6)
+
+    def _make_page(self, key):
+        """按需创建分页内容（懒建：通知页要渲染预览，不必开机就建）。"""
+        page = self.settings_pages.get(key)
+        if page is not None:
+            return page
+        page = ttk.Frame(self.settings_body, padding=2)
+        {
+            "scan": self._page_scan,
+            "notify": self._page_notify,
+            "region": self._page_region,
+            "data": self._page_data,
+            "help": self._page_help,
+        }[key](page)
+        self.settings_pages[key] = page
+        self.settings_content.bind_wheel()
+        return page
+
+    def show_settings_page(self, key, expand: bool = True):
+        """切到某个设置分页。
+
+        ``expand=False`` 用于开机首屏：把内容建好、但保持收起状态。
+        用户点标签时走默认的 expand=True，自动展开。
+        """
+        if key not in dict(SETTINGS_TABS):
+            key = SETTINGS_TABS[0][0]
+        self.settings_page = key
+        page = self._make_page(key)
+        for other_key, frame in self.settings_pages.items():
+            if other_key != key and frame.winfo_ismapped():
+                frame.pack_forget()
+        page.pack(fill="both", expand=True)
+        for k, btn in self.settings_tab_btns.items():
+            btn.configure(style="Accent.TButton" if k == key else "Bar.TButton")
+        if expand and not self.settings_expanded:
+            self.set_settings_expanded(True)
+        # 每次进「扫描与触发」都对齐一次热键总开关（顶部那个按钮才是开关的正主）
+        if key == "scan" and getattr(self, "hotkey_panel", None) is not None:
+            try:
+                self.hotkey_panel.refresh_enabled(
+                    bool(self.chat_hotkey_var.get()))
+            except Exception as e:                        # noqa: BLE001
+                self.log.warning("刷新自定义快捷键面板失败: %s", e)
+        # force：刚建好的分页要等一轮几何计算才量得出内容高度
+        self._sync_settings_layout(force=True)
+
+    def toggle_settings(self):
+        self.set_settings_expanded(not self.settings_expanded)
+
+    def set_settings_expanded(self, expanded: bool):
+        """展开/收起设置区。
+
+        收起时把内容区真的 pack_forget 掉（而不是只靠挪分隔条），这样
+        分页内容确实不可见、也不会去参与布局计算。
+        """
+        self.settings_expanded = bool(expanded)
+        if self.settings_expanded:
+            if not self.settings_content.winfo_manager():
+                self.settings_content.pack(fill="both", expand=True)
+        else:
+            self.settings_content.pack_forget()
+        self.settings_toggle_btn.configure(
+            text="▾ 收起设置" if self.settings_expanded else "▴ 展开设置")
+        self._sync_settings_layout(force=True)
+
+    def _schedule_resync(self, delay: int = 60):
+        """安排一次延后重算（只保留最新的一个，避免同时挂好几个）。"""
+        job = getattr(self, "_resync_job", None)
+        if job is not None:
+            try:
+                self.root.after_cancel(job)
+            except Exception:                            # noqa: BLE001
+                pass
+        try:
+            self._resync_job = self.root.after(delay, self._sync_settings_layout)
+        except tk.TclError:
+            self._resync_job = None
+
+    def _sync_settings_layout(self, force: bool = False):
+        """把分隔条挪到该在的位置。
+
+        展开高度按**当前分页的内容高度**自适应（上限为面板高度的 60%），
+        这样大多数分页展开后刚好够用、不用滚；内容实在太高时靠滚动容器兜底。
+
+        ⚠ ``_placed_h`` 这个容差判断不是优化，是**修 bug**：移动分隔条会让
+        tk.PanedWindow 自身高度变化 1px，那 1px 又触发 <Configure> → 再挪 →
+        再变 1px…… 无限来回抖（界面抽搐 + 事件循环空转烧 CPU）。
+        只有"面板高度真的变了"（用户缩放窗口）才重新摆。
+        """
+        if not hasattr(self, "paned"):
+            return
+        if force:
+            self._schedule_resync()
+        total = self.paned.winfo_height()
+        if total <= 1:
+            if force:
+                self._schedule_resync(80)
+            return
+        # 标签栏的真实高度要等控件被摆成一行才知道，这里每轮纠正一次。
+        # 注意上限判断：摆好之前 winfo_reqheight() 会虚高（按钮折行成几百像素），
+        # 那种值一旦被当成收起高度焊死，界面就会在启动时明显抽搐一下。
+        try:
+            need = self.settings_bar.winfo_reqheight() + 6
+            if MAX_COLLAPSED_HEIGHT >= need > self._collapsed_h:
+                self._collapsed_h = need
+                self.paned.paneconfigure(self.settings_frame, minsize=need)
+        except tk.TclError:
+            pass
+        # 高度只差一两个像素 = 我们自己挪分隔条造成的抖动，直接忽略
+        if not force and abs(total - self._placed_h) <= JITTER_TOLERANCE:
+            return
+        want = (self._preferred_settings_height(total) if self.settings_expanded
+                else self._collapsed_h)
+        # 窗口不够高时别让设置区把名单挤没
+        want = min(want, max(self._collapsed_h, total - MIN_LIST_HEIGHT))
+        try:
+            # 用 pane 自己的 height 来定高度，**不用 sash_place**：
+            # 首帧时 pane 还没真正布局（winfo_height()==1），此时 sash_place 会被
+            # Tk 夹到"请求高度"附近的一个错位置 —— 那就是启动时看得见的那下窜动。
+            # paneconfigure(height=) 不受这个影响，Tk 下一次布局就摆正，
+            # 而且窗口缩放时列表会自己吃掉增减量，设置区保持这一高度。
+            self.paned.paneconfigure(self.settings_frame, height=want)
+            self._placed_h = total
+        except tk.TclError:
+            pass
+
+    def _preferred_settings_height(self, total: int) -> int:
+        need = SETTINGS_HEIGHT
+        page = self.settings_pages.get(self.settings_page)
+        if page is not None:
+            height = page.winfo_reqheight()
+            # height<=1 说明控件还没完成尺寸推导 —— 此时别按内容算，
+            # 否则会瞬间塌到下限（等 60ms 后那次重算才纠正，会闪一下）
+            if height > 1:
+                need = (self.settings_bar.winfo_reqheight()
+                        + height + 24)
+        cap = max(SETTINGS_HEIGHT, int(total * 0.6))
+        return max(self._collapsed_h + 60, min(need, cap))
+
+    def _on_paned_configure(self, event):
+        if event.widget is not self.paned or event.height == self._last_paned_h:
+            return
+        self._last_paned_h = event.height
+        # 延到下一轮空闲再算：刚收到 Configure 时 PanedWindow 还没真正布局完
+        self._schedule_resync(0)
+
+    def _on_sash_released(self, _event=None):
+        """用户手动拖过分隔条后，同步折叠按钮的文字。"""
+        try:
+            y = self.paned.sash_coord(0)[1]
+        except tk.TclError:
+            return
+        expanded = (self.paned.winfo_height() - y) > (SETTINGS_COLLAPSED_HEIGHT + 30)
+        if expanded != self.settings_expanded:
+            self.settings_expanded = expanded
+            self.settings_toggle_btn.configure(
+                text="▾ 收起设置" if expanded else "▴ 展开设置")
+
+    # ---- 设置页：扫描与触发 ----
+    def _page_scan(self, parent):
+        left = ttk.Frame(parent)
+        left.pack(side="left", fill="both", expand=True)
+        right = ttk.Frame(parent)
+        right.pack(side="left", fill="both", expand=True, padx=(14, 0))
+
+        if self.hotkey_config is None:
+            ttk.Label(left, text="热键配置不可用", style="Muted.TLabel").pack(
+                anchor="w")
+        else:
+            from app.ui.hotkey_dialog import HotkeyPanel
+            # show_enabled=False：开关在顶部状态带上，这里只负责改键
+            self.hotkey_panel = HotkeyPanel(
+                left, self.hotkey_config, on_saved=self._on_hotkey_saved,
+                embedded=True, show_enabled=False)
+            self.hotkey_panel.pack(fill="both", expand=True)
+
+        box = ttk.LabelFrame(right, text="扫描节流与去重", padding=10)
+        box.pack(fill="x")
+        rows = (
+            ("命中去重窗口", f"{config.HIT_DEDUP_WINDOW} 秒"),
+            ("抓屏间隔", f"{config.ESC_SESSION['interval']} 秒"),
+            ("画面没变时跳过 OCR",
+             "开" if config.SESSION_SKIP_UNCHANGED else "关"),
+            ("画面静止多少帧收工", f"{config.SESSION_MAX_STATIC_FRAMES} 帧"),
+            ("模糊匹配阈值", f"{config.MATCH_THRESHOLD} 分"),
+        )
+        for i, (label, value) in enumerate(rows):
+            ttk.Label(box, text=f"{label}：").grid(row=i, column=0, sticky="w",
+                                                  pady=2)
+            ttk.Label(box, text=value).grid(row=i, column=1, sticky="w",
+                                            padx=(8, 0), pady=2)
+        ttk.Label(box, text="这些是内置节流参数，改 config.py 后重启生效。",
+                  style="Muted.TLabel").grid(row=len(rows), column=0,
+                                             columnspan=2, sticky="w",
+                                             pady=(6, 0))
+        ttk.Button(right, text="清空命中去重缓存",
+                   command=self._clear_dedup_cache).pack(anchor="w",
+                                                         pady=(10, 0))
+
+    # ---- 设置页：通知 ----
+    def _page_notify(self, parent):
+        if self.notifier is None:
+            ttk.Label(parent, text="通知模块不可用", style="Muted.TLabel").pack(
+                anchor="w")
+            return
+        from app.ui.gui_notification import NotificationPanel
+        self.notify_panel = NotificationPanel(
+            parent, self.notification_config, self.notifier, embedded=True,
+            on_saved=lambda: self._flash_status("通知设置已保存"))
+        self.notify_panel.pack(fill="both", expand=True)
+
+    # ---- 设置页：监视区域 ----
+    def _page_region(self, parent):
+        from app.ui.calibrator import CalibratorPanel
+        self.region_panel = CalibratorPanel(
+            parent, self.region_config, self.capture, embedded=True,
+            on_changed=lambda: self._flash_status("区域配置已更新"))
+        self.region_panel.pack(fill="both", expand=True)
+
+    # ---- 设置页：数据 ----
+    def _page_data(self, parent):
+        ttk.Label(parent, text=f"数据目录：{config.DATA_DIR}",
+                  style="Muted.TLabel", wraplength=620,
+                  justify="left").pack(anchor="w")
+        ttk.Label(parent, textvariable=self.data_info_var,
+                  style="Muted.TLabel", justify="left").pack(anchor="w",
+                                                             pady=(6, 0))
+        row = ttk.Frame(parent)
+        row.pack(fill="x", pady=(10, 0))
+        ttk.Button(row, text="打开数据目录",
+                   command=self.open_data_dir).pack(side="left")
+        ttk.Button(row, text="打开日志", command=self.open_log).pack(
             side="left", padx=6)
+        ttk.Button(row, text="刷新统计", command=self._refresh_data_info).pack(
+            side="left", padx=6)
+        ttk.Label(parent, text="导入 / 导出在名单工具条上。",
+                  style="Muted.TLabel").pack(anchor="w", pady=(10, 0))
+        self._refresh_data_info()
+
+    def _refresh_data_info(self):
+        """数据页的只读统计：数据库条数/体积 + 证据图数量。"""
+        parts = []
+        try:
+            parts.append(f"黑名单 {len(self.db.get_all())} 条")
+        except Exception:                                # noqa: BLE001
+            pass
+        try:
+            size = os.path.getsize(config.DB_PATH) / 1024.0
+            parts.append(f"数据库 {size:.0f} KB")
+        except OSError:
+            pass
+        try:
+            shots = len(os.listdir(config.EVIDENCE_DIR))
+            parts.append(f"证据截图 {shots} 张")
+        except OSError:
+            pass
+        self.data_info_var.set("　·　".join(parts) if parts else "（暂无数据）")
+
+    # ---- 设置页：帮助 ----
+    def _page_help(self, parent):
+        # 动作放最上面：正文较长时按钮也不会被挤到可视区外
+        row = ttk.Frame(parent)
+        row.pack(fill="x")
+        ttk.Button(row, text="使用说明", command=self.show_help).pack(
+            side="left")
+        ttk.Button(row, text="关于", command=self.show_about).pack(
+            side="left", padx=6)
+        ttk.Label(parent, text=HELP_TEXT, style="Muted.TLabel",
+                  justify="left").pack(anchor="w", pady=(10, 0))
 
     # ---------------------------------------------------------------- 列表
-    def _build_tree(self):
+    def _build_tree(self, parent):
         p = theme.PALETTE
-        frm = ttk.Frame(self.root, padding=(10, 0, 10, 6))
+        frm = ttk.Frame(parent)
         frm.pack(fill="both", expand=True)
 
         self.tree = ttk.Treeview(frm, columns=COLUMNS, show="headings",
@@ -509,29 +891,76 @@ class BlacklistGUI:
         self.menu = theme.make_menu(self.root)
         self.menu.add_command(label="编辑", command=self.edit_selected)
         self.menu.add_command(label="删除", command=self.delete_selected)
-        self.menu.add_separator()
-        self.menu.add_command(label="清零遇到次数",
-                              command=lambda: self._reset_encounter(self._ctx_iid))
-        self.menu.add_command(label="重置最后遇见时间",
-                              command=lambda: self._reset_last_seen(self._ctx_iid))
         self._ctx_iid = None
 
     def _build_statusbar(self):
-        p = theme.PALETTE
+        """⑤ 状态栏：上面是「最近动态」，下面是当前状态 + 统计。
+
+        为什么要有「最近动态」这一块：原来只有一行会被立刻覆盖的提示，
+        用户按了 F8、命中了、被去重跳过了，界面上根本留不下痕迹，只能去翻
+        app.log（实测反馈）。现在每次触发/命中/去重/失败都会带时间戳留下来，
+        最新的一条在最上面。
+        """
+        wrap = ttk.Frame(self.root, style="Panel.TFrame")
+        wrap.pack(fill="x", side="bottom")
         ttk.Separator(self.root, orient="horizontal").pack(fill="x",
                                                            side="bottom")
-        bar = ttk.Frame(self.root, style="Panel.TFrame",
-                        padding=(10, 5))
-        bar.pack(fill="x", side="bottom")
+
+        # ---- 最近动态（始终占满 EVENT_ROWS 行，高度稳定，不参与抖动）----
+        feed = ttk.Frame(wrap, style="Panel.TFrame", padding=(10, 4, 10, 0))
+        feed.pack(fill="x")
+        self._events = collections.deque(maxlen=EVENT_ROWS)
+        self.event_vars = []
+        self.event_labels = []
+        for _i in range(EVENT_ROWS):
+            var = tk.StringVar(value="")
+            lbl = ttk.Label(feed, textvariable=var, anchor="w",
+                            style="PanelMuted.TLabel")
+            lbl.pack(fill="x")
+            self.event_vars.append(var)
+            self.event_labels.append(lbl)
+        self.event_vars[0].set("（暂无动态）")
+
+        # ---- 当前状态 + 统计 ----
+        bar = ttk.Frame(wrap, style="Panel.TFrame", padding=(10, 5))
+        bar.pack(fill="x")
 
         self.status_var = tk.StringVar(value="就绪")
         ttk.Label(bar, textvariable=self.status_var, anchor="w",
                   style="PanelMuted.TLabel").pack(side="left")
 
+        # 统计放状态栏右侧：顶部 ① 只留"状态 + 动作"，避免最小宽度下被挤扁
         self.stats_var = tk.StringVar()
         ttk.Label(bar, textvariable=self.stats_var, anchor="e",
                   style="Panel.TLabel").pack(side="right")
-        self._refresh_stats()
+
+    # ------------------------------------------------------------ 动态流
+    def notify_event(self, text: str, level: str = "info"):
+        """往「最近动态」里加一条（**只能在主线程调用**）。
+
+        level: info / hit / dedup / warn —— 决定这一行的颜色。
+        后台线程请用 `post(lambda: gui.notify_event(...))`，或者让
+        ScanScheduler.report() 经 app 层的 `_gui_call` 转过来。
+        """
+        if self._closing:
+            return
+        self._events.appendleft((time.strftime("%H:%M:%S"), str(text), level))
+        self._render_events()
+
+    def _render_events(self):
+        styles = {"hit": "Hit.TLabel", "dedup": "Paused.TLabel",
+                  "warn": "Danger.TLabel"}
+        for i, var in enumerate(self.event_vars):
+            if i < len(self._events):
+                ts, text, level = self._events[i]
+                var.set(f"{ts}  {text}")
+                try:
+                    self.event_labels[i].configure(
+                        style=styles.get(level, "PanelMuted.TLabel"))
+                except tk.TclError:
+                    pass
+            else:
+                var.set("")
 
     # ------------------------------------------------------------ 数据加载
     def _load_data(self):
@@ -548,18 +977,15 @@ class BlacklistGUI:
 
     @staticmethod
     def _row_values(row):
-        return (row.get("player_id") or "", row.get("player_name") or "",
-                row.get("note") or "", row.get("tk_count") or 0,
-                row.get("encounter_count") or 0,
-                row.get("created_at") or "", row.get("last_seen") or "")
+        return (row.get("player_name") or "", row.get("note") or "",
+                row.get("created_at") or "")
 
     def refresh(self):
         self._load_data()
 
     # ------------------------------------------------------------ 排序搜索
     def sort_by_column(self, col):
-        if col not in ("id", "player_id", "player_name", "note", "tk_count",
-                       "encounter_count", "created_at", "last_seen"):
+        if col not in ("player_name", "note", "created_at"):
             return
         if self.sort_key == col:
             self.sort_desc = not self.sort_desc
@@ -653,23 +1079,6 @@ class BlacklistGUI:
         self._after_db_change()
         self.set_status(f"已删除 {len(iids)} 条记录")
 
-    def _reset_encounter(self, iid):
-        if not iid:
-            return
-        self.db.reset_encounter_count(int(iid))
-        if self.tree.exists(iid):
-            self.tree.set(iid, "encounter_count", "0")
-        self._refresh_stats()
-        self.set_status(f"已清零条目 #{iid} 的遇到次数")
-
-    def _reset_last_seen(self, iid):
-        if not iid:
-            return
-        self.db.reset_last_seen(int(iid))
-        if self.tree.exists(iid):
-            self.tree.set(iid, "last_seen", "")
-        self.set_status(f"已重置条目 #{iid} 的最后遇见时间")
-
     def _after_db_change(self):
         self._load_data()
         if self.scheduler is not None:
@@ -760,15 +1169,18 @@ class BlacklistGUI:
             pass
 
     def _apply_encounter_update(self, data: dict):
+        """命中后由主线程更新界面：闪烁那一行 + 状态栏 + 动态流。
+
+        名单里已经没有「遇到次数 / 最后遇见」这些列了，所以这里不写单元格，
+        只把命中那一行闪一下，具体事实（时间 / 匹配度 / 来源 / 证据图）
+        记在数据库的 encounters 表与 app.log 里。
+        """
         iid = str(data.get("entry_id"))
         if self.tree.exists(iid):
-            self.tree.set(iid, "encounter_count",
-                          str(data.get("encounter_count", 0)))
-            self.tree.set(iid, "last_seen", data.get("last_seen") or "")
             self._flash_row(iid, times=config.FLASH_TIMES)
         self.session_hit_count += 1
         self._refresh_stats()
-        name = data.get("player_name") or data.get("player_id") or "未知"
+        name = data.get("player_name") or "未知"
         self.set_status(f"命中黑名单：{name}（{data.get('source', '')}，"
                         f"匹配度 {float(data.get('score') or 0):.0f}）")
 
@@ -836,26 +1248,63 @@ class BlacklistGUI:
         self._refresh_stats()
 
     def set_monitoring(self, active: bool, reason: str = ""):
-        """供 app 层更新监控指示灯。"""
-        if active:
+        """供 app 层更新「游戏在不在跑」——注意这里只说游戏状态。
+
+        指示灯最终显示什么由 _render_monitor() 决定：手动暂停优先于游戏状态，
+        这样"游戏没开 → 点暂停 → 灯变监控中"那种自相矛盾不会出现。
+        """
+        self.game_active = bool(active)
+        self.game_reason = reason
+        self._render_monitor()
+
+    def _render_monitor(self):
+        """按 (游戏是否在跑, 用户是否暂停) 两个真值渲染指示灯。"""
+        if self.paused:
+            reason = "手动暂停"
+            if not self.game_active and self.game_reason:
+                reason = f"手动暂停；{self.game_reason}"
+            self.monitor_var.set(f"● 已暂停 ({reason})")
+            self.monitor_label.configure(style="Paused.TLabel")
+        elif not self.game_active:
+            self.monitor_var.set(
+                f"● 已暂停{(' (' + self.game_reason + ')') if self.game_reason else ''}")
+            self.monitor_label.configure(style="Paused.TLabel")
+        else:
             self.monitor_var.set("● 监控中")
             self.monitor_label.configure(style="Hit.TLabel")
-        else:
-            self.monitor_var.set(f"● 已暂停{(' (' + reason + ')') if reason else ''}")
-            self.monitor_label.configure(style="Paused.TLabel")
 
     def toggle_pause(self):
-        self.paused = bool(self.pause_var.get())
-        if self.on_pause:
+        """[暂停监控]/[恢复监控]：切换**用户暂停**开关。
+
+        注意必须自己取反：旧实现是读 pause_var，而主界面这个按钮从来不去写
+        它 —— 于是每次点都只发一次"恢复"，永远暂停不上（用户实测的那个 bug）。
+        """
+        self.set_paused(not self.paused)
+
+    def set_paused(self, paused: bool, notify: bool = True):
+        self.paused = bool(paused)
+        self.pause_var.set(self.paused)
+        if notify and self.on_pause:
             self.on_pause(self.paused)
-        self.set_monitoring(not self.paused, "手动暂停" if self.paused else "")
+        self._render_monitor()
         self.set_status("已暂停监控" if self.paused else "已恢复监控")
+        self._sync_pause_ui()
+
+    def _sync_pause_ui(self):
+        """顶部 [暂停监控] 按钮的文字/样式跟着状态走。"""
+        btn = getattr(self, "pause_btn", None)
+        if btn is None:
+            return
+        try:
+            btn.configure(text="恢复监控" if self.paused else "暂停监控",
+                          style="Accent.TButton" if self.paused else "Bar.TButton")
+        except tk.TclError:
+            pass
 
     # ---------------------------------------------------------------- 设置
     def open_calibrator(self):
-        from app.ui.calibrator import CalibratorDialog
-        CalibratorDialog(self.root, self.region_config, self.capture,
-                         on_changed=lambda: self.set_status("区域配置已更新"))
+        """打开设置区的「监视区域」分页（原来是个独立对话框）。"""
+        self.show_settings_page("region")
 
     def reset_regions(self):
         if not messagebox.askyesno("确认", "恢复全部监视区域为默认坐标？",
@@ -865,49 +1314,118 @@ class BlacklistGUI:
         self.set_status("全部区域已恢复默认")
 
     def open_notification_settings(self):
+        """打开设置区的「通知」分页（原来是个独立对话框）。"""
         if self.notifier is None:
             messagebox.showinfo("提示", "通知模块不可用", parent=self.root)
             return
-        from app.ui.gui_notification import NotificationSettingsDialog
-        NotificationSettingsDialog(self.root, self.notification_config,
-                                   self.notifier,
-                                   on_saved=lambda: self.set_status("通知设置已保存"))
+        self.show_settings_page("notify")
 
     # ------------------------------------------------------- 聊天框按需扫描
     def scan_chat_now(self):
         """[扫描聊天框]：抓一张聊天框截图、跑一次 OCR、匹配黑名单。
 
-        OCR 放到后台线程，避免阻塞 UI；结果通过 post() 回到主线程更新状态栏。
+        OCR 放到后台线程，避免阻塞 UI；结果由 ChatScanner.on_result 回调
+        回到主线程播报（和 F8 热键走的是同一条路）。
         """
         if self.chat_scanner is None:
             self._flash_status("聊天框扫描不可用（未接入 ChatScanner）")
+            self.notify_event("聊天框扫描不可用（未接入 ChatScanner）", "warn")
             return
         if self.chat_scanner.is_busy():
             self._flash_status("上一次聊天框扫描还没结束，已忽略本次点击")
+            self.notify_event("上一次聊天框扫描还没结束，本次点击已忽略",
+                              "warn")
             return
-        self._flash_status("已触发聊天框扫描…", 6000)
         threading.Thread(target=self._scan_chat_worker, daemon=True,
                          name="ChatScan").start()
 
     def _scan_chat_worker(self):
         try:
-            result = self.chat_scanner.scan_now()
+            self.chat_scanner.scan_now()
         except Exception as e:                           # noqa: BLE001
-            result = {"status": "error", "error": str(e)}
+            # 正常路径下结果由 ChatScanner.on_result 上报；这里只兜住
+            # "scan_now 自己炸了"这种情况，否则界面上会什么都没有。
+            # 注意：不能把 e 直接闭包进 lambda —— except 块结束后这个名字
+            # 会被删掉，延迟执行的回调只会拿到 NameError（踩过）。
+            message = str(e)
+            self.log.warning("聊天框扫描线程异常: %s", message)
+            self.post(lambda: self._on_scan_chat_done(
+                {"status": "error", "error": message}))
+
+    def _chat_scan_event(self, result: dict):
+        """ChatScanner.on_result 回调 —— **在扫描线程里**被调用。
+
+        这里只做一件事：把结果排进命令队列，真正的界面更新在主线程。
+        """
         self.post(lambda: self._on_scan_chat_done(result))
 
-    def _on_scan_chat_done(self, result: dict):
+    def _scan_source_label(self, result: dict) -> str:
+        """把来源翻成一句人话：按 F8 / 点按钮 / 热键名。"""
+        source = result.get("source") or ""
+        if source == config.CHAT_SCAN_HOTKEY_SOURCE:
+            name = "热键"
+            if self.hotkey_config is not None:
+                try:
+                    name = self.hotkey_config.display or "热键"
+                except Exception:                        # noqa: BLE001
+                    pass
+            return f"按 {name}"
+        if source == config.CHAT_SCAN_SOURCE:
+            return "点 [扫描聊天框]"
+        return "聊天框扫描"
+
+    def _scan_chat_message(self, result: dict) -> tuple:
+        """把一次聊天框扫描的结果翻成（给人看的一句话, 级别）。"""
         status = result.get("status")
         hits = int(result.get("hits") or 0)
-        ms = result.get("elapsed_ms") or 0
-        text = {
-            "busy": "上一次扫描尚未完成，本次已跳过",
-            "empty": "聊天框为空（OCR 没识别到文字）",
-            "no_hit": f"聊天框扫描完成：未命中黑名单（{ms:.0f}ms）",
-            "ok": f"聊天框扫描完成：命中 {hits} 条（{ms:.0f}ms）",
-            "error": f"聊天框扫描失败：{result.get('error', '未知错误')}",
-        }.get(status, "聊天框扫描完成")
-        self._flash_status(text, 5000)
+        ms = float(result.get("elapsed_ms") or 0)
+        label = self._scan_source_label(result)
+
+        if status == "started":
+            return (f"{label}：开始扫描聊天框…", "info")
+        if status == "busy":
+            return ("上一次扫描尚未完成，本次已跳过", "warn")
+        if status == "empty":
+            return (f"{label}：聊天框扫描完成，但聊天框为空"
+                    f"（没识别到文字，{ms:.0f}ms）", "info")
+        if status == "no_hit":
+            return (f"{label}：聊天框扫描完成，未命中黑名单（{ms:.0f}ms）",
+                    "info")
+        if status == "ok":
+            names = "、".join(str(n) for n in (result.get("names") or []))
+            recorded = int(result.get("recorded") or 0)
+            deduped = int(result.get("deduped") or 0)
+            head = f"{label}：聊天框扫描完成，命中 {hits} 条"
+            if names:
+                head += f"：{names}"
+            if recorded and deduped:
+                detail = (f"{recorded} 条已提示并记录，"
+                          f"{deduped} 条在 {config.HIT_DEDUP_WINDOW} 秒去重窗口内已跳过")
+                return (f"{head}（{detail}，{ms:.0f}ms）", "hit")
+            if recorded:
+                return (f"{head}（已提示 + 已记录，{ms:.0f}ms）", "hit")
+            if deduped:
+                return (f"{head}（{config.HIT_DEDUP_WINDOW} 秒内已提示过 → "
+                        f"本次跳过，未重复计数，{ms:.0f}ms）", "dedup")
+            # 命中了但一条都没落库（数据库被占用之类）
+            return (f"{head}（命中但全部写入失败，详见日志，{ms:.0f}ms）",
+                    "warn")
+        if status == "error":
+            return (f"{label}：聊天框扫描失败：{result.get('error', '未知错误')}",
+                    "warn")
+        if status == "ocr_unavailable":
+            return (f"{label}：OCR 引擎不可用，扫描不会有结果 —— "
+                    f"{result.get('error', '未安装 rapidocr')}", "warn")
+        return ("聊天框扫描完成", "info")
+
+    def _on_scan_chat_done(self, result: dict):
+        text, level = self._scan_chat_message(result)
+        if result.get("status") == "started":
+            # "正在扫"只是个过渡态，别把结果行顶掉，所以不进动态流
+            self.set_status(text)
+            return
+        self._flash_status(text, 6000)
+        self.notify_event(text, level)
 
     def _clear_dedup_cache(self):
         if self.scheduler is None:
@@ -915,31 +1433,39 @@ class BlacklistGUI:
         self.scheduler.clear_dedup_cache()
         self._flash_status("已清空命中去重缓存（立即可以重新计数）")
 
-    def _toggle_chat_hotkey(self):
-        """菜单里的「启用热键扫描」勾选：写盘并通知 app 重启轮询线程。"""
-        enabled = bool(self.chat_hotkey_var.get())
+    def toggle_hotkey(self):
+        """① 上的 [启用/停用 X 扫描]：切换热键开关。
+
+        必须自己取反。旧实现是读 chat_hotkey_var（那是菜单时代留给
+        Checkbutton 用的），而主界面这个按钮从来不去写它 —— 于是点一次提交
+        一次"当前值"，按钮永远启动不了热键（和暂停按钮同一个坑）。
+        """
+        self.set_hotkey_enabled(not bool(self.chat_hotkey_var.get()))
+
+    def set_hotkey_enabled(self, enabled: bool):
+        """写盘并通知 app 重启热键监听。"""
         if self.hotkey_config is None:
             self._flash_status("热键配置不可用")
+            self._sync_hotkey_ui()          # 把按钮状态还原，别骗用户
             return
-        cfg = self.hotkey_config.set_enabled(enabled)
+        self.chat_hotkey_var.set(bool(enabled))
+        cfg = self.hotkey_config.set_enabled(bool(enabled))
         self._notify_hotkey_changed(cfg)
 
     def open_hotkey_settings(self):
-        """打开「自定义快捷键…」对话框。"""
+        """打开设置区的「扫描与触发」分页（改键在那里）。"""
         if self.hotkey_config is None:
             self._flash_status("热键配置不可用")
             return
-        from app.ui.hotkey_dialog import HotkeyDialog
-        HotkeyDialog(self.root, self.hotkey_config,
-                     on_saved=self._on_hotkey_saved)
+        self.show_settings_page("scan")
 
     def _on_hotkey_saved(self, cfg: dict):
         self.chat_hotkey_var.set(bool(cfg.get("enabled")))
-        self._sync_hotkey_menu_label()
+        self._sync_hotkey_ui()
         self._notify_hotkey_changed(cfg)
 
     def _notify_hotkey_changed(self, cfg: dict):
-        self._sync_hotkey_menu_label()
+        self._sync_hotkey_ui()
         if self.on_chat_hotkey is None:
             self._flash_status("热键开关不可用（未接入 app）")
             return
@@ -953,16 +1479,41 @@ class BlacklistGUI:
         except Exception as e:                           # noqa: BLE001
             messagebox.showerror("热键切换失败", str(e), parent=self.root)
 
-    def _sync_hotkey_menu_label(self):
-        """把当前按键名显示在菜单项上，例如「启用热键扫描（Ctrl+F8）」。"""
-        if self.hotkey_config is None or not hasattr(self, "chat_menu"):
-            return
-        try:
-            self.chat_menu.entryconfigure(
-                self._hotkey_menu_index,
-                label=f"启用热键扫描（{self.hotkey_config.display}）")
-        except tk.TclError:
-            pass
+    def _sync_hotkey_ui(self):
+        """同步 ① 上的热键开关按钮。
+
+        按钮文字写的是**动作**（点下去会发生什么），配上当前按键名：
+            未启用 → 「启用 F8 扫描」（普通按钮样式）
+            已启用 → 「停用 F8 扫描」（金色 = 正在生效）
+        这样"到底开没开、点了会怎样"一眼就知道，不用翻菜单。
+        """
+        enabled = bool(self.chat_hotkey_var.get())
+        name = "热键"
+        if self.hotkey_config is not None:
+            try:
+                name = self.hotkey_config.display or "热键"
+            except Exception:                            # noqa: BLE001
+                name = "热键"
+        btn = getattr(self, "hotkey_btn", None)
+        if btn is not None:
+            try:
+                btn.configure(
+                    text=f"停用 {name} 扫描" if enabled else f"启用 {name} 扫描",
+                    style="Accent.TButton" if enabled else "Bar.TButton")
+            except tk.TclError:
+                pass
+        # 设置区里那个按键框也必须跟着变。否则会出现这种自相矛盾：
+        # 顶部写着「停用 F8 扫描」（= 正在生效），设置页里却是「F8（未启用）」
+        # —— 因为那个面板开机时按当时的 enabled=False 渲染，之后再没刷新过。
+        panel = getattr(self, "hotkey_panel", None)
+        if panel is not None:
+            try:
+                panel.refresh_enabled(enabled)
+            except Exception as e:                        # noqa: BLE001
+                self.log.warning("刷新自定义快捷键面板失败: %s", e)
+
+    #: 兼容旧名字（菜单时代的叫法）
+    _sync_hotkey_menu_label = _sync_hotkey_ui
 
     # ---------------------------------------------------------------- 导入导出
     def export_list(self):
@@ -1121,14 +1672,23 @@ class BlacklistGUI:
             self.post(self.quit_app)
 
         def _pause(icon=None, item=None):
-            self.post(lambda: (self.pause_var.set(not self.pause_var.get()),
-                               self.toggle_pause()))
+            # 只转发同一条命令（不要在这里先翻 pause_var，否则会翻两次）
+            self.post(self.toggle_pause)
 
+        def _scan(icon=None, item=None):
+            self.post(self.scan_chat_now)
+
+        # 托盘只是"同一个命令的另一个入口"，不重复实现任何逻辑
         menu = pystray.Menu(
             pystray.MenuItem("显示主界面", _show, default=True),
+            pystray.MenuItem("扫描聊天框", _scan),
             pystray.MenuItem("暂停/恢复监控", _pause),
-            pystray.MenuItem("校准区域", lambda i, it: self.post(self.open_calibrator)),
-            pystray.MenuItem("通知设置",
+            pystray.Menu.SEPARATOR,
+            pystray.MenuItem("打开设置：扫描与触发",
+                             lambda i, it: self.post(self.open_hotkey_settings)),
+            pystray.MenuItem("打开设置：监视区域",
+                             lambda i, it: self.post(self.open_calibrator)),
+            pystray.MenuItem("打开设置：通知",
                              lambda i, it: self.post(self.open_notification_settings)),
             pystray.Menu.SEPARATOR,
             pystray.MenuItem("退出", _quit),
@@ -1167,7 +1727,9 @@ class BlacklistGUI:
         否则窗口销毁后 Tcl 还会去调用已消失的回调，控制台会刷
         `invalid command name "..._drain_queues"`。
         """
-        jobs = [self._drain_job, self._flash_job] + list(self._flash_jobs.values())
+        jobs = ([self._drain_job, self._flash_job,
+                 getattr(self, "_resync_job", None)]
+                + list(self._flash_jobs.values()))
         for job in jobs:
             if job:
                 try:
@@ -1177,6 +1739,7 @@ class BlacklistGUI:
         self._flash_jobs.clear()
         self._drain_job = None
         self._flash_job = None
+        self._resync_job = None
 
     def quit_app(self):
         if self._closing:

@@ -105,7 +105,11 @@ def apply_theme(root: tk.Misc) -> dict:
     style.configure("TSeparator", background=p["border"])
 
     # ---- 按钮 ----
-    style.configure("TButton", background=p["panel"], foreground=p["fg"],
+    # width=0 = 按文字自适应。**这一条很关键**：Tk 8.6 的 ttk 按钮默认
+    # width=-11（11 个平均字符宽），也就是不管按钮上是「退出」还是「扫描
+    # 聊天框」都一样宽 —— 之前工具栏被迫排三行就是因为这个。
+    style.configure("TButton", width=0,
+                    background=p["panel"], foreground=p["fg"],
                     bordercolor=p["border"], focuscolor=p["accent"],
                     relief="flat", padding=(10, 5), font=FONT_BASE)
     style.map("TButton",
@@ -117,7 +121,7 @@ def apply_theme(root: tk.Misc) -> dict:
                            ("focus", p["accent"])])
 
     # 主操作按钮（金色实底）
-    style.configure("Accent.TButton", background=p["accent"],
+    style.configure("Accent.TButton", width=0, background=p["accent"],
                     foreground=p["on_accent"], bordercolor=p["accent"],
                     relief="flat", padding=(10, 5), font=FONT_BOLD)
     style.map("Accent.TButton",
@@ -127,13 +131,31 @@ def apply_theme(root: tk.Misc) -> dict:
               foreground=[("disabled", p["fg_dim"])])
 
     # 危险操作按钮（红色描边）
-    style.configure("Danger.TButton", background=p["panel"],
+    style.configure("Danger.TButton", width=0, background=p["panel"],
                     foreground=p["danger"], bordercolor=p["border"],
                     relief="flat", padding=(10, 5))
     style.map("Danger.TButton",
               background=[("active", p["panel_alt"])],
               foreground=[("active", p["danger"])],
               bordercolor=[("active", p["danger"])])
+
+    # 状态带 / 工具带上的普通按钮。
+    # 为什么单独一条：TButton 是 relief="flat" + background=panel，和它所在的
+    # Panel.TFrame 完全同色 —— 在界面上就是一段文字，用户根本看不出能点
+    # （实测反馈："你没有给我设置热键启动的按钮"）。这条给它一个比面板亮的
+    # 底色 + 可见边框，一眼就是按钮。
+    style.configure("Bar.TButton", width=0, background=p["panel_alt"],
+                    foreground=p["fg"], bordercolor=p["border"],
+                    lightcolor=p["panel_alt"], darkcolor=p["panel"],
+                    focuscolor=p["accent"], relief="raised", borderwidth=1,
+                    padding=(10, 4), font=FONT_BASE)
+    style.map("Bar.TButton",
+              background=[("pressed", p["accent_lo"]),
+                          ("active", p["panel"]),
+                          ("disabled", p["panel"])],
+              foreground=[("disabled", p["fg_dim"])],
+              bordercolor=[("active", p["accent"]),
+                           ("focus", p["accent"])])
 
     # ---- 输入类 ----
     style.configure("TEntry", fieldbackground=p["field"], foreground=p["fg"],
@@ -234,6 +256,9 @@ def apply_theme(root: tk.Misc) -> dict:
                     foreground=p["ok"], font=FONT_BOLD)
     style.configure("Paused.TLabel", background=p["panel"],
                     foreground=p["accent"], font=FONT_BOLD)
+    # 失败 / 需要用户注意的动态（状态栏「最近动态」用）
+    style.configure("Danger.TLabel", background=p["panel"],
+                    foreground=p["danger"], font=FONT_BOLD)
 
     return p
 

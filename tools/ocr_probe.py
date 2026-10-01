@@ -16,6 +16,11 @@ import time
 _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, _ROOT)
 
+# 仓库自带的依赖（.pylibs / .devtools）
+from app._bootstrap import add_vendored_libs                    # noqa: E402
+
+add_vendored_libs(_ROOT)
+
 from PIL import Image, ImageDraw, ImageFont          # noqa: E402
 
 from app import config  # noqa: E402

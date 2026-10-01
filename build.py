@@ -4,7 +4,8 @@
 用法：
     python build.py                 # 默认 onedir（推荐：启动快、杀软误报少）
     python build.py --onefile       # 单文件 exe
-    python build.py --clean         # 先清理本次产物（用户 data/ 会先保留再放回）
+    python build.py --clean         # 先清理本次产物（用户 data/ 会先备份走）
+    python build.py --keep-data     # 保留产物里已有的 data/（开发自用，不推荐）
     python build.py --console       # 保留控制台窗口（排查问题时用）
 
 产物（都写到源码目录上一级的「发布包/」里）：
@@ -12,20 +13,27 @@
     ../发布包/HD2Blacklist.exe                   (onefile 单文件版)
 
 并且会自动在产物旁边放好：
-    · data/ 种子目录（示例配置 + 默认提示图 + 应用图标）
+    · data/ 种子目录（**只有三个图标**；配置与名单由程序首次运行时自己生成）
     · 使用说明.txt / LICENSE.txt（从仓库根目录复制，永远与源码同步）
 
+⚠ **打包不带任何用户数据**：`data/` 里的 blacklist.db、notification.json、
+   user_config.json、hotkey.json、logs/、evidence/、以及用户自己放进去的图片
+   音频，统统不进产物 —— 里面有本机使用痕迹（名单、区域坐标、自定义文件路径）。
+   需要保留旧产物里的 data/ 时用 `--keep-data`（仅开发自用）。
+
 注意：config.py 以 **exe 所在目录** 作为 BASE_DIR，
-      所以 data/ 必须和 exe 放在一起（本脚本会自动复制）。
+      所以 data/ 必须和 exe 放在一起（本脚本会自动创建种子目录）。
 """
 from __future__ import annotations
 
 import argparse
 import importlib.util
+import io
 import os
 import shutil
 import subprocess
 import sys
+import time
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
 #: 产物输出到源码目录**上一级**的 发布包/（与 source_code/ 平级）
@@ -35,9 +43,15 @@ ENTRY = os.path.join(ROOT, "main.py")
 DIST = os.path.join(OUT_ROOT, "发布包")
 BUILD = os.path.join(ROOT, "build")
 DATA = os.path.join(ROOT, "data")
+BACKUP_ROOT = os.path.join(OUT_ROOT, "_packaged_data_backup")
 #: 随包分发给人看的文档（源文件在仓库根目录里，打包时复制到产物旁边）
 DOC_FILES = (("使用说明.txt", "使用说明.txt"),
              ("LICENSE", "LICENSE.txt"))
+#: 允许进产物的静态资源（其余 data/assets 里的东西都是用户自己的图片/音频）
+SEED_ASSETS = ("default_icon.png", "app_icon.png", "app_icon.ico")
+#: 明确属于"用户痕迹"的文件，产物里见到就删
+USER_DATA_FILES = ("blacklist.db", "notification.json", "user_config.json",
+                   "hotkey.json")
 
 
 def log(msg):
@@ -103,6 +117,12 @@ def build_command(onefile: bool, console: bool) -> list:
     ]
     cmd.append("--onefile" if onefile else "--onedir")
     cmd.append("--console" if console else "--noconsole")
+
+    # ---- exe 版本属性（右键属性 → 详细信息里能看到版本）----
+    try:
+        cmd += ["--version-file", version_file()]
+    except Exception as e:                                   # noqa: BLE001
+        log(f"版本资源生成失败（不影响打包）: {e}")
 
     # ---- exe 图标 ----
     from app import config  # noqa: E402
@@ -170,24 +190,100 @@ def build_command(onefile: bool, console: bool) -> list:
 
 
 def copy_seed_data(target_dir: str):
-    """把 data/ 种子目录复制到产物旁边（不覆盖用户已有数据）。"""
+    """只放**静态资源**到产物旁边；一个字节的用户数据都不带。
+
+    notification.json / user_config.json 里可能有本机的东西（自定义提示图/音效
+    的绝对路径、自己框的区域坐标），所以不进产物 —— 程序首次运行会自己生成
+    默认配置（`ensure_notification_file` / `RegionConfig` 默认值）。
+    """
     dest = os.path.join(target_dir, "data")
     os.makedirs(dest, exist_ok=True)
     for sub in ("assets", "evidence", "logs"):
         os.makedirs(os.path.join(dest, sub), exist_ok=True)
 
-    for name in ("notification.json", "user_config.json"):
-        src = os.path.join(DATA, name)
-        if os.path.exists(src) and not os.path.exists(os.path.join(dest, name)):
-            shutil.copy2(src, os.path.join(dest, name))
-            log(f"复制 {name}")
+    for icon_name in SEED_ASSETS:
+        src = os.path.join(DATA, "assets", icon_name)
+        dst = os.path.join(dest, "assets", icon_name)
+        if os.path.exists(src):
+            shutil.copy2(src, dst)
+            log(f"复制静态资源 {icon_name}")
 
-    for icon_name in ("default_icon.png", "app_icon.png", "app_icon.ico"):
-        src_icon = os.path.join(DATA, "assets", icon_name)
-        dst_icon = os.path.join(dest, "assets", icon_name)
-        if os.path.exists(src_icon) and not os.path.exists(dst_icon):
-            shutil.copy2(src_icon, dst_icon)
-            log(f"复制 {icon_name}")
+
+def strip_user_data(target_dir: str) -> int:
+    """产物落地后再扫一遍：任何本机使用痕迹都不许留在分发目录里。
+
+    返回清掉的条目数。宁可多删（程序会自己重建），不能把用户记录带出去。
+    """
+    dest = os.path.join(target_dir, "data")
+    if not os.path.isdir(dest):
+        return 0
+    removed = []
+
+    for name in USER_DATA_FILES:
+        p = os.path.join(dest, name)
+        if os.path.isfile(p):
+            os.remove(p)
+            removed.append(name)
+
+    for sub in ("logs", "evidence"):
+        d = os.path.join(dest, sub)
+        if not os.path.isdir(d):
+            continue
+        for name in os.listdir(d):
+            p = os.path.join(d, name)
+            if os.path.isdir(p):
+                shutil.rmtree(p, ignore_errors=True)
+            else:
+                os.remove(p)
+            removed.append(f"{sub}/{name}")
+
+    # assets 里除了三个随包图标，其它都是用户自己挑的图片/音频
+    assets = os.path.join(dest, "assets")
+    if os.path.isdir(assets):
+        for name in os.listdir(assets):
+            if name in SEED_ASSETS:
+                continue
+            os.remove(os.path.join(assets, name))
+            removed.append(f"assets/{name}")
+
+    if removed:
+        head = ", ".join(removed[:8])
+        more = "" if len(removed) <= 8 else f" …共 {len(removed)} 项"
+        log(f"已清除产物里的用户数据: {head}{more}")
+    else:
+        log("产物里没有用户数据 ✅")
+    return len(removed)
+
+
+def version_file() -> str:
+    """生成 PyInstaller 版本资源，让 exe 属性里能看到版本号。"""
+    from app import config                                  # noqa: E402
+    ver = config.VERSION
+    parts = (ver.split(".") + ["0", "0", "0", "0"])[:4]
+    quad = ", ".join(parts)
+    path = os.path.join(BUILD, "version_info.txt")
+    os.makedirs(BUILD, exist_ok=True)
+    io.open(path, "w", encoding="utf-8", newline="\n").write(f"""\
+VSVersionInfo(
+  ffi=FixedFileInfo(
+    filevers=({quad}), prodvers=({quad}),
+    mask=0x3f, flags=0x0, OS=0x40004, fileType=0x1, subtype=0x0, date=(0, 0)),
+  kids=[
+    StringFileInfo([
+      StringTable('080404B0', [
+        StringStruct('CompanyName', 'HD2 Blacklist'),
+        StringStruct('FileDescription', 'HD2 黑名单 v{ver}'),
+        StringStruct('FileVersion', '{ver}'),
+        StringStruct('InternalName', 'HD2Blacklist'),
+        StringStruct('OriginalFilename', 'HD2Blacklist.exe'),
+        StringStruct('ProductName', 'HD2 黑名单'),
+        StringStruct('ProductVersion', '{ver}'),
+        StringStruct('Comments', '')])]),
+    VarFileInfo([VarStruct('Translation', [2052, 1200])])]
+)
+""")
+    log(f"版本资源: {ver}")
+    return path
 
 
 def copy_docs(target_dir: str):
@@ -233,6 +329,8 @@ def main(argv=None) -> int:
     parser.add_argument("--onefile", action="store_true",
                         help="打包成单个 exe")
     parser.add_argument("--clean", action="store_true", help="先清理构建目录")
+    parser.add_argument("--keep-data", action="store_true",
+                        help="保留产物里已有的 data/（开发自用；默认会清掉用户数据）")
     parser.add_argument("--console", action="store_true",
                         help="保留控制台窗口（调试用）")
     args = parser.parse_args(argv)
@@ -243,21 +341,31 @@ def main(argv=None) -> int:
 
     keep_dir = None
     so_dir = os.path.join(DIST, APP_NAME)
+    keep_data = bool(args.keep_data)
     if args.clean:
         # 只清理「本次要产出的那一份」+ 构建缓存。
         # 注意不要整个删掉 发布包/：那里还放着解压版、发布压缩包和使用说明。
         targets = [BUILD,
                    os.path.join(DIST, f"{APP_NAME}.exe") if args.onefile
                    else so_dir]
-        # 文件夹版的 data/ 就长在产物目录里面 —— 里面是用户的真实数据
-        # （黑名单、证据截图、通知配置），清理前先搬出来，构建完再搬回去。
+        # 文件夹版的 data/ 长在产物目录里面 —— 里面是本机使用痕迹
+        # （黑名单、证据截图、区域坐标、自定义文件路径）。
+        # 默认**不**带进新产物：先备份到 _packaged_data_backup/（不删），
+        # 免得哪天要找回旧名单；`--keep-data` 则照旧搬回来（开发自用）。
         if not args.onefile:
             src_data = os.path.join(so_dir, "data")
             if os.path.isdir(src_data):
-                keep_dir = os.path.join(DIST, f"_{APP_NAME}_data_keep")
-                shutil.rmtree(keep_dir, ignore_errors=True)
-                shutil.move(src_data, keep_dir)
-                log(f"先保留用户数据 {src_data}")
+                if keep_data:
+                    keep_dir = os.path.join(DIST, f"_{APP_NAME}_data_keep")
+                    shutil.rmtree(keep_dir, ignore_errors=True)
+                    shutil.move(src_data, keep_dir)
+                    log(f"按 --keep-data 先保留用户数据 {src_data}")
+                else:
+                    stamp = time.strftime("%Y%m%d_%H%M%S")
+                    backup = os.path.join(BACKUP_ROOT, f"packaged_{stamp}")
+                    os.makedirs(BACKUP_ROOT, exist_ok=True)
+                    shutil.move(src_data, backup)
+                    log(f"旧产物里的用户数据已备份到 {backup}（新版不带它）")
         for d in targets:
             if os.path.isdir(d):
                 shutil.rmtree(d, ignore_errors=True)
@@ -280,12 +388,16 @@ def main(argv=None) -> int:
         exe = os.path.join(DIST, f"{APP_NAME}.exe")
         copy_seed_data(DIST)
         copy_docs(DIST)
+        if not keep_data:
+            strip_user_data(DIST)
     else:
         _restore_kept_data(keep_dir, so_dir)
         exe = os.path.join(so_dir, f"{APP_NAME}.exe")
         copy_seed_data(so_dir)
         copy_docs(so_dir)          # exe 旁边一份（发给别人时随包带走）
         copy_docs(DIST)            # 发布包/ 顶层一份（自己看目录时一眼可见）
+        if not keep_data:
+            strip_user_data(so_dir)
 
     print()
     if os.path.exists(exe):

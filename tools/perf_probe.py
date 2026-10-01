@@ -22,6 +22,11 @@ _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _ROOT not in sys.path:
     sys.path.insert(0, _ROOT)
 
+# 仓库自带的依赖（.pylibs / .devtools）—— 少了它这里会报"没有 numpy/rapidocr"
+from app._bootstrap import add_vendored_libs                    # noqa: E402
+
+add_vendored_libs(_ROOT)
+
 try:
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 except Exception:                                        # noqa: BLE001

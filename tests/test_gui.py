@@ -8,6 +8,7 @@
 """
 from __future__ import annotations
 
+import gc
 import json
 import os
 import shutil
@@ -85,8 +86,7 @@ class TestEntryDialogValidation(TempCase):
         dlg.top = tk.Toplevel(self.root)
         dlg.top.withdraw()
         dlg.vars = {k: tk.StringVar(value=str((entry or {}).get(k) or ""))
-                    for k in ("player_id", "player_name", "tk_count",
-                              "evidence_path")}
+                    for k in ("player_name",)}
         dlg.note_text = tk.Text(dlg.top)
         if entry and entry.get("note"):
             dlg.note_text.insert("1.0", entry["note"])
@@ -94,17 +94,13 @@ class TestEntryDialogValidation(TempCase):
 
     def test_valid_input(self):
         dlg = self._dialog()
-        dlg.vars["player_id"].set("7656119")
         dlg.vars["player_name"].set("PlayerX")
-        dlg.vars["tk_count"].set("4")
         dlg.note_text.insert("1.0", "恶意TK")
         dlg._ok()
-        self.assertEqual(dlg.result["player_id"], "7656119")
         self.assertEqual(dlg.result["player_name"], "PlayerX")
-        self.assertEqual(dlg.result["tk_count"], 4)
         self.assertEqual(dlg.result["note"], "恶意TK")
 
-    def test_requires_id_or_name(self):
+    def test_requires_name(self):
         import tkinter.messagebox as mb
         dlg = self._dialog()
         orig = mb.showwarning
@@ -115,11 +111,10 @@ class TestEntryDialogValidation(TempCase):
         finally:
             mb.showwarning = orig
 
-    def test_bad_tk_count_rejected(self):
+    def test_blank_name_is_rejected(self):
         import tkinter.messagebox as mb
         dlg = self._dialog()
-        dlg.vars["player_id"].set("x")
-        dlg.vars["tk_count"].set("abc")
+        dlg.vars["player_name"].set("   ")
         orig = mb.showwarning
         mb.showwarning = lambda *a, **k: None
         try:
@@ -128,11 +123,17 @@ class TestEntryDialogValidation(TempCase):
         finally:
             mb.showwarning = orig
 
-    def test_prefilled_from_entry(self):
-        dlg = self._dialog({"player_id": "id1", "player_name": "N",
-                            "tk_count": 2, "note": "备注"})
+    def test_only_name_and_note_are_collected(self):
+        """对话框只收集 名称 / 备注 —— 玩家ID / TK次数 / 证据图路径都已删掉。"""
+        dlg = self._dialog()
+        dlg.vars["player_name"].set("PlayerX")
         dlg._ok()
-        self.assertEqual(dlg.result["tk_count"], 2)
+        self.assertEqual(set(dlg.result), {"player_name", "note"})
+
+    def test_prefilled_from_entry(self):
+        dlg = self._dialog({"player_name": "N", "note": "备注"})
+        dlg._ok()
+        self.assertEqual(dlg.result["player_name"], "N")
         self.assertEqual(dlg.result["note"], "备注")
 
 
@@ -142,8 +143,8 @@ class TestBlacklistGUI(TempCase):
     def setUp(self):
         super().setUp()
         self.db = BlacklistDB(self.path("bl.db"))
-        self.db.add("id1", "PlayerX", "恶意TK", 2)
-        self.db.add("id2", "John Doe", "空格名", 1)
+        self.db.add("PlayerX", "恶意TK")
+        self.db.add("John Doe", "空格名")
         self.region_cfg = RegionConfig(self.path("user_config.json"))
         self.notif_cfg = NotificationConfig(self.path("notification.json"))
         self.matcher = Matcher(self.db)
@@ -159,6 +160,12 @@ class TestBlacklistGUI(TempCase):
             self.gui.destroy()
         except Exception:                            # noqa: BLE001
             pass
+        # 在主线程里立刻回收 Tk 对象：Tk 变量/图像若被后台线程或循环引用留到
+        # 解释器退出时才析构，Tcl 会在错误的线程删掉自己的 async handler，
+        # 进程直接 abort（Tcl_AsyncDelete: async handler deleted by the wrong
+        # thread）。测试里反复建/销毁 Tk 解释器时这个偶发崩溃很明显。
+        self.gui = None
+        gc.collect()
         self.db.close()
         super().tearDown()
 
@@ -172,23 +179,34 @@ class TestBlacklistGUI(TempCase):
         self.assertEqual(len(self.gui.tree.get_children()), 2)
 
     def test_row_values(self):
+        """名单只有三列：名称 / 备注 / 添加时间。"""
         values = self.gui.tree.item("1", "values")
-        self.assertEqual(values[0], "id1")
-        self.assertEqual(values[1], "PlayerX")
-        self.assertEqual(values[3], "2")           # tk_count
-        self.assertEqual(values[4], "0")           # encounter_count
+        self.assertEqual(len(values), 3)
+        self.assertEqual(values[0], "PlayerX")
+        self.assertEqual(values[1], "恶意TK")
+        self.assertTrue(values[2])                 # created_at
+
+    def test_tree_has_no_stats_columns(self):
+        from app.ui.gui import COLUMNS
+        self.assertEqual(COLUMNS, ("player_name", "note", "created_at"))
+        for gone in ("player_id", "tk_count", "encounter_count", "last_seen"):
+            self.assertNotIn(gone, COLUMNS)
 
     def test_sort_by_column_toggles(self):
-        self.gui.sort_by_column("encounter_count")
-        self.assertEqual(self.gui.sort_key, "encounter_count")
+        self.gui.sort_by_column("player_name")
+        self.assertEqual(self.gui.sort_key, "player_name")
         self.assertTrue(self.gui.sort_desc)
-        self.gui.sort_by_column("encounter_count")
+        self.gui.sort_by_column("player_name")
         self.assertFalse(self.gui.sort_desc)
         self.assertIn("升序", self.gui.sort_dir_btn["text"])
 
+    def test_sort_by_removed_column_is_ignored(self):
+        self.gui.sort_by_column("encounter_count")     # 不该崩，也不该改排序键
+        self.assertEqual(self.gui.sort_key, "created_at")
+
     def test_sort_button_label_sync(self):
         self.gui._on_sort_selected()
-        self.assertEqual(self.gui.sort_key, "last_seen")
+        self.assertEqual(self.gui.sort_key, "created_at")
 
     def test_search_and_clear(self):
         self.gui.search_var.set("John")
@@ -204,23 +222,26 @@ class TestBlacklistGUI(TempCase):
 
     # ---- 跨线程更新 ----
     def test_encounter_update_via_queue(self):
-        """模拟后台线程命中 → 主线程 drain → UI 立即刷新。"""
+        """模拟后台线程命中 → 主线程 drain → UI 立即刷新。
+
+        名单里已经没有「遇到次数 / 最后遇见」列了，所以命中只闪行 + 更新
+        状态栏与动态流，不再写单元格。
+        """
         self.gui.enqueue_encounter_update({
             "entry_id": 1, "player_name": "PlayerX",
-            "encounter_count": 5, "last_seen": "2026-01-01 00:00:00",
+            "today_count": 5, "seen_at": "2026-01-01 00:00:00",
             "score": 100.0, "source": "chat",
         })
         self.gui._drain_once()
-        self.assertEqual(self.gui.tree.set("1", "encounter_count"), "5")
-        self.assertEqual(self.gui.tree.set("1", "last_seen"),
-                         "2026-01-01 00:00:00")
         self.assertEqual(self.gui.session_hit_count, 1)
         self.assertIn("命中黑名单", self.gui.status_var.get())
+        self.assertEqual(self.gui.tree.item("1", "values")[0], "PlayerX")
+        self.assertIn("hit", self.gui.tree.item("1", "tags"))   # 命中行闪烁
 
     def test_encounter_update_for_missing_row_is_safe(self):
         self.gui.enqueue_encounter_update({
             "entry_id": 999, "player_name": "Ghost",
-            "encounter_count": 1, "last_seen": "x", "score": 90, "source": "s"})
+            "today_count": 1, "seen_at": "x", "score": 90, "source": "s"})
         self.gui._drain_once()                     # 不抛异常
         self.assertEqual(self.gui.session_hit_count, 1)
 
@@ -275,27 +296,19 @@ class TestBlacklistGUI(TempCase):
         self.gui.destroy()
         self.assertTrue(self.gui._closing)
 
-    # ---- 右键重置 ----
-    def test_reset_encounter(self):
+    # ---- 命中记录（列表里不再有计数列） ----
+    def test_hit_records_encounter_without_touching_list(self):
         self.db.record_encounter(1, 100.0, "chat", "PlayerX", "")
         self.gui.refresh()
-        self.gui._reset_encounter("1")
-        self.assertEqual(self.gui.tree.set("1", "encounter_count"), "0")
-        self.assertEqual(self.db.get(1)["encounter_count"], 0)
+        self.assertEqual(self.db.get_total_encounter_count(), 1)
+        self.assertEqual(len(self.gui.tree.get_children()), 2)
+        self.assertEqual(self.gui.tree.item("1", "values")[0], "PlayerX")
 
-    def test_reset_last_seen(self):
-        self.db.record_encounter(1, 100.0, "chat", "PlayerX", "")
-        self.gui.refresh()
-        self.gui._reset_last_seen("1")
-        self.assertEqual(self.gui.tree.set("1", "last_seen"), "")
-        self.assertIsNone(self.db.get(1)["last_seen"])
-
-    def test_reset_only_affects_target(self):
-        self.db.record_encounter(1, 100.0, "chat", "PlayerX", "")
-        self.db.record_encounter(2, 100.0, "chat", "John Doe", "")
-        self.gui.refresh()
-        self.gui._reset_encounter("1")
-        self.assertEqual(self.db.get(2)["encounter_count"], 1)
+    def test_context_menu_has_no_counter_reset(self):
+        labels = [self.gui.menu.entrycget(i, "label")
+                  for i in range(self.gui.menu.index("end") + 1)
+                  if self.gui.menu.type(i) == "command"]
+        self.assertEqual(labels, ["编辑", "删除"])
 
     # ---- 统计 ----
     def test_stats_bar(self):
@@ -322,6 +335,51 @@ class TestBlacklistGUI(TempCase):
         self.gui.set_monitoring(True)
         self.assertIn("监控中", self.gui.monitor_var.get())
 
+    def test_pause_button_actually_toggles(self):
+        """[暂停监控] 必须能真的切换。
+
+        旧实现读的是 pause_var（而主界面这个按钮从来不写它）→ 每次点都只发一次
+        "恢复"，永远暂停不上，日志还一直刷「监控已恢复」（用户实测反馈）。
+        """
+        seen = []
+        self.gui.on_pause = seen.append
+        self.gui.set_monitoring(True)                  # 假装游戏在跑
+
+        self.gui.toggle_pause()
+        self.assertTrue(self.gui.paused)
+        self.assertTrue(self.gui.pause_var.get())
+        self.assertIn("恢复监控", self.gui.pause_btn.cget("text"))
+        self.assertEqual(seen, [True])
+
+        self.gui.toggle_pause()
+        self.assertFalse(self.gui.paused)
+        self.assertFalse(self.gui.pause_var.get())
+        self.assertIn("暂停监控", self.gui.pause_btn.cget("text"))
+        self.assertEqual(seen, [True, False])
+
+    def test_pause_does_not_fake_monitoring_light(self):
+        """游戏没在跑时点暂停，指示灯不能变成「监控中」。"""
+        self.gui.set_monitoring(False, "游戏未运行")
+        self.assertIn("已暂停", self.gui.monitor_var.get())
+
+        self.gui.toggle_pause()
+        self.assertIn("已暂停", self.gui.monitor_var.get())
+        self.assertNotIn("监控中", self.gui.monitor_var.get())
+        self.assertIn("手动暂停", self.gui.monitor_var.get())
+
+        self.gui.toggle_pause()                        # 取消暂停，游戏仍未运行
+        self.assertIn("已暂停", self.gui.monitor_var.get())
+        self.assertNotIn("监控中", self.gui.monitor_var.get())
+
+    def test_monitor_light_green_only_when_game_runs_and_not_paused(self):
+        self.gui.toggle_pause()                        # 用户暂停
+        self.gui.set_monitoring(True)                  # 游戏起来了，但用户暂停着
+        self.assertIn("已暂停", self.gui.monitor_var.get())
+        self.gui.toggle_pause()                        # 取消暂停
+        self.assertIn("监控中", self.gui.monitor_var.get())
+        self.gui.set_monitoring(False, "游戏已退出")     # 游戏退出 → 灯变回暂停
+        self.assertIn("已暂停", self.gui.monitor_var.get())
+
     # ---- 增删改 ----
     def test_delete_entry(self):
         self.db.delete(1)
@@ -329,7 +387,7 @@ class TestBlacklistGUI(TempCase):
         self.assertEqual(len(self.gui.tree.get_children()), 1)
 
     def test_after_db_change_reloads_matcher(self):
-        self.db.add("id3", "NewGuy")
+        self.db.add("NewGuy")
         self.gui._after_db_change()
         self.assertEqual(len(self.gui.tree.get_children()), 3)
         self.assertIsNotNone(self.matcher.match_one("NewGuy"))
@@ -350,11 +408,13 @@ class TestBlacklistGUI(TempCase):
             self.assertEqual(len(list(csv.reader(f))), 3)
 
     def test_right_click_menu_exists(self):
+        """右键菜单只留 编辑 / 删除 —— 计数类操作随字段一起删掉了。"""
         labels = [self.gui.menu.entrycget(i, "label")
                   for i in range(self.gui.menu.index("end") + 1)
                   if self.gui.menu.type(i) == "command"]
-        for expected in ("编辑", "删除", "清零遇到次数", "重置最后遇见时间"):
-            self.assertIn(expected, labels)
+        self.assertEqual(labels, ["编辑", "删除"])
+        self.assertFalse(hasattr(self.gui, "_reset_encounter"))
+        self.assertFalse(hasattr(self.gui, "_reset_last_seen"))
 
     # ---- 布局 ----
     def _overflowing_children(self, parent, limit_x, limit_y):
@@ -382,9 +442,9 @@ class TestBlacklistGUI(TempCase):
         return bad
 
     def test_toolbar_fits_at_min_width(self):
-        """最小宽度下两行工具栏与底部栏都不能被挤掉。"""
+        """最小尺寸下两行工具带、设置标签栏、状态栏都不能被挤掉。"""
         from app.ui import gui as gui_mod
-        min_w, min_h = 960, 480
+        min_w, min_h = gui_mod.MIN_WIDTH, gui_mod.MIN_HEIGHT
         self.gui.root.minsize(min_w, min_h)
         self.gui.root.geometry(f"{min_w}x{min_h}+0+0")
         self.gui.root.deiconify()
@@ -395,7 +455,7 @@ class TestBlacklistGUI(TempCase):
         self.assertEqual(bad, [], f"以下控件在 {min_w}x{min_h} 下被挤出窗口: {bad}")
         self.gui.root.withdraw()
 
-    def test_toolbar_buttons_all_present(self):
+    def _button_texts(self):
         texts = []
 
         def walk(w):
@@ -408,10 +468,160 @@ class TestBlacklistGUI(TempCase):
                 walk(c)
 
         walk(self.gui.root)
-        for expected in ("添加", "编辑", "删除", "搜索", "清空",
-                         "校准区域", "恢复全部默认", "通知设置", "最小化到托盘"):
-            self.assertIn(expected, texts, f"工具栏缺少按钮：{expected}")
-        self.assertIn("↓ 降序", texts)
+        return texts
+
+    def test_toolbar_buttons_are_not_squeezed(self):
+        """最小尺寸下按钮不能被 pack 压扁。
+
+        这条能抓住一个真实历史坑：Tk 8.6 的 ttk 按钮默认等宽（-11 字符），
+        一行塞不下时 pack 会把每个按钮一起压缩 —— 曾经挤到 1px 宽。
+        """
+        from app.ui import gui as gui_mod
+        self.gui.root.minsize(gui_mod.MIN_WIDTH, gui_mod.MIN_HEIGHT)
+        self.gui.root.geometry(f"{gui_mod.MIN_WIDTH}x{gui_mod.MIN_HEIGHT}+0+0")
+        self.gui.root.deiconify()
+        self.gui.root.update()
+        self.gui.root.update_idletasks()
+
+        squeezed = []
+
+        def walk(w):
+            for c in w.winfo_children():
+                try:
+                    if c.winfo_class() == "TButton" and c.winfo_ismapped():
+                        if c.winfo_width() < c.winfo_reqwidth() - 2:
+                            squeezed.append((c.cget("text"),
+                                             c.winfo_width(),
+                                             c.winfo_reqwidth()))
+                except Exception:                     # noqa: BLE001
+                    pass
+                walk(c)
+
+        walk(self.gui.root)
+        self.assertEqual(squeezed, [], f"这些按钮被挤扁了: {squeezed}")
+        self.gui.root.withdraw()
+
+    def test_toolbar_buttons_all_present(self):
+        """① 运行状态带 + ② 名单工具带 + ④ 设置标签栏的按钮一个都不能少。"""
+        texts = self._button_texts()
+        for expected in ("添加", "编辑", "删除", "搜索", "清空", "↓ 降序",
+                         "导入", "导出",              # ② 名单工具带
+                         "扫描聊天框", "暂停监控", "退出"):   # ① 运行状态带
+            self.assertIn(expected, texts, f"缺少按钮：{expected}")
+        for _, label in gui_mod.SETTINGS_TABS:        # ④ 设置分页标签
+            self.assertIn(label, texts, f"设置缺少分页：{label}")
+        self.assertIn("▴ 展开设置", texts)
+
+    def test_no_menu_bar(self):
+        """菜单栏已删除：重复入口的根源。"""
+        self.assertEqual(str(self.gui.root.cget("menu")), "")
+
+    def test_duplicated_entries_are_gone(self):
+        """原来在菜单 + 工具栏各来一遍的入口不再重复。"""
+        texts = self._button_texts()
+        for gone in ("恢复全部默认", "通知设置", "校准区域", "最小化到托盘"):
+            self.assertNotIn(gone, texts,
+                             f"{gone} 应该只存在于设置分页里，不该再占工具带")
+
+    def test_settings_collapsed_by_default(self):
+        self.gui.root.update()
+        self.assertFalse(self.gui.settings_expanded)
+        self.assertEqual(self.gui.settings_toggle_btn.cget("text"), "▴ 展开设置")
+        # 收起时内容区根本没被 pack：标签栏还在，内容不参与布局
+        self.assertFalse(self.gui.settings_content.winfo_manager())
+        self.assertGreater(self.gui.settings_bar.winfo_reqheight(), 0)
+
+    def test_toggle_settings_expands_and_collapses(self):
+        self.gui.root.deiconify()
+        self.gui.root.update()
+        self.gui.set_settings_expanded(True)
+        self.gui.root.update()
+        self.gui.root.update_idletasks()
+        self.assertTrue(self.gui.settings_expanded)
+        self.assertEqual(self.gui.settings_toggle_btn.cget("text"), "▾ 收起设置")
+        self.assertEqual(self.gui.settings_content.winfo_manager(), "pack")
+        self.assertGreater(self.gui.settings_content.winfo_height(), 100)
+
+        self.gui.set_settings_expanded(False)
+        self.gui.root.update()
+        self.gui.root.update_idletasks()
+        self.assertFalse(self.gui.settings_content.winfo_manager())
+        self.gui.root.withdraw()
+
+    def test_settings_pages_switch(self):
+        self.gui.root.update()
+        self.gui.show_settings_page("data")
+        self.assertEqual(self.gui.settings_page, "data")
+        self.assertTrue(self.gui.settings_expanded)      # 点分页会自动展开
+        packed = [k for k, f in self.gui.settings_pages.items()
+                  if f.winfo_manager() == "pack"]
+        self.assertEqual(packed, ["data"])
+        self.assertEqual(self.gui.settings_tab_btns["data"].cget("style"),
+                         "Accent.TButton")
+        self.assertEqual(self.gui.settings_tab_btns["scan"].cget("style"),
+                         "Bar.TButton")
+
+    def test_startup_layout_settles_without_jitter(self):
+        """启动后设置区高度必须一次到位，之后纹丝不动。
+
+        历史 bug：挪分隔条会让 PanedWindow 自身高度变 1px → 触发 <Configure>
+        → 又去挪 → 再变 1px…… 无限来回抖（肉眼就是启动时那块区域抽搐，而且
+        事件循环空转烧 CPU）。所以这里直接数"设置了几次高度"和"位置变过几种"。
+        """
+        self.gui.root.deiconify()
+        self.gui.root.update()
+        time.sleep(0.2)                     # 先让首帧布局落定
+
+        calls = []
+        orig = self.gui.paned.paneconfigure
+
+        def traced(*args, **kwargs):
+            if "height" in kwargs:
+                calls.append(kwargs["height"])
+                if len(calls) > 12:         # 保险丝：别把测试本身拖死
+                    return None
+            return orig(*args, **kwargs)
+
+        self.gui.paned.paneconfigure = traced
+        positions, heights = set(), set()
+        t0 = time.time()
+        while time.time() - t0 < 0.5:
+            self.gui.root.update()
+            try:
+                positions.add(self.gui.paned.sash_coord(0)[1])
+                heights.add(self.gui.settings_frame.winfo_height())
+            except Exception:                    # noqa: BLE001
+                pass
+            time.sleep(0.01)
+
+        self.assertLessEqual(len(calls), 8, f"反复重设设置区高度：{calls}")
+        self.assertEqual(len(positions), 1, f"分隔条在抖动：{sorted(positions)}")
+        self.assertEqual(len(heights), 1, f"设置区高度在抖动：{sorted(heights)}")
+        # 收起态就该是"标签栏那么高"（差 1~2px 是 Tk 的边框取整，不算问题）
+        self.assertAlmostEqual(self.gui.settings_frame.winfo_height(),
+                               self.gui._collapsed_h, delta=4)
+        self.gui.root.withdraw()
+
+    def test_settings_page_falls_back_to_first(self):
+        self.gui.show_settings_page("no_such_page")
+        self.assertEqual(self.gui.settings_page, gui_mod.SETTINGS_TABS[0][0])
+
+    def test_every_settings_page_scrolls_to_the_end(self):
+        """每一页的内容都必须落在滚动区域内 —— 否则底部的按钮根本点不到。"""
+        self.gui.root.deiconify()
+        self.gui.root.update()
+        for key, label in gui_mod.SETTINGS_TABS:
+            self.gui.show_settings_page(key)
+            for _ in range(4):
+                self.gui.root.update()
+            area = self.gui.settings_content
+            area.update_idletasks()
+            bbox = area.canvas.bbox("all")
+            self.assertIsNotNone(bbox, f"{label} 页没有滚动区域")
+            self.assertGreaterEqual(
+                bbox[3], area.inner.winfo_reqheight() - 2,
+                f"{label} 页的内容超出了滚动区域，滚到底也点不到")
+        self.gui.root.withdraw()
 
 
 # ==========================================================================
@@ -872,13 +1082,10 @@ class TestImportExportHelpers(TempCase):
     """改进点二：CSV / JSON 读写辅助函数（不需要 Tk）。"""
 
     ROWS = [
-        {"player_id": "76561198000000001", "player_name": "PlayerX",
-         "note": "恶意TK", "tk_count": 3, "encounter_count": 5,
-         "created_at": "2026-01-01 10:00:00",
-         "last_seen": "2026-02-02 11:00:00"},
-        {"player_id": "76561198000000002", "player_name": "John Doe",
-         "note": "空格名, 含逗号", "tk_count": 1, "encounter_count": 0,
-         "created_at": "2026-01-03 12:00:00", "last_seen": None},
+        {"player_name": "PlayerX", "note": "恶意TK",
+         "created_at": "2026-01-01 10:00:00"},
+        {"player_name": "John Doe", "note": "空格名, 含逗号",
+         "created_at": "2026-01-03 12:00:00"},
     ]
 
     def test_csv_has_bom_for_excel(self):
@@ -892,20 +1099,19 @@ class TestImportExportHelpers(TempCase):
         gui_mod.write_csv(path, self.ROWS)
         back = gui_mod.parse_csv(path)
         self.assertEqual(len(back), 2)
-        self.assertEqual(back[0]["player_id"], "76561198000000001")
         self.assertEqual(back[0]["player_name"], "PlayerX")
         self.assertEqual(back[0]["note"], "恶意TK")
-        self.assertEqual(back[0]["tk_count"], "3")        # CSV 里都是字符串
-        self.assertEqual(back[0]["encounter_count"], "5")
+        self.assertEqual(back[0]["created_at"], "2026-01-01 10:00:00")
         self.assertEqual(back[1]["note"], "空格名, 含逗号")   # 逗号被正确转义
 
-    def test_csv_header_fields(self):
+    def test_csv_header_has_only_three_fields(self):
         path = self.path("out.csv")
         gui_mod.write_csv(path, self.ROWS)
         with open(path, encoding="utf-8-sig", newline="") as f:
             header = f.readline().strip()
-        for field in gui_mod.IO_FIELDS:
-            self.assertIn(field, header)
+        self.assertEqual(header, "player_name,note,created_at")
+        for gone in ("player_id", "tk_count", "encounter_count", "last_seen"):
+            self.assertNotIn(gone, header)
 
     def test_json_structure(self):
         path = self.path("out.json")
@@ -916,6 +1122,7 @@ class TestImportExportHelpers(TempCase):
         self.assertEqual(len(data["entries"]), 2)
         self.assertEqual(data["entries"][0]["player_name"], "PlayerX")
         self.assertIn("fields", data)
+        self.assertEqual(data["fields"], list(gui_mod.IO_FIELDS))
 
     def test_json_roundtrip(self):
         path = self.path("out.json")
@@ -923,26 +1130,26 @@ class TestImportExportHelpers(TempCase):
         back = gui_mod.parse_json(path)
         self.assertEqual(len(back), 2)
         self.assertEqual(back[0]["created_at"], "2026-01-01 10:00:00")
-        self.assertIsNone(back[1]["last_seen"])
+        self.assertEqual(back[1]["player_name"], "John Doe")
 
     def test_json_accepts_bare_list(self):
         path = self.path("list.json")
         with open(path, "w", encoding="utf-8") as f:
-            json.dump([{"player_id": "x", "player_name": "X"}], f)
+            json.dump([{"player_name": "X"}], f)
         self.assertEqual(len(gui_mod.parse_json(path)), 1)
 
     def test_json_accepts_bom_file(self):
         """用记事本另存过的名单（UTF-8 BOM）也要能导入。"""
         path = self.path("bom.json")
         with open(path, "w", encoding="utf-8-sig") as f:
-            json.dump([{"player_id": "x", "player_name": "X"}], f)
+            json.dump([{"player_name": "X"}], f)
         self.assertEqual(len(gui_mod.parse_json(path)), 1)
 
     def test_json_accepts_alt_container_keys(self):
         for key in ("entries", "blacklist", "items", "data"):
             path = self.path(f"{key}.json")
             with open(path, "w", encoding="utf-8") as f:
-                json.dump({key: [{"player_id": "x"}]}, f)
+                json.dump({key: [{"player_name": "x"}]}, f)
             self.assertEqual(len(gui_mod.parse_json(path)), 1, key)
 
     def test_json_rejects_bad_shape(self):
@@ -974,8 +1181,8 @@ class TestImportExportHelpers(TempCase):
             res = db.import_entries(gui_mod.read_entries(path), strategy="skip")
             self.assertEqual(res["inserted"], 2)
             row = [r for r in db.get_all() if r["player_name"] == "PlayerX"][0]
-            self.assertEqual(row["tk_count"], 3)
-            self.assertEqual(row["encounter_count"], 5)
+            self.assertEqual(row["note"], "恶意TK")
+            self.assertEqual(row["created_at"], "2026-01-01 10:00:00")
         finally:
             db.close()
 
@@ -991,19 +1198,31 @@ class TestChatScanAndIOGui(TempCase):
             self.busy = False
             self.status = status
             self.hits = hits
+            self.on_result = None
 
         def is_busy(self):
             return self.busy
 
         def scan_now(self, source=None):
             self.calls.append(source)
-            return {"status": self.status, "hits": self.hits,
-                    "elapsed_ms": 42.0, "processed": self.hits}
+            # 和真的 ChatScanner 一样：先报"开始"，再报结果。
+            # 界面（按钮 / F8 热键）都靠这个回调播报。
+            if self.on_result is not None:
+                self.on_result({"status": "started",
+                                "source": source or "chat_manual"})
+            result = {"status": self.status, "hits": self.hits,
+                      "elapsed_ms": 42.0, "processed": self.hits,
+                      "source": source or "chat_manual",
+                      "names": ["PlayerX"] if self.hits else [],
+                      "recorded": self.hits, "deduped": 0}
+            if self.on_result is not None:
+                self.on_result(result)
+            return result
 
     def setUp(self):
         super().setUp()
         self.db = BlacklistDB(self.path("bl.db"))
-        self.db.add("id1", "PlayerX", "恶意TK", 2)
+        self.db.add("PlayerX", "恶意TK")
         self.region_cfg = RegionConfig(self.path("user_config.json"))
         self.notif_cfg = NotificationConfig(self.path("notification.json"))
         self.scanner = self.FakeScanner()
@@ -1021,6 +1240,12 @@ class TestChatScanAndIOGui(TempCase):
             self.gui.destroy()
         except Exception:                            # noqa: BLE001
             pass
+        # 在主线程里立刻回收 Tk 对象：Tk 变量/图像若被后台线程或循环引用留到
+        # 解释器退出时才析构，Tcl 会在错误的线程删掉自己的 async handler，
+        # 进程直接 abort（Tcl_AsyncDelete: async handler deleted by the wrong
+        # thread）。测试里反复建/销毁 Tk 解释器时这个偶发崩溃很明显。
+        self.gui = None
+        gc.collect()
         self.db.close()
         super().tearDown()
 
@@ -1128,9 +1353,8 @@ class TestChatScanAndIOGui(TempCase):
         import tkinter.messagebox as mb
         path = self.path("in.csv")
         gui_mod.write_csv(path, [
-            {"player_id": "new1", "player_name": "NewGuy", "note": "n",
-             "tk_count": 4, "encounter_count": 0},
-            {"player_id": "id1", "player_name": "PlayerX", "note": "dup"},
+            {"player_name": "NewGuy", "note": "n"},
+            {"player_name": "PlayerX", "note": "dup"},
         ])
         calls = []
         orig = mb.showinfo
@@ -1149,9 +1373,10 @@ class TestChatScanAndIOGui(TempCase):
     def test_import_update_note_strategy(self):
         import tkinter.messagebox as mb
         path = self.path("in.csv")
+        created = self.db.get(1)["created_at"]
         gui_mod.write_csv(path, [
-            {"player_id": "id1", "player_name": "PlayerX", "note": "改过的备注",
-             "tk_count": 9, "encounter_count": 77},
+            {"player_name": "PlayerX", "note": "改过的备注",
+             "created_at": "2000-01-01 00:00:00"},
         ])
         orig = mb.showinfo
         mb.showinfo = lambda *a, **k: None
@@ -1160,8 +1385,7 @@ class TestChatScanAndIOGui(TempCase):
             self._pump(0.5)
             row = self.db.get(1)
             self.assertEqual(row["note"], "改过的备注")
-            self.assertEqual(row["tk_count"], 9)
-            self.assertEqual(row["encounter_count"], 0)   # 保留本机计数
+            self.assertEqual(row["created_at"], created)   # 添加时间保持本机的
         finally:
             mb.showinfo = orig
 
@@ -1169,15 +1393,17 @@ class TestChatScanAndIOGui(TempCase):
         import tkinter.messagebox as mb
         path = self.path("in.csv")
         gui_mod.write_csv(path, [
-            {"player_id": "id1", "player_name": "PlayerX", "note": "覆盖",
-             "tk_count": 9, "encounter_count": 77},
+            {"player_name": "PlayerX", "note": "覆盖",
+             "created_at": "2000-01-01 00:00:00"},
         ])
         orig = mb.showinfo
         mb.showinfo = lambda *a, **k: None
         try:
             self.gui._import_worker(path, "overwrite")
             self._pump(0.5)
-            self.assertEqual(self.db.get(1)["encounter_count"], 77)
+            row = self.db.get(1)
+            self.assertEqual(row["note"], "覆盖")
+            self.assertEqual(row["created_at"], "2000-01-01 00:00:00")
         finally:
             mb.showinfo = orig
 
@@ -1219,54 +1445,183 @@ class TestChatScanAndIOGui(TempCase):
         self.assertEqual(self.gui.scheduler.dedup_cache_size(), 0)
         self.assertIn("去重缓存", self.gui.status_var.get())
 
-    def test_menu_has_chat_hotkey_submenu(self):
-        menu = self.gui.chat_menu
-        labels = []
-        for i in range(menu.index("end") + 1):
-            try:
-                labels.append(menu.entrycget(i, "label"))
-            except Exception:                        # noqa: BLE001
-                pass
-        self.assertIn("立即扫描聊天框", labels)
-        self.assertIn("自定义快捷键…", labels)
-        self.assertIn("清空命中去重缓存", labels)
-        # 启用项会把当前按键名带在括号里
-        self.assertTrue(any(lab.startswith("启用热键扫描")
-                            for lab in labels), labels)
-        self.assertIn("F8", " ".join(labels))
+    def test_hotkey_toggle_button_reflects_state(self):
+        """F8 开关就是 ① 上那个按钮：文字写"动作"，金色 = 已启用。"""
+        self.gui.chat_hotkey_var.set(True)
+        self.gui._sync_hotkey_ui()
+        self.assertIn("停用", self.gui.hotkey_btn.cget("text"))
+        self.assertEqual(self.gui.hotkey_btn.cget("style"), "Accent.TButton")
 
-    def test_toggle_chat_hotkey_persists_and_calls_back(self):
+        self.gui.chat_hotkey_var.set(False)
+        self.gui._sync_hotkey_ui()
+        self.assertIn("启用", self.gui.hotkey_btn.cget("text"))
+        self.assertEqual(self.gui.hotkey_btn.cget("style"), "Bar.TButton")
+
+    def test_hotkey_button_actually_toggles(self):
+        """点一下 [启用 F8 扫描] 必须真的把热键打开（自己取反）。
+
+        旧实现读 chat_hotkey_var（菜单时代留给 Checkbutton 的），而按钮从不写它
+        → 每次点都提交"当前值"，热键永远启动不了 —— 表现得就像"根本没有启动
+        按钮"（用户实测反馈）。
+        """
         seen = []
         self.gui.on_chat_hotkey = seen.append
-        self.gui.chat_hotkey_var.set(True)
-        self.gui._toggle_chat_hotkey()
+        self.assertFalse(self.gui.chat_hotkey_var.get())
+
+        self.gui.hotkey_btn.invoke()                     # 真点按钮
+        self.assertTrue(self.gui.chat_hotkey_var.get())
+        self.assertTrue(self.hotkey_cfg.enabled)         # 已落盘
+        self.assertEqual([c["enabled"] for c in seen], [True])   # 回调收到配置 dict
+        self.assertEqual(self.gui.hotkey_btn.cget("style"), "Accent.TButton")
+
+        self.gui.hotkey_btn.invoke()
+        self.assertFalse(self.gui.chat_hotkey_var.get())
+        self.assertFalse(self.hotkey_cfg.enabled)
+        self.assertEqual([c["enabled"] for c in seen], [True, False])
+        self.assertEqual(self.gui.hotkey_btn.cget("style"), "Bar.TButton")
+
+    def test_set_hotkey_enabled_persists_and_calls_back(self):
+        seen = []
+        self.gui.on_chat_hotkey = seen.append
+        self.gui.set_hotkey_enabled(True)
         self.assertEqual(len(seen), 1)
         self.assertTrue(seen[0]["enabled"])              # 回调收到配置 dict
         self.assertTrue(self.hotkey_cfg.enabled)         # 已落盘
 
-        self.gui.chat_hotkey_var.set(False)
-        self.gui._toggle_chat_hotkey()
+        self.gui.set_hotkey_enabled(False)
         self.assertEqual(len(seen), 2)
         self.assertFalse(seen[1]["enabled"])
         self.assertFalse(self.hotkey_cfg.enabled)
 
-    def test_menu_label_shows_custom_key(self):
+    def test_hotkey_button_shows_custom_key(self):
         self.hotkey_cfg.set_binding(0x77, ctrl=True)     # Ctrl+F8
-        self.gui._sync_hotkey_menu_label()
-        label = self.gui.chat_menu.entrycget(self.gui._hotkey_menu_index,
-                                             "label")
-        self.assertIn("Ctrl+F8", label)
+        self.gui.chat_hotkey_var.set(True)
+        self.gui._sync_hotkey_ui()
+        self.assertIn("Ctrl+F8", self.gui.hotkey_btn.cget("text"))
+
+    def test_hotkey_toggle_button_is_a_visible_button(self):
+        """按钮必须在深色面板上看得出来是按钮（用有边框的 Bar.TButton）。"""
+        self.gui.chat_hotkey_var.set(False)
+        self.gui._sync_hotkey_ui()
+        style = self.gui.hotkey_btn.cget("style")
+        self.assertIn(style, ("Bar.TButton", "Accent.TButton"))
+        # 未启用时也要是"能点"的样子，而不是 flat 的 TButton
+        self.assertNotEqual(style, "TButton")
+
+    def test_hotkey_panel_embedded_in_scan_page(self):
+        """快捷键改键 UI 现在嵌在设置分页里（不再是独立对话框）。"""
+        self.gui.show_settings_page("scan")
+        self.gui.root.update()
+        panel = self.gui.hotkey_panel
+        self.assertTrue(panel.embedded)
+        # 嵌入模式不重复提供「启用」勾选（开关在顶部状态带上）
+        self.assertFalse(panel.show_enabled)
+        panel.vk_var.set(0x77)
+        panel.ctrl_var.set(True)
+        panel.save()
+        self.assertIn("Ctrl+F8", self.hotkey_cfg.display)
+        self.assertIn("已保存", panel.status_var.get())
 
     def test_toggle_without_hotkey_config(self):
         self.gui.hotkey_config = None
-        self.gui.chat_hotkey_var.set(True)
-        self.gui._toggle_chat_hotkey()                   # 不应抛异常
+        self.gui.toggle_hotkey()                         # 不应抛异常
+        self.assertIn("不可用", self.gui.status_var.get())
         self.assertIn("不可用", self.gui.status_var.get())
 
     def test_open_hotkey_settings_without_config(self):
         self.gui.hotkey_config = None
         self.gui.open_hotkey_settings()                  # 不应抛异常
         self.assertIn("不可用", self.gui.status_var.get())
+
+    # ---- 自定义按键面板不再显示过期的「未启用」 ----
+    def test_hotkey_panel_follows_top_toggle(self):
+        """开机时先建了设置页（那时热键是关的），之后打开热键必须同步过去。
+
+        旧实现：面板按当时的 enabled=False 渲染成「F8（未启用）」，之后再没人
+        刷新它 —— 顶部写着「停用 F8 扫描」，设置页里却写着「未启用」。
+        """
+        self.gui.on_chat_hotkey = lambda cfg: ""
+        self.gui.show_settings_page("scan")              # 此刻热键是关闭的
+        self.gui.root.update()
+        panel = self.gui.hotkey_panel
+        self.assertIn("未启用", panel.key_text.get())
+
+        self.gui.set_hotkey_enabled(True)                # 顶部按钮打开热键
+        self.gui.root.update()
+        self.assertNotIn("未启用", panel.key_text.get())
+        self.assertIn("F8", panel.key_text.get())
+
+        self.gui.set_hotkey_enabled(False)
+        self.gui.root.update()
+        self.assertIn("未启用", panel.key_text.get())
+
+    def test_hotkey_panel_disabled_hint_points_at_top_button(self):
+        self.gui.on_chat_hotkey = lambda cfg: ""
+        self.gui.show_settings_page("scan")
+        self.gui.root.update()
+        hint = self.gui.hotkey_panel.status_var.get()
+        self.assertIn("顶部", hint)
+
+    # ---- 状态栏「最近动态」 ----
+    def test_event_feed_is_empty_at_startup(self):
+        self.assertEqual(self.gui.event_vars[0].get(), "（暂无动态）")
+        self.assertEqual(self.gui.event_vars[1].get(), "")
+
+    def test_notify_event_shows_timestamped_lines_newest_first(self):
+        self.gui.notify_event("第一条", "info")
+        self.gui.notify_event("第二条", "hit")
+        self.assertIn("第二条", self.gui.event_vars[0].get())
+        self.assertIn("第一条", self.gui.event_vars[1].get())
+        # 带时间戳，才知道"什么时候发生的"
+        self.assertRegex(self.gui.event_vars[0].get(), r"^\d{2}:\d{2}:\d{2}  ")
+        self.assertEqual(self.gui.event_labels[0].cget("style"), "Hit.TLabel")
+
+    def test_event_feed_keeps_only_the_last_rows(self):
+        from app.ui.gui import EVENT_ROWS
+        for i in range(EVENT_ROWS + 3):
+            self.gui.notify_event(f"事件{i}")
+        self.assertIn(f"事件{EVENT_ROWS + 2}", self.gui.event_vars[0].get())
+        self.assertNotIn("事件0", " ".join(v.get() for v in self.gui.event_vars))
+
+    def test_chat_scan_result_lands_in_event_feed(self):
+        self.gui.scan_chat_now()
+        self._pump(0.6)
+        joined = " ".join(v.get() for v in self.gui.event_vars)
+        self.assertIn("聊天框扫描完成", joined)
+        # "开始扫描"只是过渡态，不该顶掉结果行
+        self.assertNotIn("开始扫描聊天框", joined)
+
+    def test_hotkey_scan_is_reported_with_key_name(self):
+        """按 F8 触发的那次扫描必须在界面上留痕（旧版只剩一行日志）。"""
+        self.hotkey_cfg.set_binding(0x77)                 # F8
+        self.gui.chat_scanner.on_result(
+            {"status": "ok", "hits": 1, "names": ["PlayerX"], "recorded": 1,
+             "deduped": 0, "elapsed_ms": 786.0, "source": "chat_hotkey",
+             "processed": 1})
+        self.gui._drain_once()
+        text = self.gui.status_var.get()
+        self.assertIn("按 F8", text)
+        self.assertIn("聊天框扫描完成", text)
+        self.assertIn("PlayerX", text)
+        self.assertIn("按 F8", self.gui.event_vars[0].get())
+
+    def test_hotkey_scan_dedup_is_reported(self):
+        self.gui.chat_scanner.on_result(
+            {"status": "ok", "hits": 1, "names": ["PlayerX"], "recorded": 0,
+             "deduped": 1, "elapsed_ms": 795.0, "source": "chat_hotkey",
+             "processed": 0})
+        self.gui._drain_once()
+        self.assertIn("跳过", self.gui.status_var.get())
+        self.assertEqual(self.gui.event_labels[0].cget("style"),
+                         "Paused.TLabel")
+
+    def test_hotkey_scan_failure_is_reported(self):
+        self.gui.chat_scanner.on_result(
+            {"status": "error", "error": "聊天框截图失败", "source": "chat_hotkey"})
+        self.gui._drain_once()
+        self.assertIn("失败", self.gui.status_var.get())
+        self.assertEqual(self.gui.event_labels[0].cget("style"),
+                         "Danger.TLabel")
 
 
 class FakeSchedulerForGui:

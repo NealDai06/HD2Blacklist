@@ -15,7 +15,7 @@ import sys
 # --------------------------------------------------------------------------
 APP_NAME = "HD2 黑名单"
 APP_ID = "hd2_blacklist"
-VERSION = "1.0.0"
+VERSION = "1.1.3"
 #: 主窗口标题（GUI 与单实例「叫回窗口」都用它，避免两处写法漂移）
 WINDOW_TITLE = f"{APP_NAME} v{VERSION}"
 
@@ -138,7 +138,7 @@ DEFAULT_NOTIFICATION = {
     "title_template": "⚠️ 黑名单玩家",
     "body_template": "{player_name}\n备注：{note}\n匹配度：{match_score}%",
     "show_fields": {
-        "note": True, "tk_count": False, "match_score": True,
+        "note": True, "match_score": True,
         "time": False, "source": False,
     },
     "image_mode": "default",       # default / custom / none
@@ -165,9 +165,9 @@ DEFAULT_NOTIFICATION = {
 }
 
 # 通知可用占位符（GUI 提示 & 校验用）
+# 名单里没有玩家ID / TK次数 / 最后遇见这些字段了，占位符同步取消
 NOTIFICATION_PLACEHOLDERS = (
-    "{player_name}", "{match_score}", "{note}", "{tk_count}",
-    "{source}", "{time}", "{last_seen}",
+    "{player_name}", "{match_score}", "{note}", "{source}", "{time}",
 )
 
 NOTIFICATION_POSITIONS = (
@@ -188,6 +188,23 @@ FONT_SIZE_MAX = 72
 CHAT_SCAN_REGION_KEY = "chat_event"
 CHAT_SCAN_SOURCE = "chat_manual"    # 手动点按钮
 CHAT_SCAN_HOTKEY_SOURCE = "chat_hotkey"
+
+#: 扫描来源 -> 人话。界面动态流、日志、会话摘要共用一套叫法，
+#: 免得同一个触发在界面上叫"聊天框扫描"、在日志里叫 "chat_hotkey"。
+SCAN_SOURCE_LABELS = {
+    CHAT_SCAN_SOURCE: "手动点的聊天框扫描",
+    CHAT_SCAN_HOTKEY_SOURCE: "聊天框扫描热键",
+    "esc_menu": "ESC 菜单玩家列表",
+    "cold_start": "进游戏后的冷启动扫描",
+    "player_list_hud": "HUD 队友列表",
+}
+
+
+def scan_source_label(source: str, default: str = "") -> str:
+    """把内部的 source 字符串翻成能给用户看的名字。"""
+    if not source:
+        return default
+    return SCAN_SOURCE_LABELS.get(source, default or source)
 
 # 热键（默认关闭，避免与游戏内快捷键冲突；可在 GUI 里自定义并持久化）
 CHAT_SCAN_HOTKEY_ENABLED = False

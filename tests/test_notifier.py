@@ -29,9 +29,8 @@ from app.settings.notification_config import NotificationConfig   # noqa: E402
 TMP_ROOT = os.path.join(_ROOT, ".test_tmp")
 
 ENTRY = {
-    "id": 1, "player_id": "76561198000000001", "player_name": "PlayerX",
-    "note": "恶意TK", "tk_count": 3, "encounter_count": 7,
-    "last_seen": "2026-01-02 03:04:05",
+    "id": 1, "player_name": "PlayerX",
+    "note": "恶意TK",
 }
 
 
@@ -65,10 +64,14 @@ class TempCase(unittest.TestCase):
 # ==========================================================================
 class TestTemplate(unittest.TestCase):
     def test_all_placeholders(self):
-        tpl = ("{player_name}|{match_score}|{note}|{tk_count}|{source}"
-               "|{last_seen}")
+        tpl = "{player_name}|{match_score}|{note}|{source}|{time}"
         out = nt.render_template(tpl, ENTRY, 92.5, "chat")
-        self.assertEqual(out, "PlayerX|92|恶意TK|3|chat|2026-01-02 03:04:05")
+        self.assertRegex(out, r"^PlayerX\|92\|恶意TK\|chat\|\d{2}:\d{2}:\d{2}$")
+
+    def test_removed_placeholders_are_kept_verbatim(self):
+        """玩家ID / TK次数 / 最后遇见 的占位符已经取消，原样保留不再替换。"""
+        for gone in ("{player_id}", "{tk_count}", "{last_seen}"):
+            self.assertEqual(nt.render_template(gone, ENTRY, 1, "x"), gone)
 
     def test_time_placeholder(self):
         out = nt.render_template("{time}", ENTRY, 100, "chat")
@@ -78,7 +81,7 @@ class TestTemplate(unittest.TestCase):
         self.assertEqual(nt.render_template("{nope}", ENTRY, 1, "x"), "{nope}")
 
     def test_missing_values_use_fallbacks(self):
-        out = nt.render_template("{note}|{tk_count}|{player_name}",
+        out = nt.render_template("{note}|{match_score}|{player_name}",
                                  {}, 0, "")
         self.assertEqual(out, "无|0|未知玩家")
 
@@ -512,8 +515,7 @@ class TestAlertBatch(TempCase):
 
     @staticmethod
     def _entries(count):
-        return [{"id": i, "player_id": f"id{i}", "player_name": f"Player{i}",
-                 "note": "TK", "tk_count": 1, "last_seen": None}
+        return [{"id": i, "player_name": f"Player{i}", "note": "TK"}
                 for i in range(1, count + 1)]
 
     # ---- 音效次数 ----
@@ -739,8 +741,7 @@ class TestAlertBatch(TempCase):
 class TestFontSize(TempCase):
     """消息文字大小可编辑（appearance.title_font_size / body_font_size）。"""
 
-    ENTRY = {"player_name": "PlayerX", "player_id": "1", "note": "恶意TK",
-             "tk_count": 2, "last_seen": "2026-01-02 03:04:05"}
+    ENTRY = {"player_name": "PlayerX", "note": "恶意TK"}
 
     def cfg(self, **ap):
         c = dict(DEFAULT_NOTIFICATION)

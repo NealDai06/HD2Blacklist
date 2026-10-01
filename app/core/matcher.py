@@ -13,6 +13,8 @@
     3. 模糊        —— rapidfuzz.ratio ≥ 阈值
     4. 符号层      —— 名字**整条就是符号**（例如玩家名就是一个 `?`）时，
                       只按「整体相等」匹配，避免一个问号在每句话里误报
+
+索引只认 `player_name`：名单里没有玩家ID 这一栏了（见 database.py）。
 """
 from __future__ import annotations
 
@@ -35,7 +37,8 @@ except ImportError:                     # 降级：标准库 difflib，保证可
 
     BACKEND = "difflib"
 
-from app.config import MATCH_FUZZY_CONFUSABLE, MATCH_SYMBOL_NAMES, MATCH_THRESHOLD
+from app.config import (MATCH_FUZZY_CONFUSABLE, MATCH_SYMBOL_NAMES,
+                        MATCH_THRESHOLD, get_logger)
 
 # 分词分隔符：空白 + 中英文标点
 _SPLIT_RE = re.compile(r"[\s,，。.、!！?？:：;；|/\\\-_\[\]【】()（）\"'“”‘’*#>]+")
@@ -136,6 +139,7 @@ class Matcher:
         self.db = db
         self.threshold = int(threshold)
         self.lock = threading.RLock()
+        self.logger = get_logger("matcher")
         self.exact: dict = {}          # normalize(name) -> entry
         self.norm_list: list = []      # [(normalize(name), entry), ...]
         self.symbols: dict = {}        # symbol_key(name) -> entry（纯符号名字）
@@ -154,14 +158,21 @@ class Matcher:
     def reload(self) -> int:
         """从数据库重建索引（黑名单增删改后调用）。返回索引条数。
 
+        索引**只认 player_name**（v1.1.2 起）：玩家ID 一栏已经从名单里删掉了
+        —— 它以前是"名字填错栏就永远匹配不上"这类 bug 的根源。
+
         「纯符号名字」（名字就是一个 `?`）不能被「去掉所有非字母数字」的
         归一化处理 —— 那样会得到空串，条目会被直接丢掉，于是这类名字
         永远匹配不上。它们单独进 `symbols`，按符号层匹配。
+
+        真的没法索引的条目（名字为空 —— 正常添加时 database.add() 会拦下来，
+        只有手改过的库才会有）会写 WARNING，不再静默跳过：静默跳过的后果
+        就是"明明在名单里却不命中"，用户完全无从判断。
         """
         exact, norm_list, symbols, folded = {}, [], {}, {}
+        skipped = []
         for entry in self.db.get_all():
             name = (entry.get("player_name") or "").strip()
-            ident = (entry.get("player_id") or "").strip()
 
             n = self.normalize(name)
             if n:
@@ -174,14 +185,15 @@ class Matcher:
                 symbols.setdefault(sk, entry)
 
             if not n and not sk:
-                # 名字没有可用信息（空 / 纯装饰符号）→ 退回用 player_id。
-                # player_id 为 "-" 只是"没填"的占位符，normalize 后是空串，天然被忽略。
-                n2 = self.normalize(ident)
-                if not n2:
-                    continue
-                exact.setdefault(n2, entry)
-                norm_list.append((n2, entry))
-                folded.setdefault(confuse(n2), []).append(entry)
+                skipped.append(entry)
+
+        if skipped:
+            self.logger.warning(
+                "[Matcher] 有 %d 条黑名单没有可用的名字，无法参与匹配（id=%s）",
+                len(skipped),
+                "、".join(str(e.get("id")) for e in skipped[:5]),
+            )
+
         with self.lock:
             self.exact = exact
             self.norm_list = norm_list

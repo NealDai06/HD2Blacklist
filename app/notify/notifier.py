@@ -271,22 +271,22 @@ class _SafeDict(dict):
 
 def build_fields(entry, score, source) -> dict:
     entry = entry or {}
-    name = entry.get("player_name") or entry.get("player_id") or "未知玩家"
+    name = entry.get("player_name") or "未知玩家"
     return {
         "player_name": str(name),
-        "player_id": str(entry.get("player_id") or ""),
         "match_score": f"{float(score or 0):.0f}",
         "note": str(entry.get("note") or "无"),
-        "tk_count": str(entry.get("tk_count") or 0),
         "source": str(source or ""),
         "time": datetime.now().strftime("%H:%M:%S"),
-        "last_seen": str(entry.get("last_seen") or "首次"),
     }
 
 
 def render_template(tpl: str, entry, score, source) -> str:
-    """渲染模板，支持 {player_name} {match_score} {note} {tk_count}
-    {source} {time} {last_seen}。"""
+    """渲染模板，支持 {player_name} {match_score} {note} {source} {time}。
+
+    名单里已经没有「玩家ID / TK次数 / 最后遇见」这些字段了（v1.1.2 删掉），
+    对应的占位符一并取消 —— 留着只会渲染出空值让人困惑。
+    """
     if tpl is None:
         return ""
     try:
@@ -298,11 +298,9 @@ def render_template(tpl: str, entry, score, source) -> str:
 #: show_fields 里的开关 → 它们控制的占位符
 FIELD_PLACEHOLDERS = {
     "note": ("{note}",),
-    "tk_count": ("{tk_count}",),
     "match_score": ("{match_score}",),
     "time": ("{time}",),
     "source": ("{source}",),
-    "last_seen": ("{last_seen}",),
 }
 
 
@@ -903,8 +901,7 @@ class Notifier:
         """把「没抢到独立通知栏」的命中合并成一条汇总栏。"""
         if not hits:
             return False
-        names = [str(h[0].get("player_name") or h[0].get("player_id") or "未知")
-                 for h in hits]
+        names = [str(h[0].get("player_name") or "未知") for h in hits]
         joined = "、".join(names)
         if len(joined) > 48:                       # 太长就截断，正文会自动换行
             joined = joined[:46] + "…"
@@ -913,10 +910,7 @@ class Notifier:
             # 名字放在 player_name 而不是 note：note 可能被用户在
             # 通知设置里关掉（show_fields.note=False），player_name 永远会显示
             "player_name": f"等 {len(hits)} 名：{joined}",
-            "player_id": "",
             "note": "同一次扫描命中的其余黑名单玩家",
-            "tk_count": 0,
-            "last_seen": "",
         }
         return self._show_overlay(entry, best, source,
                                   play_sound=False, stack_index=stack_index)
@@ -970,9 +964,8 @@ class Notifier:
         """用假数据或指定配置做一次即时预览（供 gui_notification 使用）。"""
         real_cfg = self.cfg.get()
         cfg = cfg if cfg is not None else real_cfg
-        entry = entry or {"player_name": "示例玩家", "player_id": "7656119",
-                          "note": "恶意TK / 测试条目", "tk_count": 3,
-                          "last_seen": datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
+        entry = entry or {"player_name": "示例玩家",
+                          "note": "恶意TK / 测试条目"}
         ap = cfg.get("appearance", {}) or {}
         width = max(160, int(ap.get("width", 360)))
         height = max(60, int(ap.get("height", 100)))
@@ -988,9 +981,8 @@ class Notifier:
     def render_preview_image(self, cfg: dict, entry=None, score=100.0,
                              source="preview"):
         """只渲染不显示，返回 PIL.Image（GUI 内嵌预览用）。"""
-        entry = entry or {"player_name": "示例玩家", "player_id": "7656119",
-                          "note": "恶意TK / 测试条目", "tk_count": 3,
-                          "last_seen": datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
+        entry = entry or {"player_name": "示例玩家",
+                          "note": "恶意TK / 测试条目"}
         ap = cfg.get("appearance", {}) or {}
         width = max(160, int(ap.get("width", 360)))
         height = max(60, int(ap.get("height", 100)))

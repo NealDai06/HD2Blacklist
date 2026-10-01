@@ -91,6 +91,21 @@ class FakeOCR:
         return OCREngine().preprocess(img)
 
 
+class DeadOCR(FakeOCR):
+    """OCR 不可用的替身（模拟「源码运行时没带上 .pylibs → 没有 rapidocr」）。
+
+    这个假引擎**不会**抛异常，就像真实引擎那样：`recognize_raw` 只是永远返回
+    空列表。所以扫描会"跑得很正常"却识别到 0 个名字 —— 用户看到的就是
+    "扫描功能失效"，因此代码必须靠 `available` / `unavailable_reason` 主动说出来。
+    """
+
+    unavailable_reason = "缺少 rapidocr-onnxruntime"
+
+    def __init__(self):
+        super().__init__()
+        self.available = False
+
+
 class FakeNotifier:
     """记录 alert / alert_batch 调用。
 
@@ -147,10 +162,10 @@ class TempCase(unittest.TestCase):
         return os.path.join(self.tmp, *p)
 
     def make_scheduler(self, capture=None, ocr=None, notifier=None,
-                       on_encounter=None, entries=(("id1", "PlayerX"),)):
+                       on_encounter=None, entries=(("PlayerX",),)):
         db = BlacklistDB(self.path("bl.db"))
-        for pid, name in entries:
-            db.add(pid, name)
+        for row in entries:
+            db.add(*row)
         matcher = Matcher(db)
         region = RegionConfig(self.path("user_config.json"))
         sched = ScanScheduler(
@@ -245,8 +260,8 @@ class TestPlayerNameFilterExtra(TempCase):
         """回归：一整屏真实 ESC 菜单文本里只应留下玩家名。"""
         db = BlacklistDB(self.path("bl.db"))
         try:
-            db.add("-", "?")
-            db.add("id1", "PlayerX")
+            db.add("?")
+            db.add("PlayerX")
             m = Matcher(db)
             boxes = [("小队", 0.99, (11, 12, 149, 92)),
                      ("?", 0.90, (236, 120, 260, 174)),
@@ -312,7 +327,7 @@ class TestBoxLineGrouping(TempCase):
         """拼回来的名字应能 100 分命中带下划线的黑名单条目。"""
         db = BlacklistDB(self.path("bl.db"))
         try:
-            db.add("id1", "SamplePlayer_01")
+            db.add("SamplePlayer_01")
             m = Matcher(db)
             boxes = [("SamplePlayer", 0.99, (0, 0, 200, 40)),
                      ("01", 0.99, (205, 0, 235, 40))]
@@ -341,7 +356,7 @@ class TestBoxLineGrouping(TempCase):
 
         db = BlacklistDB(self.path("bl.db"))
         try:
-            db.add("id1", "PlayerX")
+            db.add("PlayerX")
             sched = ScanScheduler(
                 db=db, matcher=Matcher(db), notifier=FakeNotifier(),
                 ocr=LineOCR(), capture=FakeCapture(),
@@ -354,7 +369,7 @@ class TestBoxLineGrouping(TempCase):
             s.start()
             s._thread.join(timeout=5)
             self.assertGreater(sched.ocr.line_calls, 0)
-            self.assertEqual(db.get_all()[0]["encounter_count"], 1)
+            self.assertEqual(db.get_total_encounter_count(), 1)
             # 证据必须落在被重定向的临时目录里
             self.assertEqual(len(os.listdir(sched_mod.EVIDENCE_DIR)), 1)
         finally:
@@ -425,7 +440,7 @@ class TestScanSession(TempCase):
                                      max_duration=10, keep_alive_after_hit=0.2))
         s.start()
         s._thread.join(timeout=5)
-        self.assertEqual(db.get_all()[0]["encounter_count"], 1)   # 只命中一次
+        self.assertEqual(db.get_total_encounter_count(), 1)   # 只命中一次
 
     def test_session_kept_alive_while_new_names_appear(self):
         """滚动不停出现新名字 → 会话持续；滚动停止后才按 keep_alive 收工。"""
@@ -574,7 +589,7 @@ class TestScanScheduler(TempCase):
         entry = db.get_all()[0]
         updated = sched.handle_hit(entry, 100.0, "chat",
                                    Image.new("RGB", (10, 10)), "PlayerX")
-        self.assertEqual(updated["encounter_count"], 1)
+        self.assertEqual(updated["today_count"], 1)
         self.assertEqual(len(events), 1)
         self.assertEqual(events[0]["entry_id"], entry["id"])
         self.assertEqual(events[0]["player_name"], "PlayerX")
@@ -585,7 +600,7 @@ class TestScanScheduler(TempCase):
         self.assertTrue(os.listdir(sched_mod.EVIDENCE_DIR))
 
     def test_dedup_blocks_both_count_and_alert(self):
-        """新的语义：去重窗口内 **既不计入 encounter_count，也不弹提示**。"""
+        """新的语义：去重窗口内 **既不记入 encounters，也不弹提示**。"""
         notifier = FakeNotifier()
         sched, db = self.make_scheduler(notifier=notifier)
         entry = db.get_all()[0]
@@ -598,7 +613,7 @@ class TestScanScheduler(TempCase):
         self.assertEqual(len(notifier.alerts), 1)              # 只弹一次
         self.assertEqual(len(notifier.batches), 1)
         self.assertEqual(sched.get_session_hit_count(), 1)     # 只计一次
-        self.assertEqual(db.get(entry["id"])["encounter_count"], 1)
+        self.assertEqual(len(db.get_encounters(entry["id"])), 1)
         self.assertEqual(db.get_total_encounter_count(), 1)
 
     def test_dedup_does_not_write_extra_encounter_rows(self):
@@ -613,7 +628,7 @@ class TestScanScheduler(TempCase):
         n = sched.process_text("PlayerX has joined the game", "chat",
                                Image.new("RGB", (10, 10)))
         self.assertEqual(n, 1)
-        self.assertEqual(db.get_all()[0]["encounter_count"], 1)
+        self.assertEqual(db.get_total_encounter_count(), 1)
         rows = db.get_recent_encounters()
         self.assertEqual(rows[0]["name_seen"], "PlayerX")
         self.assertEqual(rows[0]["source"], "chat")
@@ -625,8 +640,7 @@ class TestScanScheduler(TempCase):
         self.assertEqual(db.get_total_encounter_count(), 0)
 
     def test_match_and_notify_list(self):
-        sched, db = self.make_scheduler(entries=(("id1", "Alpha"),
-                                                 ("id2", "Beta")))
+        sched, db = self.make_scheduler(entries=(("Alpha",), ("Beta",)))
         n = sched.match_and_notify(["Alpha", "Beta", "Nobody"], "esc_menu",
                                    Image.new("RGB", (10, 10)))
         self.assertEqual(n, 2)
@@ -686,25 +700,25 @@ class TestScanScheduler(TempCase):
 
     def test_reload_blacklist(self):
         sched, db = self.make_scheduler()
-        db.add("id9", "Later")
+        db.add("Later")
         self.assertEqual(sched.reload_blacklist(), 2)
 
     def test_hit_on_missing_entry_is_swallowed(self):
         """单条坏数据不能拖垮整批：记录警告并跳过，不抛异常。"""
         sched, db = self.make_scheduler()
-        ghost = {"id": 99999, "player_name": "Ghost", "player_id": "x"}
+        ghost = {"id": 99999, "player_name": "Ghost"}
         self.assertIsNone(
             sched.handle_hit(ghost, 100.0, "chat", None, "Ghost"))
 
     def test_bad_entry_does_not_break_batch(self):
         sched, db = self.make_scheduler()
         good = db.get_all()[0]
-        ghost = {"id": 99999, "player_name": "Ghost", "player_id": "x"}
+        ghost = {"id": 99999, "player_name": "Ghost"}
         processed = sched.handle_hits(
             [(ghost, 100.0, "Ghost"), (good, 100.0, "PlayerX")],
             "chat", None)
         self.assertEqual(processed, 1)              # 好的那条照常处理
-        self.assertEqual(db.get(good["id"])["encounter_count"], 1)
+        self.assertEqual(db.get_total_encounter_count(), 1)
 
     def test_shutdown(self):
         sched, db = self.make_scheduler()
@@ -721,13 +735,13 @@ class TestScanScheduler(TempCase):
         # 窗口内再命中 → 直接跳过
         self.assertEqual(
             sched.handle_hits([(entry, 100.0, "PlayerX")], "chat", None), 0)
-        self.assertEqual(db.get(entry["id"])["encounter_count"], 1)
+        self.assertEqual(len(db.get_encounters(entry["id"])), 1)
         self.assertEqual(db.get_total_encounter_count(), 1)
 
     def test_dedup_is_per_entry(self):
         """一个玩家被去重，不影响同批次里的另一个玩家。"""
         sched, db = self.make_scheduler(
-            entries=(("id1", "Alpha"), ("id2", "Bravo")))
+            entries=(("Alpha",), ("Bravo",)))
         rows = {r["player_name"]: r for r in db.get_all()}
         alpha, bravo = rows["Alpha"], rows["Bravo"]
 
@@ -736,8 +750,8 @@ class TestScanScheduler(TempCase):
         processed = sched.handle_hits(
             [(alpha, 100.0, "Alpha"), (bravo, 100.0, "Bravo")], "chat", None)
         self.assertEqual(processed, 1)
-        self.assertEqual(db.get(alpha["id"])["encounter_count"], 1)
-        self.assertEqual(db.get(bravo["id"])["encounter_count"], 1)
+        self.assertEqual(len(db.get_encounters(alpha["id"])), 1)
+        self.assertEqual(len(db.get_encounters(bravo["id"])), 1)
 
     def test_dedup_expires(self):
         sched, db = self.make_scheduler()
@@ -748,7 +762,7 @@ class TestScanScheduler(TempCase):
                 sched._recent_hits[k] -= (config.HIT_DEDUP_WINDOW + 1)
         self.assertEqual(
             sched.handle_hits([(entry, 100.0, "PlayerX")], "chat", None), 1)
-        self.assertEqual(db.get(entry["id"])["encounter_count"], 2)
+        self.assertEqual(len(db.get_encounters(entry["id"])), 2)
 
     def test_clear_dedup_cache_and_size(self):
         sched, db = self.make_scheduler()
@@ -786,7 +800,7 @@ class TestScanScheduler(TempCase):
         notifier = FakeNotifier()
         sched, db = self.make_scheduler(
             notifier=notifier,
-            entries=(("id1", "Alpha"), ("id2", "Bravo"), ("id3", "Charlie")))
+            entries=(("Alpha",), ("Bravo",), ("Charlie",)))
         hits = [(r, 100.0, r["player_name"]) for r in db.get_all()]
         processed = sched.handle_hits(hits, "chat_manual", None)
         self.assertEqual(processed, 3)
@@ -799,7 +813,7 @@ class TestScanScheduler(TempCase):
         notifier = FakeNotifier()
         sched, db = self.make_scheduler(
             notifier=notifier,
-            entries=(("id1", "Alpha"), ("id2", "Bravo")))
+            entries=(("Alpha",), ("Bravo",)))
         n = sched.match_and_notify_batch(["Alpha", "Bravo"], "esc_menu", None)
         self.assertEqual(n, 2)
         self.assertEqual(len(notifier.batches), 1)
@@ -813,7 +827,7 @@ class TestScanScheduler(TempCase):
         notifier = FakeNotifier()
         sched, db = self.make_scheduler(
             notifier=notifier,
-            entries=(("id1", "Alpha"), ("id2", "Bravo")))
+            entries=(("Alpha",), ("Bravo",)))
         n = sched.process_text("Alpha joined. Bravo joined.", "chat_manual",
                                None)
         self.assertEqual(n, 2)
@@ -838,12 +852,72 @@ class TestScanScheduler(TempCase):
         events = []
         sched, db = self.make_scheduler(
             on_encounter=events.append,
-            entries=(("id1", "Alpha"), ("id2", "Bravo")))
+            entries=(("Alpha",), ("Bravo",)))
         hits = [(r, 100.0, r["player_name"]) for r in db.get_all()]
         sched.handle_hits(hits, "chat_manual", None)
         self.assertEqual(len(events), 2)             # 每个玩家各自通知 GUI
         self.assertEqual({e["player_name"] for e in events}, {"Alpha", "Bravo"})
-        self.assertTrue(all(e["encounter_count"] == 1 for e in events))
+        self.assertTrue(all(e["today_count"] == 1 for e in events))
+        self.assertTrue(all(e["seen_at"] for e in events))
+
+
+class TestOcrUnavailable(TempCase):
+    """回归：OCR 不可用必须**明说**，不能装成"聊天框为空 / 识别 0 个名字"。
+
+    真实故障：源码运行时没带上仓库自带的 .pylibs，rapidocr 缺失 →
+    `recognize_raw()` 永远返回空 → 每轮扫描都"识别 0 个名字"，
+    界面上看起来就是"扫描功能失效"，却没有任何指向原因的提示。
+    """
+
+    def test_chat_scanner_reports_ocr_unavailable(self):
+        sched, db = self.make_scheduler(ocr=DeadOCR(),
+                                        entries=(("PlayerX",),))
+        sc = ChatScanner(sched, sched.capture, sched.ocr)
+        res = sc.scan_now()
+        self.assertEqual(res["status"], "ocr_unavailable")
+        self.assertIn("rapidocr", res["error"])
+        # 不能跑到"聊天框为空"那条分支去
+        self.assertNotEqual(res["status"], "empty")
+
+    def test_chat_scanner_does_not_even_grab_the_screen(self):
+        """OCR 都不可用了，抓屏纯属浪费（还会让游戏掉帧）。"""
+        sched, db = self.make_scheduler(ocr=DeadOCR(),
+                                        entries=(("PlayerX",),))
+        sc = ChatScanner(sched, sched.capture, sched.ocr)
+        sc.scan_now()
+        self.assertEqual(sched.capture.grab_calls, 0)
+
+    def test_session_aborts_immediately_when_ocr_dead(self):
+        from app.scanning.scan_session import ScanSession
+        from app.config import COLD_START_SESSION
+        sched, db = self.make_scheduler(ocr=DeadOCR(),
+                                        entries=(("PlayerX",),))
+        s = ScanSession(sched, "player_list_hud", "test",
+                        dict(COLD_START_SESSION, interval=0.01,
+                             max_duration=5, max_consecutive_empty=99))
+        t0 = time.time()
+        s.start()
+        s._thread.join(timeout=5)
+        elapsed = time.time() - t0
+        self.assertLess(elapsed, 1.0, "OCR 不可用时不该把一个会话跑满")
+        self.assertEqual(sched.capture.grab_calls, 0)
+
+    def test_ocr_engine_reports_reason(self):
+        from app.capture.ocr_engine import OCREngine
+        eng = OCREngine()
+        eng._failed = True                      # 模拟「导入 rapidocr 失败」
+        eng._error = "缺少 rapidocr-onnxruntime"
+        self.assertFalse(eng.available)
+        self.assertIn("rapidocr", eng.unavailable_reason)
+        self.assertEqual(eng.recognize_raw(None), [])
+
+    def test_healthy_ocr_is_not_flagged(self):
+        """有 available 接口且为真的引擎，路径不能被拦下来。"""
+        sched, db = self.make_scheduler(entries=(("PlayerX",),))
+        sched.ocr.available = True              # FakeOCR 本来就没有这个属性
+        sc = ChatScanner(sched, sched.capture, sched.ocr)
+        sched.ocr.default = [("PlayerX", 0.99)]
+        self.assertEqual(sc.scan_now()["status"], "ok")
 
 
 # ==========================================================================
@@ -851,7 +925,7 @@ class TestChatScanner(TempCase):
     """聊天框按需扫描：无循环、无定时、_busy 锁、批量命中。"""
 
     def _scanner(self, capture=None, ocr=None, notifier=None,
-                 entries=(("id1", "PlayerX"),)):
+                 entries=(("PlayerX",),)):
         sched, db = self.make_scheduler(capture=capture, ocr=ocr,
                                         notifier=notifier or FakeNotifier(),
                                         entries=entries)
@@ -867,7 +941,7 @@ class TestChatScanner(TempCase):
         self.assertEqual(res["status"], "ok")
         self.assertEqual(res["hits"], 1)
         self.assertEqual(res["processed"], 1)
-        self.assertEqual(db.get_all()[0]["encounter_count"], 1)
+        self.assertEqual(db.get_total_encounter_count(), 1)
         self.assertEqual(db.get_recent_encounters()[0]["source"], "chat_manual")
         self.assertEqual(sc.scan_count, 1)
 
@@ -996,7 +1070,7 @@ class TestChatScanner(TempCase):
         self.assertEqual(second["processed"], 0)     # 被去重
         self.assertEqual(third["processed"], 0)
         self.assertEqual(second["hits"], 1)          # 仍然匹配到了，只是没计数
-        self.assertEqual(db.get_all()[0]["encounter_count"], 1)
+        self.assertEqual(db.get_total_encounter_count(), 1)
         self.assertEqual(db.get_total_encounter_count(), 1)
 
     def test_dedup_expires_after_window(self):
@@ -1009,7 +1083,7 @@ class TestChatScanner(TempCase):
             for k in list(sched._recent_hits):
                 sched._recent_hits[k] -= (config.HIT_DEDUP_WINDOW + 1)
         sc.scan_now()
-        self.assertEqual(db.get_all()[0]["encounter_count"], 2)
+        self.assertEqual(db.get_total_encounter_count(), 2)
 
     def test_clear_dedup_cache_allows_recount(self):
         ocr = FakeOCR()
@@ -1019,7 +1093,7 @@ class TestChatScanner(TempCase):
         sched.clear_dedup_cache()
         self.assertEqual(sched.dedup_cache_size(), 0)
         sc.scan_now()
-        self.assertEqual(db.get_all()[0]["encounter_count"], 2)
+        self.assertEqual(db.get_total_encounter_count(), 2)
 
     # ---- 批量命中 ----
     def test_batch_hit_one_batch_one_sound(self):
@@ -1030,7 +1104,7 @@ class TestChatScanner(TempCase):
                        ("John Doe has joined the game", 0.99)]
         sc, sched, db = self._scanner(
             ocr=ocr, notifier=notifier,
-            entries=(("id1", "PlayerX"), ("id2", "John Doe")))
+            entries=(("PlayerX",), ("John Doe",)))
 
         res = sc.scan_now()
         self.assertEqual(res["status"], "ok")
@@ -1048,7 +1122,7 @@ class TestChatScanner(TempCase):
                        ("Charlie joined", 0.99)]
         sc, sched, db = self._scanner(
             ocr=ocr, notifier=notifier,
-            entries=(("a", "Alpha"), ("b", "Bravo"), ("c", "Charlie")))
+            entries=(("Alpha",), ("Bravo",), ("Charlie",)))
         res = sc.scan_now()
         self.assertEqual(res["processed"], 3)
         self.assertEqual(len(notifier.batches), 1)
@@ -1075,7 +1149,7 @@ class TestChatScanner(TempCase):
         ocr.default = [("Alpha joined", 0.99), ("Bravo joined", 0.99)]
         sc, sched, db = self._scanner(
             ocr=ocr, notifier=notifier,
-            entries=(("a", "Alpha"), ("b", "Bravo")))
+            entries=(("Alpha",), ("Bravo",)))
         lines = []
         sched.log = lines.append
         sc.scan_now()
@@ -1095,14 +1169,14 @@ class TestChatScanner(TempCase):
         self.assertNotIn("本批共命中", "\n".join(str(x) for x in lines))
 
     def test_on_result_callback(self):
+        """回调要报**两次**：先 started（按下去立刻有反应），再报结果。"""
         seen = []
         ocr = FakeOCR()
         ocr.default = [("PlayerX", 0.99)]
         sc, sched, db = self._scanner(ocr=ocr)
         sc.on_result = seen.append
         sc.scan_now()
-        self.assertEqual(len(seen), 1)
-        self.assertEqual(seen[0]["status"], "ok")
+        self.assertEqual([r["status"] for r in seen], ["started", "ok"])
 
     def test_on_result_exception_is_swallowed(self):
         def boom(_res):
@@ -1126,6 +1200,77 @@ class TestChatScanner(TempCase):
         t0 = time.time()
         sc.scan_now()
         self.assertLess(time.time() - t0, 1.0)
+
+    # ---- 结果里要带上"给用户看"的细节 ----
+    def test_ok_result_carries_names_and_dedup_stats(self):
+        ocr = FakeOCR()
+        ocr.default = [("Alpha joined", 0.99), ("Bravo joined", 0.99)]
+        sc, sched, db = self._scanner(
+            ocr=ocr, entries=(("Alpha",), ("Bravo",)))
+        res = sc.scan_now(source="chat_hotkey")
+        self.assertEqual(res["status"], "ok")
+        self.assertEqual(res["source"], "chat_hotkey")
+        self.assertEqual(sorted(res["names"]), ["Alpha", "Bravo"])
+        self.assertEqual(res["recorded"], 2)
+        self.assertEqual(res["deduped"], 0)
+
+    def test_all_deduped_result_is_visible(self):
+        """第二次扫描全被去重时，结果里必须写清楚"跳过"，不能只说命中。"""
+        ocr = FakeOCR()
+        ocr.default = [("PlayerX", 0.99)]
+        sc, sched, db = self._scanner(ocr=ocr)
+        sc.scan_now()
+        res = sc.scan_now()
+        self.assertEqual(res["status"], "ok")
+        self.assertEqual(res["hits"], 1)
+        self.assertEqual(res["recorded"], 0)
+        self.assertEqual(res["deduped"], 1)
+
+    def test_dedup_is_announced_on_event_channel(self):
+        """去重也要说出来 —— 用户反馈"按了 F8 什么都没发生"。
+
+        聊天框那条路把去重写进结果里（见上面那条测试），这里覆盖菜单/HUD
+        那条路：它没有"扫描结果"可播报，必须走事件通道。
+        """
+        events = []
+        sched, db = self.make_scheduler(entries=(("Alpha",),))
+        sched.on_event = lambda msg, level="info": events.append((msg, level))
+        entry = db.get_all()[0]
+        sched.handle_hits([(entry, 100.0, "Alpha")], "esc_menu", None)
+        events.clear()
+        sched.handle_hits([(entry, 100.0, "Alpha")], "esc_menu", None)
+        self.assertTrue(events, "去重时必须往事件流里发一条")
+        joined = " ".join(m for m, _l in events)
+        self.assertIn("Alpha", joined)
+        self.assertTrue(any("跳过" in m for m, _l in events), events)
+        self.assertEqual([l for _m, l in events], ["dedup"])
+
+    def test_chat_scan_does_not_double_report_hits(self):
+        """聊天框扫描自己会播报完整结果，调度层不能再塞一行重复的。"""
+        events = []
+        ocr = FakeOCR()
+        ocr.default = [("Alpha joined", 0.99)]
+        sc, sched, db = self._scanner(ocr=ocr, entries=(("Alpha",),))
+        sched.on_event = lambda msg, level="info": events.append((msg, level))
+        sc.scan_now()
+        self.assertEqual([m for m, _l in events], [],
+                         "ChatScanner 走 notify_event=False，不该有事件")
+        # 但统计照样要记录，供 ChatScanner 播报
+        self.assertEqual(sched.get_hit_stats()["recorded"], 1)
+        self.assertEqual(sched.get_hit_stats()["names"], ["Alpha"])
+
+    def test_esc_path_reports_hits_on_event_channel(self):
+        """ESC / 冷启动那条路命中时要往事件流里报（带名字）。"""
+        events = []
+        sched, db = self.make_scheduler(
+            entries=(("Alpha",), ("Bravo",)))
+        sched.on_event = lambda msg, level="info": events.append((msg, level))
+        sched.match_and_notify_batch(["Alpha", "Bravo"], "esc_menu", None)
+        text = " ".join(m for m, _l in events)
+        self.assertIn("Alpha", text)
+        self.assertIn("Bravo", text)
+        self.assertEqual(sched.get_hit_stats()["recorded"], 2)
+
 # ==========================================================================
 class TestEscTrigger(TempCase):
     def setUp(self):

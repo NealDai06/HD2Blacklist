@@ -30,6 +30,7 @@ from app.core import database as db_mod  # noqa: E402
 from app import application as main_mod  # noqa: E402
 from app.settings import notification_config as nc_mod  # noqa: E402
 from app.settings import region_config as rc_mod  # noqa: E402
+from app.settings import hotkey_config as hkc_mod  # noqa: E402
 from app.scanning import scan_scheduler as sched_mod  # noqa: E402
 from app.config import COLD_START_SESSION            # noqa: E402
 from app.core.process_watcher import ProcessWatcher, list_process_names   # noqa: E402
@@ -133,13 +134,21 @@ class TempCase(unittest.TestCase):
         setattr(obj, attr, value)
 
     def redirect_defaults(self):
-        """把所有配置/DB 的默认路径指向临时目录。"""
+        """把所有配置/DB 的默认路径指向临时目录。
+
+        ⚠ HotkeyConfig 也必须重定向：否则它会读开发机上真实的
+        `data/hotkey.json`，而那份文件里 enabled 是什么完全取决于你上次
+        点没点过「启用 F8 扫描」—— `test_wiring` 里"默认关闭"的断言就会
+        随开发机的状态忽过忽败（真实踩过）。
+        """
         self._patch(db_mod.BlacklistDB.__init__, "__defaults__",
                     (self.path("blacklist.db"), 10.0))
         self._patch(nc_mod.NotificationConfig.__init__, "__defaults__",
                     (self.path("notification.json"),))
         self._patch(rc_mod.RegionConfig.__init__, "__defaults__",
                     (self.path("user_config.json"),))
+        self._patch(hkc_mod.HotkeyConfig.__init__, "__defaults__",
+                    (self.path("hotkey.json"),))
         self._patch(sched_mod, "EVIDENCE_DIR", self.path("evidence"))
         os.makedirs(self.path("evidence"), exist_ok=True)
 
@@ -271,7 +280,7 @@ class TestAppEndToEnd(TempCase):
     def test_chat_scan_full_dataflow(self):
         app = self._build()
         app.ocr.default = [("PlayerX", 0.99)]
-        app.db.add("7656119", "PlayerX", "恶意TK", 3)
+        app.db.add("PlayerX", "恶意TK")
         app.scheduler.reload_blacklist()
 
         app._on_game_start()
@@ -283,8 +292,7 @@ class TestAppEndToEnd(TempCase):
 
         rows = app.db.get_all()
         self.assertEqual(len(rows), 1)
-        self.assertEqual(rows[0]["encounter_count"], 1)
-        self.assertIsNotNone(rows[0]["last_seen"])
+        self.assertEqual(app.db.get_total_encounter_count(), 1)
 
         enc = app.db.get_recent_encounters()
         self.assertEqual(len(enc), 1)
@@ -299,7 +307,7 @@ class TestAppEndToEnd(TempCase):
         # on_encounter 回调
         self.assertEqual(len(self.events), 1)
         self.assertEqual(self.events[0]["player_name"], "PlayerX")
-        self.assertEqual(self.events[0]["encounter_count"], 1)
+        self.assertEqual(self.events[0]["today_count"], 1)
 
         # 提示
         self.assertEqual(len(app.notifier.alerts), 1)
@@ -308,7 +316,7 @@ class TestAppEndToEnd(TempCase):
         """连点扫描按钮：60 秒内同一玩家只计数一次。"""
         app = self._build()
         app.ocr.default = [("PlayerX", 0.99)]
-        app.db.add("7656119", "PlayerX")
+        app.db.add("PlayerX")
         app.scheduler.reload_blacklist()
 
         first = app.chat_scanner.scan_now()
@@ -318,15 +326,15 @@ class TestAppEndToEnd(TempCase):
         self.assertEqual(first["processed"], 1)
         self.assertEqual(second["processed"], 0)
         self.assertEqual(third["processed"], 0)
-        self.assertEqual(app.db.get_all()[0]["encounter_count"], 1)
+        self.assertEqual(app.db.get_total_encounter_count(), 1)
         self.assertEqual(len(app.notifier.batches), 1)
 
     def test_batch_hit_two_players_one_sound_call(self):
         """一次扫描命中 2 个玩家 → 2 个通知栏，1 次 alert_batch。"""
         app = self._build()
         app.ocr.default = [("Alpha joined", 0.99), ("Bravo joined", 0.99)]
-        app.db.add("a", "Alpha")
-        app.db.add("b", "Bravo")
+        app.db.add("Alpha")
+        app.db.add("Bravo")
         app.scheduler.reload_blacklist()
 
         res = app.chat_scanner.scan_now()
@@ -340,7 +348,7 @@ class TestAppEndToEnd(TempCase):
         """手动扫描是用户主动行为，不要求游戏在跑。"""
         app = self._build()
         app.ocr.default = [("PlayerX", 0.99)]
-        app.db.add("7656119", "PlayerX")
+        app.db.add("PlayerX")
         app.scheduler.reload_blacklist()
         self.assertFalse(app.scheduler.game_active.is_set())
         res = app.chat_scanner.scan_now()
@@ -373,10 +381,37 @@ class TestAppEndToEnd(TempCase):
         app.on_pause(False)
         self.assertTrue(app.scheduler.is_active())
 
+    def test_unpausing_without_game_does_not_claim_monitoring(self):
+        """游戏没在跑时取消暂停，日志不能说「监控已恢复」。
+
+        用户实测反馈：终端一直跳「监控已恢复」，让人以为监控被打开了 ——
+        其实只是取消了一个用户开关，游戏没跑就什么也不会扫。
+        """
+        logged = []
+        app = self._build()
+        app.scheduler.log = logged.append
+        self.assertFalse(app.scheduler.game_active.is_set())
+
+        app.on_pause(True)
+        self.assertTrue(app.scheduler.is_paused())
+        app.on_pause(False)
+        self.assertFalse(app.scheduler.is_paused())
+        self.assertFalse(app.scheduler.is_active())        # 依然不干活
+        text = " ".join(logged)
+        self.assertNotIn("监控已恢复", text)
+        self.assertIn("未运行", text)
+
+        # 游戏真的在跑时，才说「监控已恢复」
+        app._on_game_start()
+        app.on_pause(True)
+        app.on_pause(False)
+        self.assertIn("监控已恢复", " ".join(logged))
+        self.assertTrue(app.scheduler.is_active())
+
     def test_cold_start_session_runs(self):
         self._patch(main_mod, "COLD_START_DELAY", 0.05)
         app = self._build()
-        app.db.add("7656119", "PlayerX")
+        app.db.add("PlayerX")
         app.scheduler.reload_blacklist()
         app.capture.default = Image.new("RGB", (400, 120), (30, 30, 30))
         app.ocr.default = [("PlayerX", 0.99), ("Other", 0.95)]
@@ -384,10 +419,10 @@ class TestAppEndToEnd(TempCase):
         app._on_game_start()
         deadline = time.time() + 5.0
         while time.time() < deadline:
-            if app.db.get_all()[0]["encounter_count"] > 0:
+            if app.db.get_total_encounter_count() > 0:
                 break
             time.sleep(0.05)
-        self.assertGreater(app.db.get_all()[0]["encounter_count"], 0)
+        self.assertGreater(app.db.get_total_encounter_count(), 0)
         self.assertEqual(app.db.get_recent_encounters()[0]["source"],
                          "cold_start")
 
@@ -408,7 +443,7 @@ class TestAppEndToEnd(TempCase):
     def test_esc_menu_flow(self):
         """ESC → 菜单已打开 → 启动 esc_menu 会话 → 命中入库。"""
         app = self._build()
-        app.db.add("7656119", "PlayerX")
+        app.db.add("PlayerX")
         app.scheduler.reload_blacklist()
         app._on_game_start()
 
@@ -419,10 +454,10 @@ class TestAppEndToEnd(TempCase):
 
         deadline = time.time() + 5.0
         while time.time() < deadline:
-            if app.db.get_all()[0]["encounter_count"] > 0:
+            if app.db.get_total_encounter_count() > 0:
                 break
             time.sleep(0.05)
-        self.assertGreater(app.db.get_all()[0]["encounter_count"], 0)
+        self.assertGreater(app.db.get_total_encounter_count(), 0)
         self.assertEqual(app.db.get_recent_encounters()[0]["source"], "esc_menu")
 
 

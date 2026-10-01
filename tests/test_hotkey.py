@@ -615,29 +615,20 @@ class TestHotkeyDialog(TempCase):
             self.keysym = keysym
 
     def _dialog(self, mods=None, on_saved=None):
-        """构造对话框（不进入 wait_window）。"""
+        """构造快捷键面板（不进入 wait_window）。
+
+        改键逻辑现在住在 ``HotkeyPanel`` 上（``HotkeyDialog`` 只是一层
+        Toplevel 包装，构造函数里有 wait_window，单测里没人关它就会卡死）。
+        """
         import tkinter as tk
-        from app.ui.hotkey_dialog import HotkeyDialog
-        dlg = HotkeyDialog.__new__(HotkeyDialog)
-        dlg.cfg = self.cfg
-        dlg.on_saved = on_saved
-        dlg.result = None
-        dlg.log = hkd.get_logger("hotkey")
-        cur = self.cfg.get()
-        dlg.vk_var = tk.IntVar(value=cur["vk"])
-        dlg.ctrl_var = tk.BooleanVar(value=cur["ctrl"])
-        dlg.alt_var = tk.BooleanVar(value=cur["alt"])
-        dlg.shift_var = tk.BooleanVar(value=cur["shift"])
-        dlg.enabled_var = tk.BooleanVar(value=cur["enabled"])
-        dlg.key_text = tk.StringVar()
-        dlg.status_var = tk.StringVar()
-        dlg.top = tk.Toplevel(self.root)
-        dlg.top.withdraw()
-        dlg._build()
-        dlg._refresh_key_text()
+        from app.ui.hotkey_dialog import HotkeyPanel
+        win = tk.Toplevel(self.root)
+        win.withdraw()
+        panel = HotkeyPanel(win, self.cfg, on_saved=on_saved, embedded=False)
+        panel.pack(fill="both", expand=True)
         if mods is not None:
             hkd._live_modifiers = lambda: mods
-        return dlg
+        return panel
 
     def test_build_and_show_current(self):
         dlg = self._dialog()

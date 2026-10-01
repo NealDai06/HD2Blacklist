@@ -1,10 +1,25 @@
 # HD2 黑名单 · 绝地潜兵2 TK 者黑名单提示工具
 
+**当前版本：v1.1.3**（版本号写在 `app/config.py` 的 `VERSION`，会出现在窗口标题、
+`--check` 输出、exe 属性 → 详细信息，以及发布压缩包文件名里）
+
 一个 **纯本地** 的 Windows 桌面小工具：自动监视《绝地潜兵2》(Helldivers 2) 的
 聊天框与玩家列表，用 **屏幕截图 + OCR + 本地黑名单比对** 的方式，
 在你遇到记录在案的 TK 玩家时，用 **不抢焦点** 的音效 + 半透明 Overlay 小窗提醒你。
 
 > **不注入进程 · 不读内存 · 不改包 · 不抢焦点 · 不打断游戏节奏**
+
+---
+
+## 版本历史
+
+| 版本 | 主要变化 |
+|---|---|
+| **v1.1.3** | **"扫描功能失效"的真因修复 + 再也不让它静默**：源码运行时没设 `PYTHONPATH` 就找不到仓库自带的 `.pylibs`/`.devtools`（少了 rapidocr / wmi / pywin32）→ OCR 全程不可用，而 `recognize_raw()` 只返回空列表，于是每轮扫描都"识别 0 个名字"，界面/日志看起来就是扫描坏了。现在 `main.py`（及 tools）启动时自动补上这两个目录；OCR 不可用时**启动即在「最近动态」+ 状态栏写明原因**、聊天框扫描直接报 `ocr_unavailable`（不抓屏、不假装"聊天框为空"）、ESC/HUD 会话**开局即中止**（不再空转 8 秒），`--check` 也给出具体原因 |
+| **v1.1.2** | **名单简化**：删掉 **玩家ID** 一栏（匹配只认名字 —— ID 不参与匹配，却制造过"名字填进 ID 栏 → 永远不命中"的事故），并删掉 **TK次数 / 遇到次数 / 最后遇见** 三个人均统计字段（连库里的字段一起删，历史统计清空）。名单只剩 **名称 / 备注 / 添加时间**，表格从 7 列变 3 列，排序只剩"按添加时间 / 按名称"，右键菜单只剩 编辑/删除。命中的事实仍完整保留在 `encounters` 表与 `evidence/` 截图里；**老库首次打开会自动升级**（名称栏为空的老条目用玩家ID补名字，不丢数据）；旧结构另存底于 `_packaged_data_backup/legacy_schema_backup/`（`tools/legacy_schema.py` 可备份/恢复/降级） |
+| **v1.1.1** | **匹配漏报修复**：名字栏留空、纯符号名（`？`、`★`）被填进**玩家ID**栏时，旧索引只按"归一化后的名字"回退，符号被归一化成空串 → 条目被**静默丢弃**，表现就是"聊天里明明出现了 `？`，系统却不检测"（`reload()` 现在名字与 ID 都试一遍，并会告警而不是静默丢）；**界面能看见动态了**：状态栏上方新增「最近动态」3 行事件流（带时间戳），按 F8 / 点按钮触发的扫描、命中、去重跳过、失败、游戏启动退出、菜单扫描会话结束都会留痕，不再只有一行会被立刻覆盖的提示；**自定义快捷键面板不再说谎**：之前它按开机那一刻的 `enabled` 渲染成「F8（未启用）」，顶部打开热键后也不刷新 |
+| **v1.1.0** | **界面重排**：删菜单栏 → 单页五段（运行状态带 / 名单工具带 / 名单 / 设置分页 / 状态栏），设置区默认收起、分隔条可拖，功能入口不再重复；**修掉两个"点了没反应"的开关**（热键开关、暂停按钮都是"读状态不取反"，导致永远开不起来、日志还一遍遍刷「监控已恢复」）；**按钮在深色面板上看不出是按钮** → 新增 `Bar.TButton`（比面板亮的底色 + 可见边框）；监控指示灯改为由"游戏在跑"与"用户暂停"两个真值渲染，不再出现「游戏没开却显示监控中」；**打包不再携带任何用户数据**（名单 / 证据图 / 自定义图片音效 / 配置一律不进产物），仓库里的真实玩家名例子也换成中性占位符 |
+| v1.0.0 | 首个版本：四层匹配（精确 / 易混字符 / 模糊 / 全符号）、ESC 菜单扫描、聊天框按需扫描 + 全局热键、批量命中每人一栏、30 秒去重、无焦点 Overlay、通知外观可自定义（含 MP3）、区域校准、托盘常驻 |
 
 ---
 
@@ -132,6 +147,16 @@ python main.py --check
 python main.py
 ```
 
+**不需要先设 PYTHONPATH**：仓库自带的依赖目录（`.pylibs` 里的 numpy /
+opencv / rapidocr_onnxruntime / mss / pywin32 / pygame，`.devtools` 里的
+rapidfuzz）由 `main.py` 启动时自动加进 `sys.path`（`app/_bootstrap.py`）。
+
+> 这一条是**修 bug**，不是便利：以前只在"设了 PYTHONPATH 的开发终端"里找得到
+> 这些库，直接敲 `python main.py` 就会缺 rapidocr → OCR 全程不可用 →
+> 每轮扫描"识别 0 个名字"，界面上看起来就是**扫描功能失效**（真实故障）。
+> 现在 OCR 不可用时会在启动后立刻往「最近动态」和状态栏写明原因，
+> `--check` 也会给出同样的原因，不再让用户猜。
+
 第一次启动会自动生成：
 
 - `data/blacklist.db`（SQLite 数据库，WAL 模式）
@@ -144,10 +169,10 @@ python main.py
 然后：
 
 1. 在游戏里把显示模式设成 **无边框窗口**
-2. 点工具栏 **[校准区域]**，依次框选三个监视区域
+2. 展开下方「监视区域」分页 → **[框选新区域]**，依次框选三个监视区域
 3. 点 **[添加]** 录入你要记录的黑名单玩家
 4. 启动游戏 —— 监视会在检测到 `helldivers2.exe` 后自动激活
-5. 想扫聊天框时，点工具栏 **[扫描聊天框]**（或按 F8，需先启用）
+5. 想扫聊天框时，点顶部 **[扫描聊天框]**（或按 F8，需先在「扫描与触发」里启用）
 
 ---
 
@@ -161,14 +186,14 @@ python main.py
 
 | 触发方式 | 说明 |
 |---|---|
-| 工具栏 **[扫描聊天框]** 按钮 | 点一次 → 抓一张聊天框截图 → 跑一次 OCR → 匹配黑名单 |
-| **自定义热键**（可选，默认关闭） | 设置 → 聊天框扫描快捷键 → **自定义快捷键…** |
+| 顶部 **[扫描聊天框]** 按钮 | 点一次 → 抓一张聊天框截图 → 跑一次 OCR → 匹配黑名单 |
+| **自定义热键**（可选，默认关闭） | 设置区「扫描与触发」分页 → 点按键框按下组合键 → [保存] |
 
 #### 自定义扫描热键（系统全局热键）
 
 默认是 **F8**，可随时改成任意组合键：
 
-- 打开 **设置 → 聊天框扫描快捷键 → 自定义快捷键…**
+- 展开设置区「扫描与触发」分页 → 点那个按键框，直接按下你想用的组合键
 - **点一下按键框，然后直接按下你想用的组合键**（例如 `Ctrl+F9`、`Shift+S`）
 - 只按 `Ctrl` / `Alt` / `Shift` 会切换对应的复选框，不会被当成主键
 - 支持 F1–F24、A–Z、0–9、小键盘、以及常用符号键
@@ -220,13 +245,14 @@ python main.py
 
 同一玩家在 `HIT_DEDUP_WINDOW`（默认 **30 秒**）内：
 
-- **只计入一次** `encounter_count`
+- **只往 `encounters` 记一次**
 - **只弹一次提示**
 
-这样可以放心连点扫描按钮，不会把「遇到次数」刷上天。
+这样可以放心连点扫描按钮，不会把记录刷上天。
 去重缓存只在内存里，程序重启即清空；也可以在
-设置 → 聊天框扫描快捷键 → **清空命中去重缓存** 手动清掉。
-被跳过的命中会写日志：`[Hit] 去重跳过 entry_id=X source=Y`。
+设置区「扫描与触发」分页 → **[清空命中去重缓存]** 手动清掉。
+被跳过的命中会写日志：`[Hit] 去重跳过 <名字> entry_id=X source=Y`
+（并且会在「最近动态」里说一句"命中 X，但 30 秒内刚提示过 → 本次跳过"）。
 
 ### 5.3 ESC 菜单扫描
 
@@ -292,28 +318,85 @@ python main.py
 
 ## 6. 界面说明
 
-### 工具栏
+### 单页五段布局
 
-工具栏分三行（ttk 按钮较宽，挤一行会被裁掉）：
+主界面**没有菜单栏**，所有功能都在这一个页面里，按用途分成五段：
 
-| 行 | 按钮 | 说明 |
+```
+┌ ① 运行状态带 ─────────────────────────────────────────────────────┐
+│ [图标] HD2 黑名单 v1.1.2  ● 监控中   [启用 F8 扫描] │ [扫描聊天框] [暂停监控] [退出] │
+├ ② 名单工具带 ─────────────────────────────────────────────────────┤
+│ [添加][编辑][删除] │ 搜索[__] 搜索 清空（按名称/备注）│ 排序[__]↓ │ [导入][导出] │
+├ ③ 名单主区（占满剩余高度）─────────────────────────────────────────┤
+│  名称            │ 备注                                  │ 添加时间  │
+│                                                                    │
+├═══ 分隔条（可上下拖动）════════════════════════════════════════════╡
+├ ④ 设置分页（默认收起，只留标签栏）─────────────────────────────────┤
+│ [扫描与触发][通知][监视区域][数据][帮助]                    ▴ 展开设置 │
+├ ⑤ 状态栏 ─────────────────────────────────────────────────────────┤
+│ 15:03:16  按 F8：聊天框扫描完成，命中 1 条：PlayerX（已提示 + 已记录，786ms） │
+│ 15:02:46  按 F8：聊天框扫描完成，命中 1 条：PlayerX（30 秒内已提示过 → 跳过）│
+│                                                                    │
+│ 就绪                            黑名单总数：N | 本局命中：N | 今日命中：N │
+└────────────────────────────────────────────────────────────────────┘
+```
+
+| 段 | 放什么 | 说明 |
 |---|---|---|
-| 1 | 添加 / 编辑 / 删除 | 黑名单增删改 |
-| 1 | 搜索 / 清空 | 按 玩家ID / 名称 / 备注 模糊查询（大小写不敏感） |
-| 2 | 排序下拉 + ↓↑ | 按 最后遇见 / 遇到次数 / 添加时间 / TK次数 排序（点列头也可） |
-| 2 | **扫描聊天框** | **按需扫描一次聊天框**（抓图 + OCR + 黑名单匹配） |
-| 2 | **导入 / 导出** | 名单备份与迁移（CSV / JSON） |
-| 3 | 校准区域 | 打开区域校准器 |
-| 3 | 恢复全部默认 | 清除全部区域自定义 |
-| 3 | 通知设置 | 打开通知外观编辑器 |
-| 3 | 最小化到托盘 | 隐藏窗口，**监控继续运行** |
+| ① 运行状态带 | 监控灯、[启用/停用 X 扫描]、[扫描聊天框]、[暂停监控]、[退出] | **F8 到底开没开一眼可见**，按钮文字就是点下去会发生的事 |
+| ② 名单工具带 | 增删改查、搜索、排序、导入导出 | 只放「对这张名单的操作」 |
+| ③ 名单主区 | Treeview | 占满剩余高度 |
+| ④ 设置分页 | 扫描与触发 / 通知 / 监视区域 / 数据 / 帮助 | **默认收起**成一条标签栏；点标签或 [展开设置] 打开 |
+| ⑤ 状态栏 | 「最近动态」事件流（`EVENT_ROWS = 3` 行，带时间戳，最新在最上）+ 当前状态 + 统计 | 只放信息，不放动作 |
 
-菜单里也有对应入口：**文件 → 导出列表…**、
-**设置 → 聊天框扫描快捷键**（立即扫描 / 开启 F8 / 清空去重缓存）。
+- **分隔条可拖**：想多看名单就往上拖，想调设置就往下拖，比例自己定
+- **展开高度自适应**：按当前分页的内容高度撑开（上限为面板高度的 60%），
+  内容实在太高时设置区内部可滚动 —— 保证底部的 [保存] 永远点得到
+- **单一入口**：每个功能只有一个地方能点。菜单栏已经删掉 —— 之前「校准区域 /
+  通知设置 / 扫描聊天框 / 导出」在菜单和工具栏各有一份，两处还可能不一致
+- 关闭窗口 = 最小化到托盘（监控继续），**退出**在 ① 最右侧；托盘菜单里还有
+  扫描 / 暂停 / 打开各设置页的入口（都转发同一条命令，不重复实现）
+- **按钮看起来必须是按钮**：工具带上的普通按钮用 `Bar.TButton`（比面板亮的底
+  色 + 可见边框）。默认的 `TButton` 是 flat + 与面板同色，在深色界面上就是
+  一段文字 —— 用户会以为「根本没有这个按钮」。改主题时别把它换回 `TButton`
+
+### 各段的按钮
+
+| 段 | 按钮 | 说明 |
+|---|---|---|
+| ② | 添加 / 编辑 / 删除 | 黑名单增删改 |
+| ② | 搜索 / 清空 | 按 名称 / 备注 模糊查询（大小写不敏感） |
+| ② | 排序下拉 + ↓↑ | 按 添加时间 / 名称 排序（点列头也可） |
+| ② | **导入 / 导出** | 名单备份与迁移（CSV / JSON） |
+| ① | **扫描聊天框** | **按需扫描一次聊天框**（抓图 + OCR + 黑名单匹配） |
+| ① | **启用 / 停用 F8 扫描** | 系统全局热键总开关。文字写的是**动作**：未启用时是「启用 F8 扫描」，启用后变金色「停用 F8 扫描」 |
+| ① | **暂停监控 / 恢复监控** | 切换"用户暂停"。按钮变金色 = 已暂停 |
+| ④ 扫描与触发 | 改键、恢复默认 F8、清空去重缓存、节流参数（只读） | |
+| ④ 通知 | 文案 / 图片 / 外观 / 音效 + 实时预览 | |
+| ④ 监视区域 | 框选新区域 / 恢复默认 / 恢复全部默认 / 实时预览 | 框选时会临时最小化主窗口 |
+| ④ 数据 | 打开数据目录 / 打开日志 / 刷新统计 | 导入导出在 ② |
+
+### 监控指示灯说的是真话
+
+灯由**两个真值**共同决定，而不是谁最后调用了谁：
+
+| 游戏在跑 | 用户暂停 | 指示灯 |
+|---|---|---|
+| 是 | 否 | `● 监控中` |
+| 是 | 是 | `● 已暂停 (手动暂停)` |
+| 否 | 否 | `● 已暂停 (游戏未运行 / 等待游戏启动)` |
+| 否 | 是 | `● 已暂停 (手动暂停；游戏未运行)` |
+
+所以「游戏没开时点暂停」不会把灯点成绿色；「取消暂停」也不会 —— 只有游戏
+真的在跑才叫「监控已恢复」，否则日志写的是
+`已取消用户暂停（当前游戏未运行，不会扫描）`。
+| ④ 帮助 | 使用说明 / 关于 + 触发方式说明 | |
 
 ### 列表列
 
-玩家ID · 名称 · 备注 · TK次数 · 遇到次数 · 添加时间 · 最后遇见
+名称 · 备注 · 添加时间
+
+（v1.1.2 起从 7 列缩到 3 列：玩家ID、TK次数、遇到次数、最后遇见全部删除）
 
 ### 界面外观
 
@@ -326,11 +409,40 @@ python main.py
 | 主操作按钮 | `[扫描聊天框]` 用金色实底突出 |
 | 危险操作 | `[删除]` 用红色文字 |
 | 表格 | 斑马纹行背景、金色表头、命中行深红闪烁 |
-| 顶部标题带 | 应用图标 + 名称 + 版本 + 监控状态灯 |
-| 其他 | 菜单、下拉列表、滚动条、输入框、分页全部统一配色 |
+| ① 运行状态带 | 应用图标 + 名称 + 版本 + 监控状态灯 + 高频动作 |
+| 其他 | 下拉列表、滚动条、输入框、分页全部统一配色 |
 
-对话框（通知设置 / 校准器 / 添加条目 / 导入策略）共用同一套配色与图标。
-**只改外观，不改任何行为**；`Hit.TLabel` / `Paused.TLabel` 等 style 名保持不变。
+> **按钮宽度**：Tk 8.6 的 ttk 按钮默认 `-width = -11`（固定 11 个平均字符宽），
+> 也就是不管写「退出」还是「扫描聊天框」都一样宽 —— 之前工具栏被迫排三行就是
+> 因为这个。`theme.apply_theme()` 里显式设了 `width=0`（按文字自适应），
+> 现在两行工具带就能装下全部操作。改主题时**别把这一条删掉**。
+
+### 状态栏的「最近动态」
+
+底部那块不只是"一行会被下一条覆盖的提示" —— 上面三行是**事件流**
+（`EVENT_ROWS = 3`、`HH:MM:SS` 时间戳、最新在最上），按级别着色：
+
+| 级别 | 样式 | 什么时候出现 |
+|---|---|---|
+| `info` | `PanelMuted.TLabel` | 开始扫描、未命中、聊天框为空、菜单会话结束、游戏启停/暂停 |
+| `hit` | `Hit.TLabel`（绿） | 命中并已提示 + 已记录 |
+| `dedup` | `Paused.TLabel`（金） | 命中但落在 `HIT_DEDUP_WINDOW` 去重窗口内 → 本次跳过 |
+| `warn` | `Danger.TLabel`（红） | 截图/OCR 失败、写入失败、扫描还没结束就又点了一次 |
+
+两条入口，**都得留在主线程**：
+
+- `GUI.notify_event(text, level)` —— 前台线程直接调
+- `ScanScheduler.report(msg, level)` —— 后台线程用；它 = 写日志 + 触发 `on_event`，
+  由 `app.application._on_scheduler_event` 接到 `GUI.notify_event`（内部走 `post()` 队列）
+
+聊天框扫描走 `ChatScanner.on_result`（扫描线程里触发，GUI 侧 `post()` 转主线程），
+所以**点按钮和按 F8 是同一条路**，不会再出现"按热键那次什么都不显示"。
+注意 `handle_hits(..., notify_event=False)`：聊天框扫描会自己播报完整结果，
+调度层再报一遍就重复了 —— 而菜单/HUD 那条路没有"扫描结果"，仍然由调度层播报。
+
+设置分页三件套（通知 / 校准 / 快捷键）现在是「可嵌入的 Panel + 薄 Toplevel 包装」：
+`NotificationPanel` / `CalibratorPanel` / `HotkeyPanel` 嵌在主界面分页里，
+`*Dialog` 只是给需要独立窗口的调用方留的兼容壳。
 
 ### 应用图标
 
@@ -349,37 +461,93 @@ python main.py
 
 ### 右键菜单
 
-编辑 · 删除 · **清零遇到次数** · **重置最后遇见时间**
+编辑 · 删除
 
-### 底部汇总栏
+（`清零遇到次数` / `重置最后遇见时间` 随字段一起删掉了 —— v1.1.2 起名单里
+不再有逐人统计，见下面「名单只有三个字段」）
 
-`黑名单总数：N | 本局命中：N | 今日命中：N`
+### 底部状态栏
+
+上面三行是**「最近动态」事件流**（带时间戳，最新在最上，见 §6 的
+「状态栏的最近动态」），下面一行是 `就绪（当前列出 N 条）` + 统计
+`黑名单总数：N | 本局命中：N | 今日命中：N`。
 
 ### 命中时的实时反馈
 
 命中黑名单后 **100 ms 内**：
 
-1. 对应行的「遇到次数」+1、「最后遇见」更新（每个命中玩家各自一行）
-2. 该行高亮 **闪烁约 3 秒** 后恢复
-3. 弹出无焦点 Overlay + 提示音（多个命中 → 多个通知栏，但音效只响一次）
-4. 状态栏显示命中的玩家名、来源与匹配度
+1. 该行高亮 **闪烁约 3 秒** 后恢复（名单里不再有计数列，所以不写单元格）
+2. 弹出无焦点 Overlay + 提示音（多个命中 → 多个通知栏，但音效只响一次）
+3. 状态栏显示命中的玩家名、来源与匹配度，并往「最近动态」里加一行
+4. 往 `encounters` 表写一条命中事实（时间 / 匹配度 / 来源 / 证据图路径）
 
-### 字段语义
+### 名单只有三个字段（v1.1.2 起）
 
 | 字段 | 谁在维护 | 说明 |
 |---|---|---|
-| TK次数 | **用户手动录入** | 你主观记录的 TK 次数 |
-| 遇到次数 | **系统自动累积** | 扫描命中该玩家的累计次数，每次命中 +1 |
-| 最后遇见 | **系统自动更新** | 最近一次命中的时间 |
+| `player_name` | 用户 | 玩家名，**唯一**；匹配就是按它做的 |
+| `note` | 用户 | 备注（你为什么记他） |
+| `created_at` | 系统 | 添加时间 |
 
-> **去重窗口内的命中既不计入「遇到次数」也不弹提示**（默认 30 秒）——
-> 这是为了让你可以放心连点 [扫描聊天框] 而不会把次数刷上天。
+**删掉了**：`player_id`（玩家ID）、`tk_count`（TK次数）、`encounter_count`
+（遇到次数）、`last_seen`（最后遇见）。理由：
+
+- 匹配只认名字 —— 玩家ID 一栏不但没参与匹配，还制造过"名字填错栏 →
+  永远不命中"的真实事故。少一栏，就少一类这种错。
+- 名单只需要回答一个问题：**这个名字要不要提醒**。人均统计既没人看，
+  又要在每次命中时做一次原子加一（并发下还容易丢更新）。
+
+命中的事实仍然完整保留：`encounters` 表一条命中一行，`evidence/` 里还有
+截图。底部的「本局命中 / 今日命中」就是现算的。
+
+> **去重窗口内的命中既不记入 `encounters` 也不弹提示**（默认 30 秒）——
+> 这是为了让你可以放心连点 [扫描聊天框] 而不会把记录刷上天。
+
+### 老库自动升级
+
+升级到 v1.1.2 后第一次打开，程序会**自动**把旧结构改成新结构：
+
+| 情况 | 处理 |
+|---|---|
+| 名称栏有名字 | 名字与备注原样保留 |
+| 名称栏为空、玩家ID栏有值（`PlayerX`、`？` 这类填错栏的） | **用玩家ID补成名字**，不丢条目 |
+| 名称栏与玩家ID栏都空（老占位行 `-`） | 丢弃，并在日志里写明丢了几条 |
+| 同名条目 | 只留第一条 |
+| `encounters` 里的历史命中记录 | **清空**（用户明确要求"历史统计一并清空"） |
+| `evidence/` 里的证据截图 | 不碰（只是不再有数据库索引行） |
+
+升级会往 `app.log` 写一行 WARNING 说明保留/丢弃了多少条。
+
+**旧结构已经留了底**（在 `../_packaged_data_backup/legacy_schema_backup/`）：
+
+| 内容 | 说明 |
+|---|---|
+| `schema_old.sql` | 旧结构建表语句，纯文本 |
+| `empty_old_schema.db` | 旧结构**空库**，改名成 `blacklist.db` 即可回到旧结构 |
+| `db/*.db` | 扫到的 6 份真实旧库**副本**（原库没动）—— 升级会清空 encounters，所以这是唯一还留着历史命中的地方 |
+| `old_source/database.py` | 旧结构时代的实现（从 git 导出，含默认值与计数写法） |
+
+配套工具（只用标准库，不 import 项目模块，以后代码再改也照样能跑）：
+
+```bat
+:: 重新扫一遍工作区，把所有旧结构 blacklist.db 备份进来（只复制）
+python tools\legacy_schema.py --backup
+
+:: 看备份里有什么（名单条数 / 命中记录数 / 名字）
+python tools\legacy_schema.py --list
+
+:: 恢复某一份（目标会被先改名成 xxx.before_restore_<时间戳>）
+python tools\legacy_schema.py --restore 测试版 --to "..\发布包\HD2Blacklist\data"
+
+:: 把已经被升级过的新结构库变回旧结构（player_id/统计字段填默认值）
+python tools\legacy_schema.py --downgrade data\blacklist.db
+```
 
 ---
 
 ## 7. 校准监视区域
 
-**设置 → 校准区域**（或工具栏 **[校准区域]**）。
+展开设置区 **「监视区域」** 分页。
 
 三个区域：
 
@@ -413,7 +581,7 @@ python main.py
 
 ## 8. 名单导入导出
 
-工具栏 **[导出]** / **[导入]**，或菜单 **文件 → 导出列表…**。
+顶部工具带右侧 **[导出]** / **[导入]**（设置区「数据」分页里也有说明）。
 用于**备份、换机迁移、多机同步**。
 
 ### 支持格式
@@ -423,7 +591,7 @@ python main.py
 | **CSV** | `utf-8-sig`（带 BOM） | Excel 直接双击打开**不乱码**；也可用记事本编辑 |
 | **JSON** | `utf-8` | 结构化，便于脚本处理与人工核对 |
 
-导出字段：`player_id, player_name, note, tk_count, encounter_count, created_at, last_seen`
+导出字段：`player_name, note, created_at`
 
 JSON 结构：
 
@@ -431,17 +599,12 @@ JSON 结构：
 {
   "version": 1,
   "exported_count": 2,
-  "fields": ["player_id", "player_name", "note", "tk_count",
-             "encounter_count", "created_at", "last_seen"],
+  "fields": ["player_name", "note", "created_at"],
   "entries": [
     {
-      "player_id": "76561198000000001",
       "player_name": "SamplePlayer_01",
       "note": "示例条目（可删除）：疑似故意 TK 队友",
-      "tk_count": 2,
-      "encounter_count": 1,
-      "created_at": "2026-01-01 10:00:00",
-      "last_seen": "2026-01-02 11:00:00"
+      "created_at": "2026-01-01 10:00:00"
     }
   ]
 }
@@ -452,22 +615,22 @@ JSON 结构：
 
 ### 导入冲突策略
 
-以 `(player_id, player_name)` 为唯一键。导入前会弹窗让你选：
+以 **玩家名** 为唯一键（大小写不敏感）。导入前会弹窗让你选：
 
 | 策略 | 行为 |
 |---|---|
-| **跳过已存在的条目**（默认） | 只新增数据库里没有的；同名同 ID 的跳过 |
-| **更新备注与 TK 次数** | 保留本机已累积的 `遇到次数` / `最后遇见`，只覆盖 `note` / `tk_count` |
-| **完全覆盖** | 连 `encounter_count` / `last_seen` 也一起用文件里的值覆盖 |
+| **跳过已存在的条目**（默认） | 只新增这里没有的名字；同名跳过 |
+| **只更新备注** | 同名条目的 `note` 用文件里的覆盖，`created_at` 保持本机的 |
+| **完全覆盖** | 同名条目的 `note` 与 `created_at` 都用文件里的值 |
 
 导入完成后弹窗显示：**新增 N，更新 M，跳过 K**。
 
 ### 规则与保障
 
-- `player_id` 为空的行 **一律跳过**（计入"跳过"数）
-- 同一 `player_id` 但 `player_name` 不同 → 视为**两条不同记录**（与数据库唯一键一致）
+- 没有名字的行（空 / 只有备注）**一律跳过**（计入"跳过"数）
+- 老版本导出的文件里有 `player_id` / `tk_count` / `encounter_count` /
+  `last_seen` 也无所谓 —— **一律无视**，只取名字、备注、添加时间
 - 整个导入在 **一个事务** 内完成：任何一条出错 → **全部回滚**，数据库保持原样
-- 数字字段容错：`"abc"` / 空值 → 记为 `0`
 - **导入导出都在后台线程执行**，大文件不会卡住界面；完成后通过
   `queue.Queue` 回到主线程刷新列表并提示
 
@@ -478,7 +641,7 @@ JSON 结构：
 
 ## 9. 自定义提示（GUI 可视化）
 
-**设置 → 通知设置**（或工具栏 **[通知设置]**）。左侧四个分页，右侧 **实时预览**。
+展开设置区 **「通知」** 分页。左侧四个分页，右侧 **实时预览**。
 
 ### 文案
 
@@ -489,10 +652,11 @@ JSON 结构：
 | `{player_name}` | 玩家名称 |
 | `{match_score}` | 匹配度（0-100） |
 | `{note}` | 备注描述 |
-| `{tk_count}` | 你录入的 TK 次数 |
 | `{source}` | 命中来源（chat / chat_trigger_join / esc_menu / cold_start） |
 | `{time}` | 当前时间 |
-| `{last_seen}` | 上次遇见时间 |
+
+（v1.1.2 起 `{player_id}` / `{tk_count}` / `{last_seen}` 已取消 ——
+名单里没有这些字段了；老模板里若还写着，会**原样保留**不替换，不会报错。）
 
 「字段显示开关」可以关掉某些字段：**正文模板里只包含该字段的整行会被自动去掉**。
 
@@ -628,12 +792,12 @@ Helldiver_black/                     ← 工作区（不是一个 git 仓库）
 │   │   │   └── notifier.py          无焦点分层窗口 Overlay（每栏一窗）+ 音效 + 堆叠
 │   │   └── ui/
 │   │       ├── theme.py             暗色主题（配色 / ttk 样式 / 窗口与托盘图标）
-│   │       ├── gui.py               主界面（Treeview + 三行工具栏 + 托盘 + 导入导出）
-│   │       ├── gui_notification.py  通知设置对话框
-│   │       ├── calibrator.py        区域校准器
-│   │       └── hotkey_dialog.py     快捷键设置对话框（按键捕获）
+│   │       ├── gui.py               主界面（单页五段：状态带 / 工具带 / 名单 / 设置分页 / 状态栏）
+│   │       ├── gui_notification.py  通知面板（NotificationPanel + 兼容壳 Dialog）
+│   │       ├── calibrator.py        区域校准面板（CalibratorPanel + 全屏框选遮罩）
+│   │       └── hotkey_dialog.py     快捷键面板（HotkeyPanel + 兼容壳 Dialog）
 │   │
-│   ├── tests/                       单元 / 集成 / GUI 测试（514 个用例）
+│   ├── tests/                       单元 / 集成 / GUI 测试（523 个用例）
 │   │   ├── test_core.py             配置 / 数据库 / 匹配（含符号名与易混字符）/ 导入导出
 │   │   ├── test_pipeline.py         截图 / OCR / 会话 / 按需扫描 / 去重 / 批量 / ESC
 │   │   ├── test_notifier.py         模板 / 渲染 / 无焦点窗口池 / 音效 / 堆叠 / 字号
@@ -649,7 +813,8 @@ Helldiver_black/                     ← 工作区（不是一个 git 仓库）
 │   │   ├── ocr_probe.py             真实 OCR 验证脚本（渲染样图 → 识别 → 匹配）
 │   │   ├── perf_probe.py            抓屏 / OCR 的 CPU 与墙钟成本实测
 │   │   ├── hotkey_probe.py          全局热键真机探测（注册 → 模拟按键 → 注销）
-│   │   └── diagnose_ocr.py          拿真实证据截图复盘 OCR 识别效果
+│   │   ├── diagnose_ocr.py          拿真实证据截图复盘 OCR 识别效果
+│   │   └── legacy_schema.py         旧数据库结构（v1.1.1 及更早）的备份 / 恢复 / 降级
 │   │
 │   └── data/                        ⚠ 运行期数据（git 忽略，别删）
 │       ├── blacklist.db            SQLite 数据库
@@ -667,10 +832,16 @@ Helldiver_black/                     ← 工作区（不是一个 git 仓库）
 ├── 发布包/                           ← 打包 / 分发产物（不在仓库里）
 │   ├── HD2Blacklist/                文件夹版产物（build.py 输出，含 data/）
 │   ├── 解压版/HD2Blacklist/         发布压缩包解开后的样子（实测用）
-│   ├── HD2Blacklist-v1.0.0-win64.rar  发给别人的压缩包
+│   ├── HD2Blacklist-v1.1.2-win64.rar  发给别人的压缩包
 │   └── 使用说明.txt / LICENSE.txt    build.py 自动从仓库复制过来
 │
 └── _packaged_data_backup/           ⚠ 历次打包前的用户数据备份（别删）
+    └── legacy_schema_backup/        ⚠ 旧数据库结构备份（v1.1.1 及更早）
+        ├── README.txt               说明 + 恢复方法
+        ├── schema_old.sql           旧结构建表语句（纯文本，最权威）
+        ├── empty_old_schema.db      旧结构空库（可直接改名成 blacklist.db）
+        ├── db/*.db                  6 份真实旧库副本（唯一保留历史命中的地方）
+        └── old_source/database.py   旧结构时代的实现（从 git 导出）
 ```
 
 > **包名约定**：所有跨模块导入一律写绝对路径（`from app.core.matcher import Matcher`），
@@ -682,7 +853,8 @@ Helldiver_black/                     ← 工作区（不是一个 git 仓库）
 
 **可安全删除**（都会自动重建）：`build/`、`.test_tmp/`、`.piptmp/`、任意 `__pycache__/`。
 
-**绝不能删**：`data/`、`../发布包/*/data/`、`../_packaged_data_backup/`、
+**绝不能删**：`data/`、`../发布包/*/data/`、`../_packaged_data_backup/`
+（含里面的 `legacy_schema_backup/` —— 那是**唯一**还能看到旧结构命中历史的地方）、
 `.pylibs/`、`.devtools/`、`使用说明.txt`。
 
 所有 `data/*.json` 都支持 **手动编辑或直接删除恢复默认**，改动 **无需重启**。
@@ -694,18 +866,13 @@ Helldiver_black/                     ← 工作区（不是一个 git 仓库）
 ```sql
 CREATE TABLE blacklist (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
-    player_id TEXT NOT NULL,
-    player_name TEXT,
-    note TEXT,
-    tk_count INTEGER DEFAULT 0,           -- 用户手动录入
-    encounter_count INTEGER DEFAULT 0,    -- 系统自动累积
-    evidence_path TEXT,
-    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-    last_seen DATETIME,
-    UNIQUE(player_id, player_name)
+    player_name TEXT NOT NULL,            -- 匹配只看它，唯一
+    note TEXT DEFAULT '',
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
 );
+CREATE UNIQUE INDEX idx_blacklist_name ON blacklist(player_name);
 
-CREATE TABLE encounters (
+CREATE TABLE encounters (                 -- 命中事实（一次命中一行）
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     blacklist_id INTEGER,
     name_seen TEXT,
@@ -717,7 +884,11 @@ CREATE TABLE encounters (
 ```
 
 - `PRAGMA journal_mode=WAL` + `BEGIN IMMEDIATE` 事务
-  → 「次数 +1、更新时间、插入 encounters」三件事 **原子完成**，并发下不会丢计数
+  → 「插入 encounters」这一步是原子的，并发下不会丢记录
+- `blacklist` 里**没有任何人均统计字段**（v1.1.2 删掉了 `player_id` /
+  `tk_count` / `encounter_count` / `last_seen`）：命中事实全在 `encounters`，
+  「本局命中 / 今日命中」是现算的
+- 老库打开时自动升级（见 §6「老库自动升级」）
 - 数据库连接跨线程使用，内部用 `threading.RLock` 串行化
 - 排序字段走 **白名单**，防止 SQL 注入
 
@@ -773,6 +944,7 @@ python main.py --debug
 python build.py --clean              :: 文件夹版（推荐：启动约 1 秒）
 python build.py --clean --onefile    :: 单文件版（便携，启动要解压 5~15 秒）
 python build.py --console            :: 保留控制台，排查问题用
+python build.py --clean --keep-data  :: 保留产物里已有的 data/（开发自用）
 ```
 
 产物写到**上一层的 `发布包/`**，并自动在 exe 旁边放好 `data/` 种子目录、
@@ -780,22 +952,44 @@ python build.py --console            :: 保留控制台，排查问题用
 
 ```
 发布包/                                   ← 一切"给别人用"的东西都在这里（不进仓库）
-├── HD2Blacklist/                        文件夹版产物（build.py 输出，292 MB，启动 ~1s）
-│   ├── HD2Blacklist.exe
+├── HD2Blacklist/                        文件夹版产物（build.py 输出，288 MB，启动 ~1s）
+│   ├── HD2Blacklist.exe                 版本号写在 exe 属性里（右键 → 详细信息）
 │   ├── _internal/
-│   ├── data/                            ← 用户真实数据长在这里
+│   ├── data/                            ① 见下：只含三个图标，程序首次运行自己生成配置
+│   │   ├── assets/                      app_icon.png / app_icon.ico / default_icon.png
+│   │   ├── evidence/                    空目录
+│   │   └── logs/                        空目录
 │   ├── 使用说明.txt                      ← build.py 自动复制
 │   └── LICENSE.txt                      ← build.py 自动复制
 ├── 解压版/HD2Blacklist/                 发布压缩包解开后的样子（自己实测用）
-│   └── （内容同上：exe + _internal + data + 两个文档）
 ├── HD2Blacklist.exe                     单文件版（120 MB，启动 ~10s，可选）
-├── HD2Blacklist-v1.0.0-win64.rar        发布压缩包（发给别人用这个）
+├── HD2Blacklist-v1.1.2-win64.rar        发布压缩包（发给别人用这个）
 └── 使用说明.txt / LICENSE.txt            顶层再放一份，翻目录时一眼可见
 ```
 
+### ① 打包**不带任何用户数据**（隐私）
+
+`data/` 里有本机使用痕迹：黑名单、证据截图、区域坐标、以及你自己挑的提示图/
+音效。**这些一个字节都不进产物**：
+
+| 项 | 处理 |
+|---|---|
+| `blacklist.db` / `notification.json` / `user_config.json` / `hotkey.json` | 不复制；程序首次运行自己生成默认值 |
+| `logs/` `evidence/` 里的东西 | 不复制，打包后再扫一遍强制清空 |
+| `data/assets/` 里除三个图标以外的文件（你自己的图片 / MP3） | 不复制，打包后强制删除 |
+| exe 里的版本属性 | 由 `build.py` 按 `config.VERSION` 写入（`FileDescription` = `HD2 黑名单 v1.1.2`） |
+
+`--clean` 时旧产物里的 `data/` **不会**被带进新产物，而是**整体备份**到
+`../_packaged_data_backup/packaged_<时间戳>/`（只搬不删，万一要找回旧名单）。
+需要保留（开发自用）就加 `--keep-data`。
+
+> 仓库里也做过一次隐私清理：早期文档/测试里用过真实玩家名当例子
+> （`PlayerX` / `playery`，来自本机名单与真实 OCR 截图），已全部换成中性占位符
+> （`PlayerX` / `PlayerY`）。`LICENSE` 与 `使用说明.txt` 里的 `NealDai06`
+> 是作者署名，保留。
+
 > `--clean` **只清理本次要产出的那一份**（外加 `build/` 构建缓存），
 > 不会动 `发布包/` 里的解压版、发布压缩包和说明书 —— 那里是手工维护的分发区。
-> 文件夹版的 `data/` 在清理前会先搬出来、构建完再搬回去，用户数据不会丢。
 > `使用说明.txt` 与 `LICENSE` 的**源文件在仓库根目录**，打包时复制一份到产物旁边，
 > 所以「GitHub 内容全在 source_code/ 里」和「分发包自带说明书与许可证」同时成立。
 
@@ -1068,8 +1262,8 @@ OCR 判读又会认为它"不含字母数字"而不像玩家名。现在：
 自检里的 **「全符号玩家名」** 一项会验证这条链路（`python main.py --check`）。
 
 **Q：误报太多？**
-- 提高匹配阈值：`config.py` 里的 `MATCH_THRESHOLD`（默认 85）- 尽量录入 **完整玩家名**，太短的名字（2-3 个字母）容易模糊命中
-- 也可以在黑名单里只填 `player_id`，让名字留空
+- 提高匹配阈值：`config.py` 里的 `MATCH_THRESHOLD`（默认 85）
+- 尽量录入 **完整玩家名**，太短的名字（2-3 个字母）容易模糊命中
 
 **Q：提示音不响？**
 检查通知设置 → 音效页是否启用了音效、模式是否为 `none`；
@@ -1080,15 +1274,32 @@ OCR 判读又会认为它"不含字母数字"而不像玩家名。现在：
 **Q：扫描聊天框没反应 / 说"上一次扫描还没结束"？**
 说明上一次扫描仍在跑（OCR 通常 0.3–0.5 秒）。这是 `_busy` 锁在起作用，
 等它结束再点即可。如果状态栏说"聊天框为空"，说明 OCR 没在聊天框区域里
-识别到文字 —— 先用 **[校准区域]** 重新框选聊天框。
+识别到文字 —— 先用 **[校准区域]** 重新框选聊天框；但要是「最近动态」里
+写着 **OCR 不可用**，那跟区域无关，见下面那条。
 
-**Q：为什么同一个玩家只计了一次？**
-命中有 **30 秒去重窗口**。想立刻重新计数，用
-设置 → 聊天框扫描快捷键 → **清空命中去重缓存**。
+**Q：为什么同一个玩家只提示了一次？**
+命中有 **30 秒去重窗口**（窗口内的命中既不弹窗也不记入 `encounters`）。
+想立刻重新计，用设置区「扫描与触发」→ **[清空命中去重缓存]**。
+「最近动态」里会明确写着"命中 X，但 30 秒内刚提示过 → 本次跳过"。
+
+**Q：扫描"能用"但什么都识别不到（识别 0 个名字 / 聊天框为空）？**
+先看「最近动态」和 `app.log` 里有没有 **OCR 不可用** 这几个字：
+
+| 现象 | 原因 | 解决 |
+|---|---|---|
+| 启动后「最近动态」立刻出现"OCR 引擎不可用，扫描不会有任何结果：缺少 rapidocr…" | 源码运行时没带上仓库自带的 `.pylibs` | 用 `python main.py` 启动（会自动补路径）或直接用打包好的 exe |
+| `--check` 里「OCR 引擎」FAIL，原因同上 | 同上 | 同上（自检现在会打印具体原因，不再只说"不可用"） |
+| OCR 正常，但聊天框一直为空 | 聊天框区域没框对 | 设置区「监视区域」重新框选聊天框 |
+
+> 这一条以前是**静默**的：OCR 不可用时 `recognize_raw()` 只返回空列表，
+> 于是每轮扫描都"识别 0 个名字"，日志/界面看起来就是"扫描功能失效"。
+> 现在 OCR 不可用时：聊天框扫描直接报 `ocr_unavailable`（不抓屏、不假装
+> "聊天框为空"）、ESC/HUD 会话**开局即中止**（不再空转 8 秒）、启动时就在
+> 界面和日志里写明原因。
 
 **Q：游戏里按 F8 没反应？**
 热键现在是 `RegisterHotKey` 系统全局热键，正常在游戏里也有效。若无效请：
-① 确认 设置 → 聊天框扫描快捷键 里 **已启用**；
+① 确认顶部状态带上的 **[启用 F8 扫描]** 已经变成金色的 **[停用 F8 扫描]**（点一下即可切换）；
 ② 看状态栏/日志是否提示「已注册为系统全局热键」还是「退回按键轮询模式」——
 若被其它程序占用（例如录屏/外设驱动也用了 F8），换个键或关掉那个程序即可；
 ③ 运行 `python tools/hotkey_probe.py` 做真机探测（会临时独占该键几秒后注销）。
@@ -1102,12 +1313,12 @@ OCR 判读又会认为它"不含字母数字"而不像玩家名。现在：
 
 **Q：导入会不会覆盖我现在的数据？**
 取决于你选的策略：默认 **跳过**（什么都不覆盖）；
-「更新备注」保留你本机累积的遇到次数/最后遇见；
-只有「完全覆盖」才会连计数一起替换。而且导入是 **单事务**，
+「只更新备注」会换掉备注但保留本机的添加时间；
+只有「完全覆盖」才会连添加时间一起替换。而且导入是 **单事务**，
 中途出错会全部回滚。
 
 **Q：点了关闭窗口，程序去哪了？**
-默认 **最小化到系统托盘**，监控继续运行。从托盘菜单「退出」才会真正结束。
+默认 **最小化到系统托盘**，监控继续运行。点顶部 ① 的 **[退出]** 或托盘菜单「退出」才会真正结束。
 （想关闭即退出，可把 `gui.on_close` 改成调用 `quit_app`。）
 
 **Q：怎么彻底重置？**
@@ -1136,7 +1347,7 @@ OCR 判读又会认为它"不含字母数字"而不像玩家名。现在：
 
 | 验收项 | 实现 | 测试 |
 |---|---|---|
-| 主界面有 `[扫描聊天框]` 按钮 | `gui._build_toolbar` → `scan_chat_now` | `test_scan_button_exists` |
+| 主界面有 `[扫描聊天框]` 按钮 | `gui._build_header`（① 运行状态带）→ `scan_chat_now` | `test_scan_button_exists` |
 | 点击后 1 秒内完成扫描 | OCR 实测 0.3–0.5 s | `test_scan_is_fast` |
 | 连点不会并发 OCR | `_busy` 非阻塞锁 → 返回 `busy` | `test_no_concurrent_ocr` |
 | 游戏运行但未点击时 CPU < 0.3% | 无循环、无定时器，不点就零开销 | `test_no_background_chat_scanning` |
@@ -1147,18 +1358,81 @@ OCR 判读又会认为它"不含字母数字"而不像玩家名。现在：
 | 导出 JSON 结构清晰 | `{version, exported_count, fields, entries}` | `test_json_structure` |
 | 导入按所选策略处理冲突 | `skip` / `update_note` / `overwrite` | `test_import_*_strategy` |
 | 导入结果显示新增/更新/跳过数量 | `_on_import_done` 弹窗 | `test_import_worker_inserts_and_refreshes` |
-| 空 player_id 行被跳过 | `import_entries` 首行判断 | `test_import_skips_empty_player_id` |
+| 空名字的行被跳过 | `import_entries` 首行判断 | `test_import_skips_rows_without_name` |
 | 导入失败时全部回滚 | `BEGIN IMMEDIATE` + 整体 `ROLLBACK` | `test_import_rolls_back_on_error` |
 | 命中 2 / 3 / 1 个玩家 → 对应数量通知栏 + 1 次音效 | `notifier.alert_batch` | `test_batch_of_two/three/one_plays_sound_once` |
 | 通知栏垂直堆叠、互不遮挡 | `_stacked_position`（gap = 高度+8） | `test_batch_stacks_vertically_without_overlap` |
 | 每个命中玩家在 Treeview 独立闪烁 | `on_encounter` 逐个回调 | `test_on_encounter_called_per_hit` |
-| 每个命中玩家 `encounter_count` 都 +1 | `_process_hits` 逐条 `record_encounter` | `test_handle_hits_calls_alert_batch_once` |
+| 每个命中玩家各写一条 `encounters` | `_process_hits` 逐条 `record_encounter` | `test_handle_hits_calls_alert_batch_once`、`test_record_encounter_writes_facts` |
 | 连点扫描按钮，30 秒内同一批玩家全部去重跳过 | `_is_recently_hit` | `test_repeated_clicks_are_deduped` |
 | 30 秒后同一玩家再次命中可正常计数 + 弹提示 | 窗口过期即放行 | `test_dedup_expires` |
 | `app.log` 中有 `[Hit] 去重跳过 entry_id=X source=Y` | `_process_hits` | `test_dedup_skip_is_logged` |
 | 堆叠上限 5，超出的命中汇总成一栏列出剩余玩家 | `MAX_NOTIFY_STACK` + `alert_batch` 的汇总栏 | `test_max_stack_limit`、`test_overflow_is_summarised_in_the_last_slot` |
 | 屏幕下沿保护 | `_stacked_position` 返回 `None` 跳过 | `test_offscreen_stack_is_skipped` |
 | 不重写项目 / 不改无焦点样式 / 不改线程安全机制 | 分层窗口 4 样式仍由自检校验；GUI 仍只用两个 `queue.Queue` | `--check` + 全部 GUI 测试 |
+
+### 第九轮修复（"扫描功能失效"：OCR 缺失被静默吞掉）
+
+| 验收项 | 实现 | 测试 |
+|---|---|---|
+| **源码运行找不到自带依赖 → OCR 全程不可用 → 看起来"扫描坏了"** | `app/_bootstrap.py: add_vendored_libs()` 把 `<仓库根>/.pylibs`、`/.devtools` 插到 `sys.path` 最前；`main.py` 在导入 `app.application` **之前**调用；`tools/ocr_probe.py`、`perf_probe.py`、`diagnose_ocr.py`、`hotkey_probe.py` 同样调用 | `TestVendoredLibPath`（3 条，含"必须在导入 app 之前"的源码断言）、实测：**不设 PYTHONPATH** 跑 `python main.py --check` → exit 0，numpy/rapidfuzz/wmi/pygame/OCR 全 OK |
+| OCR 不可用时**不再静默**（以前只是每轮"识别 0 个名字"） | `OCREngine.available` 改为"真的尝试加载一次"（旧写法在预热前永远返回 True）；新增 `unavailable_reason`；失败信息里直接给出解决办法 | `test_ocr_engine_reports_reason`、`test_healthy_ocr_is_not_flagged` |
+| 启动时就告诉用户 | `app._warmup_ocr` 失败时 `notify_event(..., "warn")` + `set_status`，界面上立刻能看到原因 | 手工验证 + `--check` 输出 |
+| 聊天框扫描不再假装"聊天框为空" | `ChatScanner` 先查 OCR 状态：不可用 → `status="ocr_unavailable"` 并**直接返回（不抓屏）**；GUI 把它翻成"OCR 引擎不可用，扫描不会有结果 —— …" | `test_chat_scanner_reports_ocr_unavailable`、`test_chat_scanner_does_not_even_grab_the_screen`、`test_hotkey_scan_failure_is_reported` |
+| ESC/HUD 会话不再空转 | `ScanSession._run()` 开局检查 OCR，不可用就写 ERROR + 发 warn 事件并**立即收工**（以前会每 0.5s 抓一帧、连续无结果撑到 8 秒） | `test_session_aborts_immediately_when_ocr_dead`（断言 <1s 且 0 次抓屏） |
+| `--check` 给具体原因 | 「OCR 引擎」项失败时输出 `eng.unavailable_reason`（含"请用 python main.py 启动 / 用打包版"） | 手工验证 |
+| 顺带修掉一个"看开发机状态决定成败"的测试 | `tests/test_e2e.py` 的 `redirect_defaults()` 漏了 `HotkeyConfig` → 它读的是开发机上真实的 `data/hotkey.json`；一旦你自己点过「启用 F8 扫描」，`test_wiring` 里"默认关闭"的断言就会失败 | 全量 565 测试稳定通过 |
+
+### 第八轮改动（名单简化：只按名字 / 去掉人均统计）
+
+| 验收项 | 实现 | 测试 |
+|---|---|---|
+| **删掉玩家ID 一栏** | `blacklist` 表重建为 `(id, player_name, note, created_at)`；`database.add(name, note)`、`update(id, player_name=, note=)`；`Matcher.reload()` 索引**只认 `player_name`**；添加对话框只剩 名称 / 备注 / 证据图 | `TestDatabase.test_no_legacy_fields_anymore`、`TestSymbolAndNormalNamesTogether`、`test_only_three_fields_are_collected` |
+| **删掉 TK次数 / 遇到次数 / 最后遇见**（连数据库字段一起删，历史统计清空） | 三个字段与 `reset_encounter_count` / `reset_last_seen` / `reset_all_counters` 一起删除；`record_encounter()` 改为"只写事实"并返回 `{encounter_id, seen_at, today_count}`；名单表不再做任何原子累加 | `test_record_encounter_writes_facts`、`test_hit_records_encounter_without_touching_list` |
+| 表格 7 列 → 3 列（名称 / 备注 / 添加时间） | `COLUMNS` / `HEADERS` / `WIDTHS` 收敛；`_row_values` 只返回三列；列宽重排（备注占满剩余宽度） | `test_row_values`、`test_tree_has_no_stats_columns` |
+| 排序入口只剩「按添加时间 / 按名称」 | `SORT_OPTIONS` 收敛；`sort_by_column()` 白名单收敛（点已删列名不再改排序） | `test_sort_by_removed_column_is_ignored`、`test_sort_matches_counters_are_gone` |
+| 右键菜单只剩 编辑 / 删除 | `清零遇到次数` / `重置最后遇见时间` 两个菜单项与对应方法一起删掉 | `test_context_menu_has_no_counter_reset`、`test_right_click_menu_exists` |
+| 通知模板占位符同步 | `NOTIFICATION_PLACEHOLDERS` / `FIELD_PLACEHOLDERS` / `build_fields()` 去掉 `{player_id}` `{tk_count}` `{last_seen}`；老模板里写着它们也**不报错**，原样保留 | `test_removed_placeholders_are_kept_verbatim`、`test_all_placeholders` |
+| 导入导出只剩三个字段 | `IO_FIELDS` / `IMPORT_EXPORT_FIELDS` = `(player_name, note, created_at)`；唯一键改为**名字**（大小写不敏感）；老文件里的多余字段**一律无视** | `test_csv_header_has_only_three_fields`、`test_import_ignores_legacy_fields`、`test_import_same_name_case_insensitive_is_duplicate` |
+| **老库自动升级，名字不丢** | 首次打开检测到旧字段 → 建新表、把"名称栏为空"的条目用 `player_id` 补成名字、丢弃无名占位行（`-`）、`encounters` 清空、写 WARNING 说明保留/丢弃条数 | `TestLegacyMigration`（3 条，含幂等性） |
+| 真实数据实测 | 拿用户测试版库的**拷贝**跑升级：9 字段 → 4 字段；空名字的 `PlayerX` / `？` 补回名字；`encounters` 5 行 → 0；`PlayerX: asd PlayerX: ? PlayerX: PlayerY` 命中 `PlayerX` + `？` | 手工验证（原库未改动） |
+| **旧结构留底** | `tools/legacy_schema.py`：`--backup` 扫出所有旧结构库并复制到 `_packaged_data_backup/legacy_schema_backup/`（附 `schema_old.sql` + 空库模板 + git 导出的旧 `database.py`）；`--list` / `--restore` / `--downgrade` 分别用于查看、恢复、把新结构转回旧结构 | 6 步实测：空库字段/索引核对、6 份副本字段核对、`schema_old.sql` 建库核对、`--restore` 真跑（含保底改名）、`--downgrade` 后能被重新升级且名字不丢 |
+
+### 第七轮修复（实机反馈：`？` 漏检 / 界面看不见动态 / 自定义按键栏说谎）
+
+| 验收项 | 实现 | 测试 |
+|---|---|---|
+| **聊天里出现了 `？`，系统却不检测** | 真因在索引：用户把纯符号名 `？` 填进了**玩家ID**栏（添加对话框两栏挨着，很容易填错）。`reload()` 回退到 `player_id` 时**只看归一化结果**，而 `？` 归一化后是空串 → 条目被**静默丢弃**，索引条数比名单条数少 1。现在名字与 ID 都试一遍：ID 里是纯符号名同样进 `symbols` 符号层，并进 `name_allowlist()`（OCR 那侧才肯放行） | `TestSymbolNameStoredAsPlayerId` 全部 6 条：`test_index_count_matches_entry_count`、`test_symbol_in_id_column_is_indexed`、`test_check_matches_symbol_from_id_column`、`test_match_text_finds_both_symbol_and_normal_name`、`test_fullwidth_and_halfwidth_both_hit` |
+| 索引悄悄吞条目（用户只能看到"明明在名单里却不命中"） | 真的无法索引（名字与 ID 都空、历史库脏数据）时写 WARNING，不再静默 `continue` | `test_skipped_entry_is_reported`（`assertLogs("matcher")`） |
+| **按了 F8 没有任何界面反馈** | 热键路径以前完全不碰 GUI（只有按钮路径 `post()` 回主线程）。现在 `ChatScanner.on_result` 是唯一出口：**先发 `status="started"`（按下去立刻有反应），再发结果**；按钮与热键走同一条路 | `test_on_result_callback`、`test_scan_chat_now_calls_scanner`、`test_hotkey_scan_is_reported_with_key_name` |
+| 命中了却不说"是谁/去了重/写失败" | 扫描结果带上 `source / names / recorded / deduped`；`ScanScheduler.last_hit_stats`（`get_hit_stats()`）记录最近一批。结果文案分四种：已提示+已记录 / 全被去重跳过 / 部分去重 / 命中但全部写入失败 | `test_ok_result_carries_names_and_dedup_stats`、`test_all_deduped_result_is_visible`、`test_hotkey_scan_dedup_is_reported`、`test_hotkey_scan_failure_is_reported` |
+| 去重只有 `entry_id`，用户看不懂 | 去重日志/事件改成 `[Hit] 去重跳过 <名字> entry_id=… source=…`，事件流里是一句人话：「命中 X，但 30 秒内刚提示过 → 本次跳过」 | `test_dedup_is_announced_on_event_channel` |
+| **底部提示留不住痕迹**（一行提示转眼被下一条覆盖） | 状态栏上方新增「最近动态」事件流：`EVENT_ROWS = 3` 行、带 `HH:MM:SS` 时间戳、按级别着色（命中=绿 / 去重=金 / 失败=红）。`GUI.notify_event(text, level)` 追加，新事件在最上 | `test_notify_event_shows_timestamped_lines_newest_first`、`test_event_feed_keeps_only_the_last_rows`、`test_event_feed_is_empty_at_startup`、`test_chat_scan_result_lands_in_event_feed` |
+| 动态流不该重复播报同一次命中 | `handle_hits(..., notify_event=False)`：聊天框扫描自己会播报完整结果，调度层就不再塞一行；菜单/HUD 那条路没有"扫描结果"，仍然报 | `test_chat_scan_does_not_double_report_hits`、`test_esc_path_reports_hits_on_event_channel` |
+| 游戏启停 / 暂停 / 菜单扫描会话结束也要看得见 | `ScanScheduler.report(msg, level)` = 写日志 + 推事件；`on_event` 由 `app.application` 接到 `GUI.notify_event`（内部 `post()` 转主线程）。会话结束的播报带原因、耗时、识别名字数、命中次数 | `test_esc_path_reports_hits_on_event_channel` + `--check` |
+| **自定义按键栏显示「F8（未启用）」而顶部明明已启用** | 那个面板按**开机那一刻**的 `enabled` 渲染，之后再没人刷新过。新增 `HotkeyPanel.refresh_enabled()`，`GUI._sync_hotkey_ui()`（开关一变就调）与切到「扫描与触发」页时都会同步；嵌入模式下还会提示"总开关在主界面顶部" | `test_hotkey_panel_follows_top_toggle`、`test_hotkey_panel_disabled_hint_points_at_top_button` |
+| `except` 块里的异常对象被闭包进延迟回调 | 这轮把上报挪到回调之后踩到的坑：`lambda: … str(e)` 真正执行时 `e` 已被删除（Python 在 except 结束时清理）→ `NameError` 被 `_drain_once` 吞掉，界面永远停在"就绪"。改为先取出 `message = str(e)` 再闭包 | `test_scan_chat_scanner_exception_is_reported`（当场抓住；旧写法是"先存 dict 再 post"，所以一直没暴露） |
+
+### 第六轮改动（UI 重排：单页五段 + 去重 + 可拖拽分隔）
+
+| 验收项 | 实现 | 测试 |
+|---|---|---|
+| **菜单栏删除**，重复入口归零 | `_build_menu` 整个移除；`退出 / 打开数据目录 / 打开日志 / 使用说明 / 关于` 分别进 ① 和设置分页。原来「校准区域 / 通知设置 / 扫描聊天框 / 导出」都是菜单 + 工具栏各一份 | `test_no_menu_bar`、`test_duplicated_entries_are_gone` |
+| **重要开关提到主界面**：F8 开关 / 暂停 / 扫描 | ① 运行状态带：`[启用/停用 F8 扫描]`、`[暂停监控]`、`[扫描聊天框]`、`[退出]`；按钮文字写"动作"，金色 = 已启用 | `test_hotkey_toggle_button_reflects_state`、`test_hotkey_button_actually_toggles`、`test_settings_collapsed_by_default` |
+| **按钮在深色面板上看不出是按钮** | `TButton` 是 flat + 与 `Panel.TFrame` 同色 → 界面上就是一段文字，用户以为"根本没有这个按钮"。新增 `Bar.TButton`（比面板亮的底色 + 可见边框），① ② 和设置标签栏统一用它 | `test_hotkey_toggle_button_is_a_visible_button` |
+| **点热键按钮启动不了热键** | `_toggle_chat_hotkey` 读 `chat_hotkey_var`（菜单时代留给 Checkbutton 的），而按钮从不写它 → 每次点都提交"当前值"，永远开不起来。改成 `toggle_hotkey()` 自己取反 | `test_hotkey_button_actually_toggles`（真 `invoke()` 点按钮） |
+| **点暂停只会刷日志、暂停不上** | 同一个坑：`toggle_pause` 读 `pause_var` 而不是取反 → 每次点都发一次"恢复" | `test_pause_button_actually_toggles` |
+| **游戏没开时点暂停，灯变"监控中"** | 指示灯改为由 (游戏在跑, 用户暂停) **两个真值**渲染（`_render_monitor`），不再由最后一次调用决定 | `test_pause_does_not_fake_monitoring_light`、`test_monitor_light_green_only_when_game_runs_and_not_paused` |
+| 没开游戏却刷"监控已恢复" | `scheduler.set_paused(False)` 按 `game_active` 分别记日志：只有游戏在跑才叫"监控已恢复"，否则是"已取消用户暂停（当前游戏未运行，不会扫描）" | `test_unpausing_without_game_does_not_claim_monitoring` |
+| 测试收尾偶发 `Tcl_AsyncDelete` 进程 abort | GUI 测试 `tearDown` 里销毁窗口后 `gc.collect()`，让 Tk 对象在主线程析构 | 连续 3 次全量跑不再复现 |
+| 三行工具栏 → 两行（① 状态带 + ② 名单工具带） | ③ 名单 + ④ 设置分页装在 `tk.PanedWindow` 里，分隔条可拖；设置区**默认收起**成一条标签栏 | `test_toolbar_buttons_all_present`、`test_toggle_settings_expands_and_collapses` |
+| 设置收进同页分页：扫描与触发 / 通知 / 监视区域 / 数据 / 帮助 | 三个 Toplevel 拆成可嵌入的 `HotkeyPanel / NotificationPanel / CalibratorPanel`，`*Dialog` 留作兼容壳（`__getattr__` 转发，旧调用与测试不用改） | `test_hotkey_panel_embedded_in_scan_page`、`TestNotificationDialog` 全部保留 |
+| 展开高度按当前页内容自适应 | `_preferred_settings_height()`：内容高度 + 上限 60%；量不到尺寸时退回默认值（否则会瞬间塌掉） | `test_toggle_settings_expands_and_collapses` |
+| 分页内容再高也点得到底部的按钮 | `_ScrollArea`（竖向滚动容器，滚动条常驻；notify / help 的动作条放最上面） | `test_every_settings_page_scrolls_to_the_end` |
+| **修掉"按钮个个一样宽"** | Tk 8.6 的 ttk 按钮默认 `-width = -11`（固定 11 字符宽），与文字无关 —— 这是旧工具栏被迫排三行的真因。`theme.apply_theme()` 统一设 `width=0`（自适应） | `test_toolbar_buttons_are_not_squeezed`（最小宽度下按钮不能被压扁） |
+| 窗口默认 1280×820、最小 1060×640 | 原来的 1120×660 装不下「名单 + 展开的设置区」；1060 = 工具带自然宽度 + 余量 | `test_toolbar_fits_at_min_width` |
+| 托盘不再有第二套实现 | 托盘菜单项全部转发同一条命令（扫描 / 暂停 / 打开某个设置页） | 手工验证 + `_ensure_tray` |
+| 校准的框选仍是独立全屏窗口 | `RegionSelector` 不动（overrideredirect + 半透明 + 覆盖虚拟桌面）；页面里只放区域列表和 [框选新区域]，框选时临时最小化主窗口 | `TestCalibratorDialog`（全部保留） |
 
 ### 第五轮改动（自定义资源：默认目录 / 自动复制 / 音频放宽到 MP3）
 
@@ -1248,7 +1522,7 @@ OCR 判读又会认为它"不含字母数字"而不像玩家名。现在：
 | 暗色主题全局生效 | `theme.apply_theme`（clam + ttk 样式 + tk 默认色） | `test_ttk_styles_configured` |
 | 正文对比度足够（可读性） | 前景/背景 WCAG 对比度 > 7:1 | `test_foreground_contrasts_with_background` |
 | 命中闪烁在暗色下仍可见 | `flash = #6d2f2f` + clam 主题 | `test_treeview_supports_row_tags` |
-| 只改外观、不改行为 | 全部 350 个测试仍然通过 | 全量测试 |
+| 只改外观、不改行为 | 全部 550 个测试仍然通过 | 全量测试 |
 
 ### 功能（原有）
 
@@ -1313,7 +1587,7 @@ OCR 判读又会认为它"不含字母数字"而不像玩家名。现在：
 ## 18. 测试
 
 ```bat
-:: 全部（514 个用例）
+:: 全部（523 个用例）
 python -m unittest discover -s tests -v
 
 :: 分类

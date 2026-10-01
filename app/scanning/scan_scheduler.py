@@ -38,6 +38,9 @@ class ScanScheduler:
         self.game_active = threading.Event()
         self._paused = threading.Event()
         self.on_encounter = on_encounter
+        #: 「给用户看的动态」回调：on_event(text, level)。GUI 侧负责转到主线程。
+        #: 与 log() 分开是因为日志里有大量技术细节，而这里只推用户看得懂的句子。
+        self.on_event = None
         self.evidence_enabled = evidence_enabled
 
         self.logger = get_logger("scheduler")
@@ -45,6 +48,10 @@ class ScanScheduler:
         self._recent_lock = threading.Lock()
         self._hit_count_lock = threading.Lock()
         self.session_hit_count = 0
+        #: 最近一批命中的统计（界面播报用）：
+        #: {"total": 命中条数, "deduped": 被去重跳过, "recorded": 真正记录, "names": [...]}
+        self._stats_lock = threading.Lock()
+        self.last_hit_stats = {"total": 0, "deduped": 0, "recorded": 0, "names": []}
 
         self._active_session = None
         self._active_lock = threading.Lock()
@@ -56,21 +63,26 @@ class ScanScheduler:
     def set_game_active(self, active: bool) -> None:
         if active:
             self.game_active.set()
-            self.log("游戏已启动，监视已激活")
+            self.report("游戏已启动，监视已激活")
         else:
             self.game_active.clear()
             self.stop_session()
-            self.log("游戏已退出，监视已暂停")
+            self.report("游戏已退出，监视已暂停")
 
     def set_paused(self, paused: bool) -> None:
         """用户手动暂停监控（不影响 game_active 状态）。"""
         if paused:
             self._paused.set()
             self.stop_session()
-            self.log("监控已被用户暂停")
+            self.report("监控已被用户暂停（菜单/HUD 不再扫描）")
         else:
             self._paused.clear()
-            self.log("监控已恢复")
+            # 游戏没在跑的时候别喊"监控已恢复" —— 那会让人以为监控被打开了，
+            # 其实只是取消了一个用户开关（实测反馈：终端一直跳"监控已恢复"）。
+            if self.game_active.is_set():
+                self.report("监控已恢复")
+            else:
+                self.report("已取消用户暂停（当前游戏未运行，不会扫描）")
 
     def is_paused(self) -> bool:
         return self._paused.is_set()
@@ -120,7 +132,7 @@ class ScanScheduler:
     def _is_recently_hit(self, entry_id) -> bool:
         """同一玩家在 HIT_DEDUP_WINDOW 秒内是否已经计过数。
 
-        去重窗口内**既不计入 encounter_count，也不弹提示** —— 防止连点扫描
+        去重窗口内**既不记入 encounters，也不弹提示** —— 防止连点扫描
         按钮或反复触发导致重复计数。
         """
         now = time.time()
@@ -150,7 +162,7 @@ class ScanScheduler:
             return len(self._recent_hits)
 
     # ------------------------------------------------------------ 命中处理
-    def _process_hits(self, hits, source, img) -> list:
+    def _process_hits(self, hits, source, img, notify_event: bool = True) -> list:
         """命中处理流水线，返回 [(entry, score, updated), ...]。
 
         顺序严格为：
@@ -159,12 +171,17 @@ class ScanScheduler:
                "一部分标记了、一部分没标记"导致后续批量行为不一致）
             3. 逐个写证据 + 原子更新 DB + 通知 GUI
             4. 批量弹提示：多个通知栏，只播一次音效
+
+        ``notify_event=False``：调用方会自己播报完整结果（聊天框按需扫描就是
+        这样），此时不再往界面动态流里塞重复的行。统计照样记录。
         """
         if not hits:
+            self._set_hit_stats(0, 0, 0, [])
             return []
 
         # ---- 1. 过滤去重 ----
         passed = []
+        deduped_names = []
         for item in hits:
             entry = item[0]
             score = item[1]
@@ -172,12 +189,22 @@ class ScanScheduler:
             entry_id = entry.get("id")
             if entry_id is None:
                 continue
+            who = name_seen or entry.get("player_name") or "?"
             if self._is_recently_hit(entry_id):
-                self.log(f"[Hit] 去重跳过 entry_id={entry_id} source={source}")
+                # 去重也要说清楚是谁：旧日志只有 entry_id，用户看不懂"为什么没反应"
+                self.log(f"[Hit] 去重跳过 {who} entry_id={entry_id} source={source}")
+                if notify_event:
+                    self._emit(
+                        f"命中 {who}，但 {HIT_DEDUP_WINDOW} 秒内刚提示过 → "
+                        f"本次跳过（不重复计数、不重复弹窗）",
+                        "dedup",
+                    )
+                deduped_names.append(str(who))
                 continue
             passed.append((entry, score, name_seen))
 
         if not passed:
+            self._set_hit_stats(len(hits), len(deduped_names), 0, deduped_names)
             return []
 
         # ---- 2. 标记去重 ----
@@ -203,9 +230,9 @@ class ScanScheduler:
                 self.session_hit_count += 1
 
             self.log(
-                f"[Hit] {entry.get('player_name') or entry.get('player_id')} "
+                f"[Hit] {entry.get('player_name')} "
                 f"score={float(score or 0):.0f} source={source} "
-                f"累计={updated['encounter_count']}"
+                f"今日第{updated.get('today_count', 1)}次"
             )
 
             updated_list.append((entry, score, updated))
@@ -214,28 +241,41 @@ class ScanScheduler:
                 try:
                     self.on_encounter({
                         "entry_id": entry["id"],
-                        "player_id": entry.get("player_id"),
                         "player_name": entry.get("player_name"),
                         "note": entry.get("note") or "",
-                        "encounter_count": updated["encounter_count"],
-                        "last_seen": updated["last_seen"],
+                        "seen_at": updated.get("seen_at"),
+                        "today_count": updated.get("today_count", 1),
                         "score": score,
                         "source": source,
                     })
                 except Exception as e:                   # noqa: BLE001
                     self.logger.warning("[Scheduler] GUI 回调异常: %s", e)
 
+        recorded_names = [
+            str(e.get("player_name") or "?") for e, _s, _u in updated_list
+        ]
+        self._set_hit_stats(len(hits), len(deduped_names), len(updated_list),
+                            recorded_names + deduped_names)
+
         if not updated_list:
+            # 命中了但一条都没写进库（例如数据库被占用）—— 这同样要告诉用户，
+            # 否则界面上就是"按了 F8 什么都没发生"。
+            self.logger.warning("[Hit] 命中 %d 条但全部写入失败", len(hits))
+            if notify_event:
+                self._emit(f"命中 {len(hits)} 条，但全部写入失败（详见日志）",
+                           "warn")
             return []
 
         # 一次扫描命中多个玩家时，把**整批名字**打在一行里。
         # 之前只有逐条日志，用户很难确认"到底命中了谁、是不是只播了一个"。
+        names = "、".join(recorded_names)
         if len(updated_list) > 1:
-            names = "、".join(
-                str(e.get("player_name") or e.get("player_id") or "?")
-                for e, _s, _u in updated_list
-            )
             self.log(f"[Hit] 本批共命中 {len(updated_list)} 名黑名单玩家：{names}")
+            if notify_event:
+                self._emit(f"本批共命中 {len(updated_list)} 名黑名单玩家：{names}",
+                           "hit")
+        elif notify_event:
+            self._emit(f"命中黑名单玩家 {names}（已弹提示 + 已记录）", "hit")
 
         # ---- 4. 合并通知：多个通知栏 + 一次音效 ----
         try:
@@ -247,13 +287,16 @@ class ScanScheduler:
 
         return updated_list
 
-    def handle_hits(self, hits, source, img) -> int:
+    def handle_hits(self, hits, source, img, notify_event: bool = True) -> int:
         """批量命中处理（ChatScanner / 列表匹配调用）。
 
         hits: [(entry, score, name_seen), ...]
         返回实际计数并提示的条数。
+
+        ``notify_event=False`` 见 `_process_hits`：调用方自己播报结果。
         """
-        return len(self._process_hits(hits, source, img))
+        return len(self._process_hits(hits, source, img,
+                                      notify_event=notify_event))
 
     def handle_hit(self, entry, score, source, img, name_seen):
         """单条命中（兼容原接口）。
@@ -318,8 +361,7 @@ class ScanScheduler:
         try:
             os.makedirs(EVIDENCE_DIR, exist_ok=True)
             ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]
-            raw_name = (entry.get("player_name")
-                        or entry.get("player_id") or "unknown")
+            raw_name = entry.get("player_name") or "unknown"
             safe = _SAFE_NAME_RE.sub("_", str(raw_name))[:24] or "unknown"
             path = os.path.join(EVIDENCE_DIR, f"{ts}_{safe}_{int(score)}.jpg")
             img.convert("RGB").save(path, "JPEG",
@@ -355,6 +397,42 @@ class ScanScheduler:
     # ---------------------------------------------------------------- 日志
     def log(self, msg: str, level: str = "info") -> None:
         getattr(self.logger, level, self.logger.info)(msg)
+
+    def report(self, msg: str, level: str = "info") -> None:
+        """写日志 **并** 把这条动态推给界面（`on_event`）。
+
+        界面上那条「最近动态」就是靠它撑起来的：用户按下 F8、命中、被去重、
+        会话结束、游戏启动/退出……都要看得见，而不是只躺在日志文件里。
+        回调由 app 层接上（GUI 内部再转主线程），没接上时退化成纯日志。
+        """
+        try:
+            self.log(msg, level)
+        except TypeError:
+            # log 有时会被换成只收一个参数的替身（测试里就是 lines.append，
+            # 外部也可能这么包一层）。别让"播报"反过来把扫描线程搞崩。
+            self.log(msg)
+        self._emit(msg, level)
+
+    def _emit(self, msg: str, level: str = "info") -> None:
+        """只推界面动态流，不再写一遍日志。"""
+        cb = self.on_event
+        if cb is None:
+            return
+        try:
+            cb(msg, level)
+        except Exception as e:                           # noqa: BLE001
+            self.logger.warning("[Scheduler] 事件回调异常: %s", e)
+
+    def _set_hit_stats(self, total, deduped, recorded, names) -> None:
+        with self._stats_lock:
+            self.last_hit_stats = {"total": int(total), "deduped": int(deduped),
+                                   "recorded": int(recorded),
+                                   "names": list(names)}
+
+    def get_hit_stats(self) -> dict:
+        """最近一批命中的统计（ChatScanner 用它播报去重/记录结果）。"""
+        with self._stats_lock:
+            return dict(self.last_hit_stats)
 
     # ---------------------------------------------------------------- 关闭
     def shutdown(self) -> None:

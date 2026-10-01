@@ -8,6 +8,14 @@
     * [恢复默认]   —— 清除该区域的用户自定义
     * [实时预览]   —— 立即截图并显示该区域当前画面
 
+提供两层：
+    * ``CalibratorPanel``  —— 可嵌入任意容器的 Frame（主界面设置分页用它）
+    * ``CalibratorDialog`` —— 薄薄的 Toplevel 包装，保留给需要独立窗口的调用方
+
+注意：``RegionSelector``（全屏框选遮罩）**必须**是独立的全屏窗口 ——
+它要盖住整个虚拟桌面让用户在游戏画面上取景，没法嵌进页面里。
+页面里放的是「区域列表 + 框选按钮 + 预览」这些入口。
+
 所有 tkinter 操作都在主线程（本模块只由 GUI 主线程调用）。
 """
 from __future__ import annotations
@@ -129,26 +137,20 @@ class RegionSelector:
             pass
 
 
-class CalibratorDialog:
-    """区域校准对话框。"""
+class CalibratorPanel(ttk.Frame):
+    """区域校准面板（可嵌入）。"""
 
     def __init__(self, master, region_config: RegionConfig, capture,
-                 on_changed=None):
-        self.master = master
+                 on_changed=None, embedded=False):
+        super().__init__(master)
         self.region_config = region_config
         self.capture = capture
         self.on_changed = on_changed
+        self.embedded = bool(embedded)
         self.log = get_logger("calibrator")
         self._preview_img = None
         self._preview_win = None
-
-        self.top = tk.Toplevel(master)
-        self.top.title("校准监视区域")
-        self.top.transient(master)
-        self.top.configure(bg=theme.PALETTE["bg"])
-        theme.apply_window_icon(self.top)
-        self.top.resizable(False, False)
-        self.top.protocol("WM_DELETE_WINDOW", self.close)
+        self.top = self                      # 统一容器别名（历史代码用 self.top）
 
         self.key_var = tk.StringVar(value=RegionConfig.keys()[0])
         self.coords_var = tk.StringVar()
@@ -157,7 +159,6 @@ class CalibratorDialog:
 
         self._build()
         self._refresh()
-        self._center()
 
     # ---------------------------------------------------------------- 构建
     def _build(self):
@@ -191,8 +192,8 @@ class CalibratorDialog:
 
         btns = ttk.Frame(self.top)
         btns.pack(fill="x", **pad)
-        ttk.Button(btns, text="框选新区域", command=self.select_region
-                   ).pack(side="left", padx=4)
+        ttk.Button(btns, text="框选新区域", style="Accent.TButton",
+                   command=self.select_region).pack(side="left", padx=4)
         ttk.Button(btns, text="恢复默认", command=self.reset_region
                    ).pack(side="left", padx=4)
         ttk.Button(btns, text="恢复全部默认", command=self.reset_all
@@ -203,16 +204,15 @@ class CalibratorDialog:
         ttk.Label(self.top, textvariable=self.status_var,
                   style="Muted.TLabel").pack(fill="x", padx=12, pady=(0, 4))
 
-        bottom = ttk.Frame(self.top)
-        bottom.pack(fill="x", **pad)
-        ttk.Button(bottom, text="关闭", command=self.close).pack(side="right")
-
-    def _center(self):
-        self.top.update_idletasks()
-        w, h = self.top.winfo_width(), self.top.winfo_height()
-        x = self.master.winfo_rootx() + (self.master.winfo_width() - w) // 2
-        y = self.master.winfo_rooty() + (self.master.winfo_height() - h) // 2
-        self.top.geometry(f"+{max(0, x)}+{max(0, y)}")
+        if not self.embedded:
+            bottom = ttk.Frame(self.top)
+            bottom.pack(fill="x", **pad)
+            ttk.Button(bottom, text="关闭", command=self.close).pack(side="right")
+        else:
+            ttk.Label(self.top,
+                      text="框选时会临时最小化主窗口，方便你在游戏画面上取景。",
+                      style="Muted.TLabel", wraplength=560,
+                      justify="left").pack(fill="x", padx=12, pady=(0, 6))
 
     # ---------------------------------------------------------------- 状态
     def _current_key(self) -> str:
@@ -232,15 +232,18 @@ class CalibratorDialog:
     # ---------------------------------------------------------------- 操作
     def select_region(self):
         key = self._current_key()
-        self.top.withdraw()
-        self.top.update()
+        # 取景必须让开主窗口，否则用户看不到游戏画面（嵌入模式下就是主窗口本身）
+        win = self.winfo_toplevel()
+        win.withdraw()
+        win.update()
 
         def done(rect):
-            self.top.deiconify()
+            win.deiconify()
             try:
                 self.region_config.set(key, rect)
             except ValueError as e:
-                messagebox.showerror("保存失败", str(e), parent=self.top)
+                messagebox.showerror("保存失败", str(e),
+                                     parent=self.winfo_toplevel())
                 return
             self.status_var.set(
                 f"已保存 {RegionConfig.label(key)}："
@@ -250,10 +253,10 @@ class CalibratorDialog:
             self._notify_changed()
 
         def cancel():
-            self.top.deiconify()
+            win.deiconify()
             self.status_var.set("已取消框选")
 
-        self.top.after(200, lambda: RegionSelector(self.top, done, cancel))
+        self.after(200, lambda: RegionSelector(win, done, cancel))
 
     def reset_region(self):
         key = self._current_key()
@@ -266,7 +269,8 @@ class CalibratorDialog:
         self._notify_changed()
 
     def reset_all(self):
-        if not messagebox.askyesno("确认", "恢复全部区域为默认值？", parent=self.top):
+        if not messagebox.askyesno("确认", "恢复全部区域为默认值？",
+                                   parent=self.winfo_toplevel()):
             return
         self.region_config.reset_all()
         self._refresh()
@@ -276,13 +280,14 @@ class CalibratorDialog:
     def preview(self):
         key = self._current_key()
         if self.capture is None:
-            messagebox.showinfo("提示", "截图模块不可用", parent=self.top)
+            messagebox.showinfo("提示", "截图模块不可用",
+                                parent=self.winfo_toplevel())
             return
         img = self.capture.grab(key)
         if img is None:
             messagebox.showwarning("预览失败",
                                    "无法截取该区域，请确认坐标是否超出屏幕。",
-                                   parent=self.top)
+                                   parent=self.winfo_toplevel())
             return
         self._show_preview(key, img)
 
@@ -302,10 +307,10 @@ class CalibratorDialog:
 
         if self._preview_win is not None and self._preview_win.winfo_exists():
             self._preview_win.destroy()
-        win = tk.Toplevel(self.top)
+        win = tk.Toplevel(self.winfo_toplevel())
         self._preview_win = win
         win.title(f"预览 - {RegionConfig.label(key)}")
-        win.transient(self.top)
+        win.transient(self.winfo_toplevel())
         win.configure(bg=theme.PALETTE["bg"])
         tk.Label(win, bg=theme.PALETTE["bg"], fg=theme.PALETTE["fg"],
                  text=(f"{RegionConfig.label(key)}   "
@@ -323,11 +328,61 @@ class CalibratorDialog:
                 self.log.warning("on_changed 回调异常: %s", e)
 
     def close(self):
+        """对话框模式：关窗；嵌入模式：只收掉预览窗。"""
         if self._preview_win is not None:
             try:
                 self._preview_win.destroy()
             except tk.TclError:
                 pass
+            self._preview_win = None
+        if self.embedded:
+            self._refresh()
+            return
+        try:
+            self.winfo_toplevel().destroy()
+        except tk.TclError:
+            pass
+
+
+class CalibratorDialog:
+    """独立窗口版。保留给第三方 / 旧调用方。"""
+
+    def __init__(self, master, region_config: RegionConfig, capture,
+                 on_changed=None):
+        self.master = master
+        self.top = tk.Toplevel(master)
+        self.top.title("校准监视区域")
+        self.top.transient(master)
+        self.top.configure(bg=theme.PALETTE["bg"])
+        theme.apply_window_icon(self.top)
+        self.top.resizable(False, False)
+        self.top.protocol("WM_DELETE_WINDOW", self.close)
+
+        self.panel = CalibratorPanel(self.top, region_config, capture,
+                                     on_changed=on_changed, embedded=False)
+        self.panel.pack(fill="both", expand=True)
+        self._center()
+
+    def _center(self):
+        self.top.update_idletasks()
+        w, h = self.top.winfo_width(), self.top.winfo_height()
+        x = self.master.winfo_rootx() + (self.master.winfo_width() - w) // 2
+        y = self.master.winfo_rooty() + (self.master.winfo_height() - h) // 2
+        self.top.geometry(f"+{max(0, x)}+{max(0, y)}")
+
+    def __getattr__(self, name):
+        """把 coords_var / reset_region 之类的访问转发给内部面板。"""
+        panel = self.__dict__.get("panel")
+        if panel is not None:
+            return getattr(panel, name)
+        raise AttributeError(name)
+
+    def close(self):
+        """显式实现：protocol() 绑定时面板可能还没建好。"""
+        panel = self.__dict__.get("panel")
+        if panel is not None:
+            panel.close()
+            return
         try:
             self.top.destroy()
         except tk.TclError:

@@ -22,7 +22,7 @@ import numpy as np
 
 from app.config import (OCR_CONFIDENCE_MIN, SCAN_THREAD_PRIORITY,
                     SESSION_DIFF_TOLERANCE, SESSION_MAX_STATIC_FRAMES,
-                    SESSION_SKIP_UNCHANGED, get_logger)
+                    SESSION_SKIP_UNCHANGED, get_logger, scan_source_label)
 from app.core.matcher import fold as _fold_name
 from app.core.priority import low_priority
 
@@ -299,6 +299,27 @@ class ScanSession:
             self.logger.debug("[Session] 读取名字白名单失败: %s", e)
             return None
 
+    def _ocr_unavailable_reason(self) -> str:
+        """OCR 不可用时返回原因（可用 / 测试替身没有这个接口时返回空串）。"""
+        ocr = getattr(self.scheduler, "ocr", None)
+        if ocr is None:
+            return ""
+        reason = getattr(ocr, "unavailable_reason", None)
+        if isinstance(reason, str):
+            return reason
+        if callable(reason):
+            try:
+                return str(reason() or "")
+            except Exception:                            # noqa: BLE001
+                return ""
+        available = getattr(ocr, "available", True)
+        if callable(available):
+            try:
+                available = available()
+            except Exception:                            # noqa: BLE001
+                available = True
+        return "" if available else "OCR 引擎不可用"
+
     def _scan_once(self):
         """抓图 + OCR + 有效性过滤。
 
@@ -335,10 +356,20 @@ class ScanSession:
         last_new_name_time = None
         reason = "unknown"
         self.scheduler.register_session(self)
-        self.scheduler.log(
-            f"[Session] 开始 source={self.source} region={self.region_key} "
-            f"interval={self.interval}s max={self.max_duration}s"
+        self.scheduler.report(
+            f"开始扫描「{scan_source_label(self.source)}」"
+            f"（区域 {self.region_key}，每 {self.interval}s 一帧，"
+            f"最长 {self.max_duration}s）"
         )
+
+        # OCR 不可用就别扫了：抓屏 + 跑一遍空 OCR 只会烧 CPU，而且日志里
+        # 刷出一堆"识别 0 个名字"，看起来像匹配坏了（真实故障）。
+        ocr_reason = self._ocr_unavailable_reason()
+        if ocr_reason:
+            self.logger.error("[Session] 中止：%s", ocr_reason)
+            self.scheduler.report(f"扫描中止：{ocr_reason}", "warn")
+            self.scheduler.unregister_session(self)
+            return
 
         try:
             while not self._stop.is_set():
@@ -412,4 +443,11 @@ class ScanSession:
                 f"耗时={elapsed:.1f}s "
                 f"识别={len(self.seen_names)}个名字 命中={self.hit_count} "
                 f"静止跳过={self.skipped_frames}帧"
+            )
+            # 给界面一句人话总结：这一轮到底扫到了什么、为什么收工
+            self.scheduler.report(
+                f"「{scan_source_label(self.source)}」扫描结束：{reason}，"
+                f"耗时 {elapsed:.1f}s，识别 {len(self.seen_names)} 个名字，"
+                f"命中黑名单 {self.hit_count} 次",
+                "hit" if self.hit_count else "info",
             )

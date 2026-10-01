@@ -52,12 +52,26 @@ class OCREngine:
         self._load_lock = threading.Lock()
         self._call_lock = threading.Lock()
         self._failed = False
+        self._error = ""            # 不可用时的原因（给界面/自检看）
         self.last_elapse = 0.0
 
     # ------------------------------------------------------------ 模型加载
     @property
     def available(self) -> bool:
-        return not self._failed
+        """OCR 到底能不能用（会触发一次加载尝试，之后走缓存）。
+
+        ⚠ 以前这里只返回 `not self._failed`，而 `_failed` 要等第一次识别才
+        被置上 —— 于是"还没预热"和"真的不可用"分不出来，界面上那句
+        "扫描完成，识别 0 个名字"看起来就像功能坏了。
+        """
+        return self._ensure_engine() is not None
+
+    @property
+    def unavailable_reason(self) -> str:
+        """不可用的原因（可用时为空串），会尝试加载一次以便给出真实原因。"""
+        if self._ensure_engine() is not None:
+            return ""
+        return self._error or "OCR 引擎不可用"
 
     def _ensure_engine(self):
         if self._engine is not None or self._failed:
@@ -72,9 +86,11 @@ class OCREngine:
                     from rapidocr import RapidOCR
                 except ImportError as e:
                     self._failed = True
-                    self.log.error(
-                        "未安装 rapidocr-onnxruntime，OCR 功能不可用: %s", e
-                    )
+                    self._error = (
+                        f"缺少 rapidocr-onnxruntime（{e}）—— 源码运行时请用 "
+                        "`python main.py` 启动（会自动带上仓库里的 .pylibs），"
+                        "或直接使用打包好的 HD2Blacklist.exe")
+                    self.log.error("OCR 功能不可用：%s", self._error)
                     return None
             try:
                 try:
@@ -88,6 +104,7 @@ class OCREngine:
                 self.log.info("RapidOCR 初始化完成")
             except Exception as e:                       # noqa: BLE001
                 self._failed = True
+                self._error = f"RapidOCR 初始化失败：{e}"
                 self.log.exception("RapidOCR 初始化失败: %s", e)
                 return None
         return self._engine
