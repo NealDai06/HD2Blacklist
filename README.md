@@ -510,7 +510,7 @@ rapidfuzz）由 `main.py` 启动时自动加进 `sys.path`（`app/_bootstrap.py`
 | 情况 | 处理 |
 |---|---|
 | 名称栏有名字 | 名字与备注原样保留 |
-| 名称栏为空、玩家ID栏有值（`PlayerX`、`？` 这类填错栏的） | **用玩家ID补成名字**，不丢条目 |
+| 名称栏为空、玩家ID栏有值（名字被填进了 ID 栏，例如 `？`） | **用玩家ID补成名字**，不丢条目 |
 | 名称栏与玩家ID栏都空（老占位行 `-`） | 丢弃，并在日志里写明丢了几条 |
 | 同名条目 | 只留第一条 |
 | `encounters` 里的历史命中记录 | **清空**（用户明确要求"历史统计一并清空"） |
@@ -983,8 +983,8 @@ python build.py --clean --keep-data  :: 保留产物里已有的 data/（开发�
 `../_packaged_data_backup/packaged_<时间戳>/`（只搬不删，万一要找回旧名单）。
 需要保留（开发自用）就加 `--keep-data`。
 
-> 仓库里也做过一次隐私清理：早期文档/测试里用过真实玩家名当例子
-> （`PlayerX` / `playery`，来自本机名单与真实 OCR 截图），已全部换成中性占位符
+> 仓库里也做过一次隐私清理：早期文档/测试里用过**真实玩家名**当例子
+> （来自本机名单与真实 OCR 截图），已全部换成中性占位符
 > （`PlayerX` / `PlayerY`）。`LICENSE` 与 `使用说明.txt` 里的 `NealDai06`
 > 是作者署名，保留。
 
@@ -1395,7 +1395,7 @@ OCR 判读又会认为它"不含字母数字"而不像玩家名。现在：
 | 通知模板占位符同步 | `NOTIFICATION_PLACEHOLDERS` / `FIELD_PLACEHOLDERS` / `build_fields()` 去掉 `{player_id}` `{tk_count}` `{last_seen}`；老模板里写着它们也**不报错**，原样保留 | `test_removed_placeholders_are_kept_verbatim`、`test_all_placeholders` |
 | 导入导出只剩三个字段 | `IO_FIELDS` / `IMPORT_EXPORT_FIELDS` = `(player_name, note, created_at)`；唯一键改为**名字**（大小写不敏感）；老文件里的多余字段**一律无视** | `test_csv_header_has_only_three_fields`、`test_import_ignores_legacy_fields`、`test_import_same_name_case_insensitive_is_duplicate` |
 | **老库自动升级，名字不丢** | 首次打开检测到旧字段 → 建新表、把"名称栏为空"的条目用 `player_id` 补成名字、丢弃无名占位行（`-`）、`encounters` 清空、写 WARNING 说明保留/丢弃条数 | `TestLegacyMigration`（3 条，含幂等性） |
-| 真实数据实测 | 拿用户测试版库的**拷贝**跑升级：9 字段 → 4 字段；空名字的 `PlayerX` / `？` 补回名字；`encounters` 5 行 → 0；`PlayerX: asd PlayerX: ? PlayerX: PlayerY` 命中 `PlayerX` + `？` | 手工验证（原库未改动） |
+| 真实数据实测 | 拿用户测试版库的**拷贝**跑升级：9 字段 → 4 字段；名称栏为空（名字填在 ID 栏）的条目补回名字；`encounters` 5 行 → 0；一行里同时出现普通名字与 `？` 时两条都命中 | 手工验证（原库未改动） |
 | **旧结构留底** | `tools/legacy_schema.py`：`--backup` 扫出所有旧结构库并复制到 `_packaged_data_backup/legacy_schema_backup/`（附 `schema_old.sql` + 空库模板 + git 导出的旧 `database.py`）；`--list` / `--restore` / `--downgrade` 分别用于查看、恢复、把新结构转回旧结构 | 6 步实测：空库字段/索引核对、6 份副本字段核对、`schema_old.sql` 建库核对、`--restore` 真跑（含保底改名）、`--downgrade` 后能被重新升级且名字不丢 |
 
 ### 第七轮修复（实机反馈：`？` 漏检 / 界面看不见动态 / 自定义按键栏说谎）

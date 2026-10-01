@@ -17,7 +17,7 @@ v1.1.2 把名单表简化成 `(id, player_name, note, created_at)`，删掉了
     python tools/legacy_schema.py --list
 
     # 3. 恢复某一份回去（目标会被先改名成 xxx.before_restore_<时间戳>）
-    python tools/legacy_schema.py --restore 测试版_PlayerX \
+    python tools/legacy_schema.py --restore extracted_data \
         --to "..\\发布包\\HD2Blacklist\\data\\blacklist.db"
 
     # 4. 把已经被升级过的新结构库变回旧结构（player_id/统计字段填默认值）

@@ -142,7 +142,7 @@ class BlacklistDB:
                 self.conn.execute(_BLACKLIST_DDL)
                 for _id, pid, pname, note, created in rows:
                     # 名称栏为空的老条目用 player_id 补名字 —— 那多半就是
-                    # 用户填错栏的名字（`？`、`PlayerX` 这种），不能丢。
+                    # 用户填错栏的名字（`？` 这种），不能丢。
                     name = (pname or "").strip() or (pid or "").strip()
                     if not name or name == "-" or name in seen:
                         dropped += 1

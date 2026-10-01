@@ -700,7 +700,7 @@ class TestLegacyMigration(TempCase):
             "INSERT INTO blacklist (player_id, player_name, note, tk_count, "
             "encounter_count, created_at, last_seen) VALUES (?,?,?,?,?,?,?)",
             [
-                ("PlayerX", "", "名字填在ID栏", 0, 5, "2026-01-01 10:00:00",
+                ("PlayerZ", "", "名字填在ID栏", 0, 5, "2026-01-01 10:00:00",
                  "2026-01-02 10:00:00"),
                 ("？", "", "", 0, 0, "2026-01-01 11:00:00", None),
                 ("76561198000000001", "PlayerX", "正常条目", 2, 7,
@@ -710,7 +710,7 @@ class TestLegacyMigration(TempCase):
         )
         conn.execute(
             "INSERT INTO encounters (blacklist_id, name_seen, match_score, "
-            "source, screenshot_path, seen_at) VALUES (1,'PlayerX',100,'chat',"
+            "source, screenshot_path, seen_at) VALUES (1,'PlayerZ',100,'chat',"
             "'a.jpg','2026-01-02 10:00:00')")
         conn.commit()
         conn.close()
@@ -724,11 +724,11 @@ class TestLegacyMigration(TempCase):
             self.assertEqual(cols, {"id", "player_name", "note", "created_at"})
             names = sorted(r["player_name"] for r in db.get_all())
             # 名称栏为空的条目用 player_id 补名字；没有名字的占位行丢弃
-            self.assertEqual(names, ["PlayerX", "PlayerX", "？"])
+            self.assertEqual(names, ["PlayerX", "PlayerZ", "？"])
             # 备注与添加时间保留
             by_name = {r["player_name"]: r for r in db.get_all()}
-            self.assertEqual(by_name["PlayerX"]["note"], "名字填在ID栏")
-            self.assertEqual(by_name["PlayerX"]["created_at"],
+            self.assertEqual(by_name["PlayerZ"]["note"], "名字填在ID栏")
+            self.assertEqual(by_name["PlayerZ"]["created_at"],
                              "2026-01-01 10:00:00")
             # 历史统计一并清空
             self.assertEqual(db.get_total_encounter_count(), 0)
@@ -955,7 +955,7 @@ class TestSymbolNames(TempCase):
 class TestSymbolAndNormalNamesTogether(TempCase):
     """一行里同时出现普通名字与纯符号名字时，**两条都要报**。
 
-    回归：用户实测「聊天里明明出现了 `？`，却只报了 PlayerX」。除了索引问题，
+    回归：用户实测「聊天里明明出现了 `？`，却只报了另一个名字」。除了索引问题，
     还要确认匹配本身不会"报了一个就收工"。
     """
 
@@ -985,7 +985,7 @@ class TestSymbolAndNormalNamesTogether(TempCase):
         self.assertEqual(hits[0][1], 100.0)
 
     def test_match_text_finds_both_symbol_and_normal_name(self):
-        hits = self.matcher.match_text("PlayerX: asd PlayerX: ? PlayerX: PlayerY")
+        hits = self.matcher.match_text("PlayerX: asd PlayerX: ? PlayerY")
         self.assertEqual({h[0]["player_name"] for h in hits}, {"PlayerX", "？"})
 
     def test_fullwidth_and_halfwidth_both_hit(self):
