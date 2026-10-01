@@ -324,7 +324,7 @@ rapidfuzz）由 `main.py` 启动时自动加进 `sys.path`（`app/_bootstrap.py`
 
 ```
 ┌ ① 运行状态带 ─────────────────────────────────────────────────────┐
-│ [图标] HD2 黑名单 v1.1.2  ● 监控中   [启用 F8 扫描] │ [扫描聊天框] [暂停监控] [退出] │
+│ [图标] HD2 黑名单 v1.1.3  ● 监控中   [启用 F8 扫描] │ [扫描聊天框] [暂停监控] [退出] │
 ├ ② 名单工具带 ─────────────────────────────────────────────────────┤
 │ [添加][编辑][删除] │ 搜索[__] 搜索 清空（按名称/备注）│ 排序[__]↓ │ [导入][导出] │
 ├ ③ 名单主区（占满剩余高度）─────────────────────────────────────────┤
@@ -832,7 +832,7 @@ Helldiver_black/                     ← 工作区（不是一个 git 仓库）
 ├── 发布包/                           ← 打包 / 分发产物（不在仓库里）
 │   ├── HD2Blacklist/                文件夹版产物（build.py 输出，含 data/）
 │   ├── 解压版/HD2Blacklist/         发布压缩包解开后的样子（实测用）
-│   ├── HD2Blacklist-v1.1.2-win64.rar  发给别人的压缩包
+│   ├── HD2Blacklist-v1.1.3-win64.rar  发给别人的压缩包
 │   └── 使用说明.txt / LICENSE.txt    build.py 自动从仓库复制过来
 │
 └── _packaged_data_backup/           ⚠ 历次打包前的用户数据备份（别删）
@@ -963,7 +963,7 @@ python build.py --clean --keep-data  :: 保留产物里已有的 data/（开发�
 │   └── LICENSE.txt                      ← build.py 自动复制
 ├── 解压版/HD2Blacklist/                 发布压缩包解开后的样子（自己实测用）
 ├── HD2Blacklist.exe                     单文件版（120 MB，启动 ~10s，可选）
-├── HD2Blacklist-v1.1.2-win64.rar        发布压缩包（发给别人用这个）
+├── HD2Blacklist-v1.1.3-win64.rar        发布压缩包（发给别人用这个）
 └── 使用说明.txt / LICENSE.txt            顶层再放一份，翻目录时一眼可见
 ```
 
@@ -977,7 +977,7 @@ python build.py --clean --keep-data  :: 保留产物里已有的 data/（开发�
 | `blacklist.db` / `notification.json` / `user_config.json` / `hotkey.json` | 不复制；程序首次运行自己生成默认值 |
 | `logs/` `evidence/` 里的东西 | 不复制，打包后再扫一遍强制清空 |
 | `data/assets/` 里除三个图标以外的文件（你自己的图片 / MP3） | 不复制，打包后强制删除 |
-| exe 里的版本属性 | 由 `build.py` 按 `config.VERSION` 写入（`FileDescription` = `HD2 黑名单 v1.1.2`） |
+| exe 里的版本属性 | 由 `build.py` 按 `config.VERSION` 写入（`FileDescription` = `HD2 黑名单 v1.1.3`） |
 
 `--clean` 时旧产物里的 `data/` **不会**被带进新产物，而是**整体备份**到
 `../_packaged_data_backup/packaged_<时间戳>/`（只搬不删，万一要找回旧名单）。
