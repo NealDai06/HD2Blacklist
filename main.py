@@ -8,13 +8,14 @@
 用法：
     python main.py                      正常启动 GUI
     python main.py --check              环境自检（逐项 OK/FAIL）
-    python main.py --capture-debug      抓三个监视区域 + OCR，输出调试图
+    python main.py --watch-debug        前台实时打印插件日志的每一行
+    python main.py --replay 日志文件     离线回放一份日志（不写库，只看结论）
     python main.py --preview-notification   离线渲染一张通知预览图
     python main.py --debug              打开 DEBUG 日志
 
 **不需要**先设 PYTHONPATH：仓库根与自带的依赖目录都会在这里补上
-（见 app/_bootstrap.py —— 少了这一步就会出现"OCR 不可用 → 扫描永远
-识别 0 个名字"的假故障）。
+（见 app/_bootstrap.py —— 少了这一步就会出现"提示浮层画不出来 / 匹配退化"
+这类看起来毫无道理的静默故障）。
 
 PyInstaller 也以本文件为入口（见 build.py），
 `from app.application import ...` 会被静态分析顺着收进包里。

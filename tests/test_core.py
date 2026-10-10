@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
-"""阶段 1-3 验收测试：config / region / keyword / notification / database / matcher.
+"""阶段 1-3 验收测试：config / 通知配置 / 数据库 / 匹配器 / 插件日志解析。
 
-运行： python -m unittest discover -s tests -v
+运行： python -m unittest discover -s tests -t tests
 """
 from __future__ import annotations
 
@@ -18,10 +18,12 @@ if _ROOT not in sys.path:
     sys.path.insert(0, _ROOT)
 
 from app import config  # noqa: E402
-from app.core.database import BlacklistDB                # noqa: E402
+from app.core.database import (BlacklistDB, PREV_NAME_LIMIT,   # noqa: E402
+                               dump_prev_names, format_prev_names,
+                               normalize_peer_id, parse_prev_names,
+                               push_prev_name)
 from app.core.matcher import Matcher                     # noqa: E402
 from app.settings.notification_config import NotificationConfig, ensure_notification_file  # noqa: E402
-from app.settings.region_config import RegionConfig          # noqa: E402
 
 TMP_ROOT = os.path.join(_ROOT, ".test_tmp")
 
@@ -55,26 +57,49 @@ class TestConfig(TempCase):
             self.assertTrue(os.path.isdir(d), d)
 
     def test_no_deleted_constants(self):
-        """已删除的旧常量不应存在（含本轮改造删掉的聊天框/关键词常量）。"""
+        """已删除的旧常量不应存在（含本轮 v2 改造删掉的抓屏/OCR/热键常量）。"""
         for name in ("FALLBACK_INTERVAL", "FALLBACK_SESSION", "HOTKEY_VK",
                      "HOTKEY_SESSION", "CHAT_SESSION",
-                     # 本轮改造：聊天框改按需扫描后删掉的
                      "CHAT_POLL_INTERVAL", "CHAT_FULL_SCAN_INTERVAL",
                      "CHAT_HASH_SIZE", "CHAT_TEXT_HASH_CACHE_SIZE",
                      "NOTIFY_THROTTLE_SECONDS",
-                     "DEFAULT_KEYWORDS", "KEYWORDS_PATH"):
+                     "DEFAULT_KEYWORDS", "KEYWORDS_PATH",
+                     # v2：抓屏 + OCR + 区域 + 热键 + 进程监控 全部下线
+                     "DEFAULT_REGIONS", "REGION_META", "REGION_MIN_SIZE",
+                     "HOTKEY_PATH", "DEFAULT_HOTKEY",
+                     "CHAT_SCAN_REGION_KEY", "CHAT_SCAN_SOURCE",
+                     "CHAT_SCAN_HOTKEY_SOURCE", "CHAT_SCAN_HOTKEY_ENABLED",
+                     "CHAT_SCAN_HOTKEY_VK", "SCAN_SOURCE_LABELS",
+                     "ESC_POLL_INTERVAL", "ESC_SESSION", "ESC_MENU_MEAN_MAX",
+                     "COLD_START_DELAY", "COLD_START_SESSION",
+                     "SESSION_SKIP_UNCHANGED", "SESSION_MAX_STATIC_FRAMES",
+                     "OCR_UPSCALE", "OCR_CONFIDENCE_MIN",
+                     "EVIDENCE_DIR", "EVIDENCE_JPEG_FILES",
+                     "EVIDENCE_MAX_FILES", "SCAN_THREAD_PRIORITY",
+                     "TARGET_PROCESS_NAMES"):
             self.assertFalse(hasattr(config, name), name)
 
-    def test_new_chat_and_dedup_constants(self):
+    def test_watch_constants(self):
+        """v2 的数据来源常量必须齐全。"""
         self.assertEqual(config.HIT_DEDUP_WINDOW, 30)
-        self.assertIs(config.CHAT_SCAN_HOTKEY_ENABLED, False)
-        self.assertEqual(config.CHAT_SCAN_HOTKEY_VK, 0x77)   # F8
-        self.assertGreaterEqual(config.MAX_NOTIFY_STACK, 1)
+        self.assertGreaterEqual(config.WATCH_POLL_INTERVAL, 0.1)
+        self.assertGreaterEqual(config.WATCH_TAIL_MAX_LINES, 100)
+        self.assertEqual(config.WATCH_THREAD_PRIORITY, "lowest")
+        self.assertIn("join", config.ALERT_EVENTS)
+        self.assertNotIn("squad", config.ALERT_EVENTS)   # 快照绝不触发告警
+        self.assertEqual(config.PLAYER_LOG_NAME, "playerLog.txt")
+        self.assertTrue(config.player_log_path().endswith("playerLog.txt"))
+        self.assertTrue(os.path.isabs(config.player_log_path()))
         # 保留项
-        for name in ("ESC_POLL_INTERVAL", "ESC_SESSION", "COLD_START_DELAY",
-                     "COLD_START_SESSION", "MATCH_THRESHOLD",
-                     "OCR_CONFIDENCE_MIN"):
+        for name in ("MATCH_THRESHOLD", "MATCH_SYMBOL_NAMES",
+                     "MATCH_FUZZY_CONFUSABLE", "MAX_NOTIFY_STACK",
+                     "GAME_FRIENDLY_PRIORITY", "PROCESS_PRIORITY"):
             self.assertTrue(hasattr(config, name), name)
+
+    def test_alert_source_label(self):
+        self.assertIn("PeerID", config.alert_source_label("peer_join"))
+        self.assertEqual(config.alert_source_label(""), "")
+        self.assertEqual(config.alert_source_label("unknown", "兜底"), "兜底")
 
 
 # ==========================================================================
@@ -135,115 +160,20 @@ class TestBundledAssetSeeding(TempCase):
     def test_ensure_dirs_creates_everything(self):
         base = self.path("fresh")
         data = os.path.join(base, "data")
-        old = (config.DATA_DIR, config.ASSETS_DIR, config.EVIDENCE_DIR,
+        old = (config.DATA_DIR, config.ASSETS_DIR,
                config.LOG_DIR, config.DIRECTORIES)
         config.DATA_DIR = data
         config.ASSETS_DIR = os.path.join(data, "assets")
-        config.EVIDENCE_DIR = os.path.join(data, "evidence")
         config.LOG_DIR = os.path.join(data, "logs")
         config.DIRECTORIES = (config.DATA_DIR, config.ASSETS_DIR,
-                              config.EVIDENCE_DIR, config.LOG_DIR)
+                              config.LOG_DIR)
         try:
             config.ensure_dirs()
         finally:
-            (config.DATA_DIR, config.ASSETS_DIR, config.EVIDENCE_DIR,
+            (config.DATA_DIR, config.ASSETS_DIR,
              config.LOG_DIR, config.DIRECTORIES) = old
-        for sub in ("", "assets", "evidence", "logs"):
+        for sub in ("", "assets", "logs"):
             self.assertTrue(os.path.isdir(os.path.join(data, sub)), sub)
-
-
-# ==========================================================================
-class TestRegionConfig(TempCase):
-    def setUp(self):
-        super().setUp()
-        self.cfg = RegionConfig(self.path("user_config.json"))
-
-    def test_defaults_when_no_file(self):
-        self.assertEqual(self.cfg.get("chat_event"),
-                         config.DEFAULT_REGIONS["chat_event"])
-        self.assertFalse(self.cfg.is_customized("chat_event"))
-        self.assertEqual(self.cfg.source_of("chat_event"), "default")
-        self.assertEqual(len(self.cfg.get_all()), 3)
-
-    def test_set_persist_and_reload(self):
-        self.cfg.set("chat_event", {"left": 1, "top": 2, "width": 30, "height": 40})
-        self.assertTrue(self.cfg.is_customized("chat_event"))
-        self.assertEqual(self.cfg.get("chat_event")["width"], 30)
-        again = RegionConfig(self.path("user_config.json"))
-        self.assertEqual(again.get("chat_event"),
-                         {"left": 1, "top": 2, "width": 30, "height": 40})
-
-    def test_reset_single_and_all(self):
-        self.cfg.set("chat_event", {"left": 1, "top": 2, "width": 30, "height": 40})
-        self.cfg.set("player_list_hud", {"left": 5, "top": 6, "width": 70, "height": 80})
-        self.cfg.reset("chat_event")
-        self.assertEqual(self.cfg.get("chat_event"), config.DEFAULT_REGIONS["chat_event"])
-        self.assertTrue(self.cfg.is_customized("player_list_hud"))
-        self.cfg.reset_all()
-        self.assertFalse(self.cfg.is_customized("player_list_hud"))
-
-    def test_defaults_have_no_size_warning(self):
-        self.assertEqual(self.cfg.warnings(), [])
-
-    def test_region_size_warning(self):
-        """区域被框成几个像素 → 永远识别不到东西，必须给出告警。
-
-        真实案例：HUD 玩家列表被误框成 10x13 像素。
-        """
-        self.cfg.set("player_list_hud", {"left": 1603, "top": 571,
-                                         "width": 10, "height": 13})
-        warns = self.cfg.warnings()
-        self.assertEqual(len(warns), 1)
-        self.assertIn("10x13", warns[0])
-        self.assertIn("HUD", warns[0])
-        # 改回一个合理尺寸后告警消失
-        self.cfg.set("player_list_hud", {"left": 100, "top": 200,
-                                         "width": 400, "height": 120})
-        self.assertEqual(self.cfg.warnings(), [])
-
-    def test_region_warnings_helper_handles_garbage(self):
-        from app.settings.region_config import region_warnings
-        self.assertEqual(region_warnings({}), [])
-        self.assertEqual(region_warnings({"chat_event": None}), [])
-        self.assertEqual(region_warnings({"chat_event": {"width": "x"}}), [])
-
-    def test_reject_bad_input(self):
-        with self.assertRaises(KeyError):
-            self.cfg.get("nope")
-        with self.assertRaises(KeyError):
-            self.cfg.set("nope", {"left": 0, "top": 0, "width": 1, "height": 1})
-        with self.assertRaises(ValueError):
-            self.cfg.set("chat_event", {"left": 0, "top": 0, "width": 1})
-        with self.assertRaises(ValueError):
-            self.cfg.set("chat_event", {"left": 0, "top": 0, "width": 0, "height": 10})
-        with self.assertRaises(ValueError):
-            self.cfg.set("chat_event", {"left": "x", "top": 0, "width": 10, "height": 10})
-
-    def test_set_rect_normalizes_negative_drag(self):
-        r = self.cfg.set_rect("chat_event", 100, 100, -40, -30)
-        self.assertEqual(r, {"left": 60, "top": 70, "width": 40, "height": 30})
-
-    def test_corrupt_file_falls_back(self):
-        with open(self.path("user_config.json"), "w", encoding="utf-8") as f:
-            f.write("{ this is not json")
-        cfg = RegionConfig(self.path("user_config.json"))
-        self.assertEqual(cfg.get("chat_event"), config.DEFAULT_REGIONS["chat_event"])
-
-    def test_reads_file_saved_with_bom(self):
-        """记事本另存的 user_config.json（带 BOM）不能被当成损坏配置。"""
-        with open(self.path("user_config.json"), "w", encoding="utf-8-sig") as f:
-            json.dump({"regions": {"chat_event": {"left": 11, "top": 22,
-                                                  "width": 33, "height": 44}}}, f)
-        cfg = RegionConfig(self.path("user_config.json"))
-        self.assertEqual(cfg.get("chat_event"),
-                         {"left": 11, "top": 22, "width": 33, "height": 44})
-
-    def test_unknown_keys_in_file_ignored(self):
-        with open(self.path("user_config.json"), "w", encoding="utf-8") as f:
-            json.dump({"regions": {"ghost": {"left": 0, "top": 0,
-                                             "width": 9, "height": 9}}}, f)
-        cfg = RegionConfig(self.path("user_config.json"))
-        self.assertEqual(len(cfg.get_all()), 3)
 
 
 # ==========================================================================
@@ -389,13 +319,14 @@ class TestDatabase(TempCase):
         self.assertTrue(row["created_at"])
 
     def test_no_legacy_fields_anymore(self):
-        """玩家ID / TK次数 / 遇到次数 / 最后遇见 必须彻底消失。"""
+        """TK次数 / 遇到次数 / 最后遇见 必须彻底消失（peer_id 是 v2 新增的系统列）。"""
         row = self.db.get(self.db.add("PlayerX"))
         for gone in ("player_id", "tk_count", "encounter_count", "last_seen"):
             self.assertNotIn(gone, row)
         cols = {r[1] for r in
                 self.db.conn.execute("PRAGMA table_info(blacklist)")}
-        self.assertEqual(cols, {"id", "player_name", "note", "created_at"})
+        self.assertEqual(cols, {"id", "player_name", "note", "peer_id",
+                                "prev_names", "created_at"})
 
     def test_unique_constraint(self):
         self.db.add("Name1")
@@ -421,13 +352,184 @@ class TestDatabase(TempCase):
             self.db.update(eid, player_name="  ")
         self.assertEqual(self.db.get(eid)["player_name"], "Name1")
 
-    def test_delete_cascades_encounters(self):
-        eid = self.db.add("Name1")
-        self.db.record_encounter(eid, 100.0, "chat", "Name1", "")
-        self.assertEqual(len(self.db.get_encounters(eid)), 1)
-        self.assertTrue(self.db.delete(eid))
-        self.assertIsNone(self.db.get(eid))
-        self.assertEqual(self.db.get_total_encounter_count(), 0)
+    def test_peer_id_is_stored_and_normalized(self):
+        eid = self.db.add("Name1", peer_id="aabbccdd00112233")
+        self.assertEqual(self.db.get(eid)["peer_id"], "AABBCCDD00112233")
+
+    def test_peer_id_is_optional(self):
+        """没有 PeerID 的条目：只能按名字识别，而且不会告警。"""
+        eid = self.db.add("Legacy")
+        self.assertEqual(self.db.get(eid)["peer_id"], "")
+
+    # ------------------------------------------------------ 身份 = PeerID
+    def test_same_peer_id_updates_name_instead_of_adding(self):
+        """同一个人改了名字 → 还是那一条，只更新名字。"""
+        eid = self.db.add("老王", peer_id="AABBCCDD00112233")
+        again = self.db.add("老王改名了", peer_id="aabbccdd00112233")
+        self.assertEqual(again, eid)                    # 同一条
+        self.assertEqual(self.db.get_count(), 1)
+        self.assertEqual(self.db.get(eid)["player_name"], "老王改名了")
+
+    def test_rename_keeps_existing_note(self):
+        """改名时备注留空 = 别动我原来写的备注。"""
+        eid = self.db.add("老王", "故意TK", peer_id="AABBCCDD00112233")
+        self.db.add("老王改名了", "", peer_id="AABBCCDD00112233")
+        self.assertEqual(self.db.get(eid)["note"], "故意TK")
+        # 但真的填了备注就按填的来
+        self.db.add("老王又改名", "这次是别的", peer_id="AABBCCDD00112233")
+        self.assertEqual(self.db.get(eid)["note"], "这次是别的")
+
+    def test_same_name_different_peer_id_keeps_both(self):
+        """同名、不同 PeerID = 两个人 → 各留一条。"""
+        a = self.db.add("PlayerX", peer_id="AABBCCDD00112233")
+        b = self.db.add("PlayerX", peer_id="1111222233334444")
+        self.assertNotEqual(a, b)
+        self.assertEqual(self.db.get_count(), 2)
+        self.assertEqual(sorted(e["peer_id"] for e in self.db.get_all()),
+                         ["1111222233334444", "AABBCCDD00112233"])
+
+    def test_named_entry_coexists_with_same_name_peer_entry(self):
+        """没 ID 的「老王」和有 ID 的「老王」也算两个人（ID 不同）。"""
+        self.db.add("老王")
+        self.db.add("老王", peer_id="AABBCCDD00112233")
+        self.assertEqual(self.db.get_count(), 2)
+
+    def test_two_entries_without_peer_id_must_differ_by_name(self):
+        """两条都没 ID 时，名字就是身份 —— 同名必须挡住，否则分不清谁是谁。"""
+        self.db.add("老王")
+        with self.assertRaises(ValueError):
+            self.db.add("老王")
+        with self.assertRaises(ValueError):
+            self.db.add("老王", peer_id="")             # 空串等于没有
+        self.assertEqual(self.db.get_count(), 1)
+
+    def test_unique_index_allows_duplicate_names(self):
+        """约束本身也是这么定的：唯一索引只看 PeerID（无 ID 的才看名字）。"""
+        self.db.add("Homer", peer_id="AABBCCDD00112233")
+        self.db.add("Homer", peer_id="1111222233334444")     # 不该被索引拦住
+        self.assertEqual(self.db.get_count(), 2)
+
+    def test_set_peer_id_fills_and_clears(self):
+        eid = self.db.add("A")
+        self.assertTrue(self.db.set_peer_id(eid, "AABBCCDD00112233"))
+        self.assertEqual(self.db.get(eid)["peer_id"], "AABBCCDD00112233")
+        self.assertTrue(self.db.set_peer_id(eid, ""))
+        self.assertEqual(self.db.get(eid)["peer_id"], "")
+
+    # ------------------------------------------------------ 名字自动同步
+    def test_rename_by_peer_id(self):
+        eid = self.db.add("老名字", "备注留着", peer_id="AABBCCDD00112233")
+        self.assertEqual(self.db.rename_by_peer_id("aabbccdd00112233", "新名字"),
+                         "老名字")                     # 返回旧名字
+        row = self.db.get(eid)
+        self.assertEqual(row["player_name"], "新名字")
+        self.assertEqual(row["note"], "备注留着")        # 别的字段一个不动
+        self.assertEqual(row["peer_id"], "AABBCCDD00112233")
+
+    def test_rename_by_peer_id_no_change_returns_empty(self):
+        self.db.add("同名", peer_id="AABBCCDD00112233")
+        self.assertEqual(self.db.rename_by_peer_id("AABBCCDD00112233", "同名"), "")
+        self.assertEqual(self.db.rename_by_peer_id("AABBCCDD00112233", "  同名 "),
+                         "")
+
+    def test_rename_by_peer_id_ignores_unknown_and_empty(self):
+        self.db.add("在名单里的", peer_id="AABBCCDD00112233")
+        self.assertEqual(self.db.rename_by_peer_id("1111222233334444", "谁"), "")
+        self.assertEqual(self.db.rename_by_peer_id("", "谁"), "")
+        self.assertEqual(self.db.rename_by_peer_id("AABBCCDD00112233", ""), "")
+        self.assertEqual(self.db.rename_by_peer_id("AABBCCDD00112233", "   "), "")
+        self.assertEqual(self.db.get_all()[0]["player_name"], "在名单里的")
+
+    def test_rename_does_not_touch_same_name_other_id(self):
+        a = self.db.add("同名", peer_id="AABBCCDD00112233")
+        b = self.db.add("同名", peer_id="1111222233334444")
+        self.db.rename_by_peer_id("AABBCCDD00112233", "改了")
+        self.assertEqual(self.db.get(a)["player_name"], "改了")
+        self.assertEqual(self.db.get(b)["player_name"], "同名")   # 另一个不动
+
+    def test_rename_never_adds_a_row(self):
+        self.db.add("老名字", peer_id="AABBCCDD00112233")
+        self.db.rename_by_peer_id("AABBCCDD00112233", "新名字")
+        self.assertEqual(self.db.get_count(), 1)
+
+    # ------------------------------------------------------ 曾用名
+    def test_rename_records_prev_name(self):
+        eid = self.db.add("老王", peer_id="AABBCCDD00112233")
+        self.db.rename_by_peer_id("AABBCCDD00112233", "老王改名了")
+        row = self.db.get(eid)
+        self.assertEqual(row["player_name"], "老王改名了")
+        self.assertEqual(format_prev_names(row["prev_names"]), "老王")
+        self.db.rename_by_peer_id("AABBCCDD00112233", "又改了")
+        self.assertEqual(format_prev_names(self.db.get(eid)["prev_names"]),
+                         "老王 / 老王改名了")
+
+    def test_manual_rename_records_prev_name(self):
+        eid = self.db.add("老王")
+        self.db.update(eid, player_name="老王二号")
+        self.assertEqual(format_prev_names(self.db.get(eid)["prev_names"]),
+                         "老王")
+
+    def test_explicit_prev_names_wins_over_auto(self):
+        """编辑框里改过的曾用名以用户为准（清空就是清空）。"""
+        eid = self.db.add("老王")
+        self.db.update(eid, player_name="老王二号", prev_names="只留这个")
+        row = self.db.get(eid)
+        self.assertEqual(format_prev_names(row["prev_names"]), "只留这个")
+        self.db.update(eid, player_name="老王三号", prev_names="")
+        self.assertEqual(self.db.get(eid)["prev_names"], "")
+
+    def test_rename_without_name_change_keeps_prev(self):
+        eid = self.db.add("老王", peer_id="AABBCCDD00112233")
+        self.db.rename_by_peer_id("AABBCCDD00112233", "老王")
+        self.assertEqual(self.db.get(eid)["prev_names"], "")
+
+    def test_add_same_peer_id_records_prev_name(self):
+        eid = self.db.add("老王", peer_id="AABBCCDD00112233")
+        again = self.db.add("新名字", peer_id="aabbccdd00112233")
+        self.assertEqual(again, eid)
+        self.assertEqual(format_prev_names(self.db.get(eid)["prev_names"]),
+                         "老王")
+
+    def test_add_with_empty_prev_names_does_not_clear_history(self):
+        """加入名单时不给曾用名 = "没指定"，不能把已有的历史抹掉。"""
+        eid = self.db.add("老王", peer_id="AABBCCDD00112233")
+        self.db.rename_by_peer_id("AABBCCDD00112233", "老二")
+        self.db.add("老三", peer_id="AABBCCDD00112233", prev_names="")
+        self.assertEqual(format_prev_names(self.db.get(eid)["prev_names"]),
+                         "老王 / 老二")
+
+    def test_import_merges_prev_names(self):
+        eid = self.db.add("老王", peer_id="AABBCCDD00112233")
+        self.db.import_entries(
+            [{"player_name": "老王新名", "peer_id": "AABBCCDD00112233",
+              "prev_names": '["文件里的旧名"]'}], strategy="skip")
+        got = format_prev_names(self.db.get(eid)["prev_names"])
+        self.assertIn("老王", got)
+        self.assertIn("文件里的旧名", got)
+
+    def test_export_carries_prev_names(self):
+        eid = self.db.add("老王", peer_id="AABBCCDD00112233")
+        self.db.rename_by_peer_id("AABBCCDD00112233", "新名")
+        self.assertEqual(format_prev_names(self.db.export_all()[0]["prev_names"]),
+                         "老王")
+        self.assertEqual(self.db.get(eid)["player_name"], "新名")
+
+    def test_set_peer_id_refuses_taken_id(self):
+        self.db.add("A", peer_id="AABBCCDD00112233")
+        eid_b = self.db.add("B")
+        with self.assertRaises(ValueError):
+            self.db.set_peer_id(eid_b, "aabbccdd00112233")
+
+    def test_find_by_peer_id(self):
+        eid = self.db.add("A", peer_id="AABBCCDD00112233")
+        self.assertEqual(self.db.find_by_peer_id("aabbccdd00112233")["id"], eid)
+        self.assertIsNone(self.db.find_by_peer_id(""))
+        self.assertIsNone(self.db.find_by_peer_id("0000000000000000"))
+
+    def test_blacklist_peers_map(self):
+        self.db.add("A", peer_id="AABBCCDD00112233")
+        self.db.add("B")
+        self.assertEqual(list(self.db.blacklist_peers()), ["AABBCCDD00112233"])
 
     def test_search(self):
         self.db.add("Alpha", "备注A")
@@ -438,57 +540,147 @@ class TestDatabase(TempCase):
         self.assertEqual(len(self.db.search("GAMMA")), 1)   # 大小写不敏感
         self.assertEqual(len(self.db.search("")), 3)
 
-    def test_record_encounter_writes_facts(self):
-        """命中只"写事实"：一条 encounters 记录，不再累加到名单上。"""
-        eid = self.db.add("Name1")
-        r1 = self.db.record_encounter(eid, 100.0, "chat", "Name1", "a.jpg")
-        self.assertTrue(r1["seen_at"])
-        self.assertEqual(r1["today_count"], 1)
-        r2 = self.db.record_encounter(eid, 92.5, "esc_menu", "Name12", "b.jpg")
-        self.assertEqual(r2["today_count"], 2)
-        rows = self.db.get_encounters(eid)
-        self.assertEqual(len(rows), 2)
-        self.assertEqual(rows[0]["name_seen"], "Name12")
-        self.assertEqual(rows[0]["match_score"], 92.5)
-        self.assertEqual(rows[0]["source"], "esc_menu")
-        self.assertEqual(rows[0]["screenshot_path"], "b.jpg")
-        self.assertEqual(self.db.get_total_encounter_count(), 2)
+    def test_delete_keeps_seen_players(self):
+        """删名单条目**不该**把"遇到过"这个事实一起删掉。"""
+        eid = self.db.add("A", peer_id="AABBCCDD00112233")
+        self.db.record_seen("AABBCCDD00112233", "A", game_pid=1)
+        self.assertTrue(self.db.delete(eid))
+        self.assertIsNone(self.db.get(eid))
+        self.assertEqual(self.db.count_seen(), 1)
 
-    def test_record_encounter_concurrent_no_lost_rows(self):
-        eid = self.db.add("Name1")
-        n_threads, per_thread = 8, 25
-        errors = []
+    def test_record_seen_upsert_and_game_counting(self):
+        self.db.record_seen("1111222233334444", "甲", game_pid=100)
+        self.assertEqual(self.db.count_seen(), 1)
+        # 同一局里重复出现：次数不涨（不是"写了几行日志"）
+        self.db.record_seen("1111222233334444", "甲", game_pid=100)
+        self.assertEqual(self.db.get_seen("1111222233334444")["seen_count"], 1)
+        # 换一局：涨一次
+        self.db.record_seen("1111222233334444", "甲改名", game_pid=200)
+        row = self.db.get_seen("1111222233334444")
+        self.assertEqual(row["seen_count"], 2)
+        self.assertEqual(row["name_first"], "甲")       # 第一次的名字留着
+        self.assertEqual(row["name_last"], "甲改名")
+        self.assertEqual(row["last_game_pid"], 200)
 
-        def worker(tag):
-            try:
-                for i in range(per_thread):
-                    self.db.record_encounter(eid, 100.0, f"t{tag}", "Name1", "")
-            except Exception as e:                       # noqa: BLE001
-                errors.append(e)
+    def test_record_seen_fills_name_late(self):
+        """名字比 peer 晚几秒才从名册读到：先存空名，后来补上。"""
+        self.db.record_seen("1111222233334444", "", game_pid=1)
+        self.assertEqual(self.db.get_seen("1111222233334444")["name_first"], "")
+        self.db.record_seen("1111222233334444", "补上的名字", game_pid=1)
+        row = self.db.get_seen("1111222233334444")
+        self.assertEqual(row["name_first"], "补上的名字")
+        self.assertEqual(row["name_last"], "补上的名字")
 
-        threads = [threading.Thread(target=worker, args=(t,))
-                   for t in range(n_threads)]
-        for t in threads:
-            t.start()
-        for t in threads:
-            t.join()
+    def test_record_seen_ignores_bad_peer_id(self):
+        self.db.record_seen("", "无id")
+        self.db.record_seen("zzz", "坏id")
+        self.db.record_seen(None, "None")
+        self.assertEqual(self.db.count_seen(), 0)
 
-        self.assertEqual(errors, [])
-        expected = n_threads * per_thread
-        self.assertEqual(len(self.db.get_encounters(eid, limit=1000)), expected)
-        self.assertEqual(self.db.get_total_encounter_count(), expected)
+    def test_recent_seen_ordering_and_limit(self):
+        from datetime import datetime, timedelta
+        fmt = "%Y-%m-%d %H:%M:%S"
+        older = (datetime.now() - timedelta(days=3)).strftime(fmt)
+        newer = (datetime.now() - timedelta(days=1)).strftime(fmt)
+        self.db.record_seen("1111222233334444", "先", game_pid=1, seen_at=older)
+        self.db.record_seen("2222333344445555", "后", game_pid=1, seen_at=newer)
+        rows = self.db.get_recent_seen()
+        self.assertEqual([r["name_last"] for r in rows], ["后", "先"])
+        self.assertEqual(len(self.db.get_recent_seen(limit=1)), 1)
+        # days=0 = 不限时间
+        self.assertEqual(len(self.db.get_recent_seen(days=0)), 2)
 
-    def test_record_encounter_missing_entry_rolls_back(self):
-        with self.assertRaises(ValueError):
-            self.db.record_encounter(99999, 100.0, "chat", "x", "")
-        self.assertEqual(self.db.get_total_encounter_count(), 0)
+    def test_recent_seen_days_filter(self):
+        self.db.record_seen("1111222233334444", "很旧", game_pid=1,
+                            seen_at="2020-01-01 00:00:00")
+        self.assertEqual(self.db.count_seen(days=7), 0)
+        self.assertEqual(self.db.count_seen(), 1)
 
-    def test_today_count(self):
-        eid = self.db.add("Name1")
-        self.assertEqual(self.db.get_today_encounter_count(), 0)
-        self.db.record_encounter(eid, 100.0, "chat", "Name1", "")
-        self.db.record_encounter(eid, 100.0, "chat", "Name1", "")
-        self.assertEqual(self.db.get_today_encounter_count(), 2)
+    def test_forget_and_clear_seen(self):
+        self.db.record_seen("1111222233334444", "甲", game_pid=1)
+        self.db.record_seen("2222333344445555", "乙", game_pid=1)
+        self.assertTrue(self.db.forget_seen("1111222233334444"))
+        self.assertFalse(self.db.forget_seen("1111222233334444"))
+        self.assertEqual(self.db.count_seen(), 1)
+        self.db.clear_seen()
+        self.assertEqual(self.db.count_seen(), 0)
+
+    def test_clear_all_clears_both_tables(self):
+        self.db.add("A", peer_id="AABBCCDD00112233")
+        self.db.record_seen("1111222233334444", "甲", game_pid=1)
+        self.db.clear_all()
+        self.assertEqual(self.db.get_count(), 0)
+        self.assertEqual(self.db.count_seen(), 0)
+
+    def test_clear_blacklist_keeps_seen(self):
+        self.db.add("A")
+        self.db.record_seen("1111222233334444", "甲", game_pid=1)
+        self.db.clear_blacklist()
+        self.assertEqual(self.db.get_count(), 0)
+        self.assertEqual(self.db.count_seen(), 1)
+
+    # ------------------------------------------------------ 忽略名单
+    def test_ignore_removes_from_seen(self):
+        """忽略的语义：以后不提醒，也不再进「最近遇到」。"""
+        self.db.record_seen("AABBCCDD00112233", "甲", game_pid=1)
+        self.assertTrue(self.db.ignore_peer("aabbccdd00112233", "甲"))
+        self.assertTrue(self.db.is_ignored("AABBCCDD00112233"))
+        self.assertEqual(self.db.count_seen(), 0)        # 已从列表里清掉
+
+    def test_is_ignored_rejects_garbage(self):
+        self.db.ignore_peer("AABBCCDD00112233")
+        self.assertFalse(self.db.is_ignored(""))
+        self.assertFalse(self.db.is_ignored(None))
+        self.assertFalse(self.db.is_ignored("zzz"))
+        self.assertFalse(self.db.is_ignored("0000000000000000"))
+
+    def test_ignore_peer_without_seen_row(self):
+        """从别处得知的 id（还没在游戏里遇到）也要能先拉黑。"""
+        self.db.ignore_peer("AABBCCDD00112233", "还没遇到的人")
+        self.assertEqual(len(self.db.get_ignored()), 1)
+        self.assertEqual(self.db.get_ignored()[0]["name"], "还没遇到的人")
+
+    def test_ignore_is_idempotent(self):
+        self.db.ignore_peer("AABBCCDD00112233", "甲")
+        self.db.ignore_peer("aabbccdd00112233", "甲改名了")
+        self.assertEqual(len(self.db.get_ignored()), 1)
+        self.assertEqual(self.db.get_ignored()[0]["name"], "甲改名了")
+
+    def test_unignore(self):
+        self.db.ignore_peer("AABBCCDD00112233")
+        self.assertTrue(self.db.unignore_peer("AABBCCDD00112233"))
+        self.assertFalse(self.db.unignore_peer("AABBCCDD00112233"))
+        self.assertFalse(self.db.is_ignored("AABBCCDD00112233"))
+        # 取消忽略不会凭空补一条"遇到过"
+        self.assertEqual(self.db.count_seen(), 0)
+
+    def test_clear_ignored(self):
+        self.db.ignore_peer("AABBCCDD00112233")
+        self.db.ignore_peer("1111222233334444")
+        self.db.clear_ignored()
+        self.assertEqual(self.db.ignored_peers(), set())
+
+    def test_ignored_peers_set(self):
+        self.db.ignore_peer("aabbccdd00112233")
+        self.db.ignore_peer("1111222233334444")
+        self.assertEqual(self.db.ignored_peers(),
+                         {"AABBCCDD00112233", "1111222233334444"})
+
+    def test_clear_all_keeps_ignored(self):
+        """「清空全部」不动忽略名单 —— 那是你主动做的选择，不是数据。"""
+        self.db.add("A")
+        self.db.record_seen("1111222233334444", "甲", game_pid=1)
+        self.db.ignore_peer("AABBCCDD00112233")
+        self.db.clear_all()
+        self.assertEqual(self.db.get_count(), 0)
+        self.assertEqual(self.db.count_seen(), 0)
+        self.assertTrue(self.db.is_ignored("AABBCCDD00112233"))
+
+    def test_get_ignored_has_metadata(self):
+        self.db.ignore_peer("AABBCCDD00112233", "甲")
+        row = self.db.get_ignored()[0]
+        self.assertEqual(set(row), {"peer_id", "name", "added_at"})
+        self.assertTrue(row["added_at"])
 
     def test_ordering_is_newest_first(self):
         a = self.db.add("A")
@@ -527,13 +719,16 @@ class TestDatabase(TempCase):
 
     # ------------------------------------------------------ 导入导出
     def test_export_all_fields(self):
-        self.db.add("Name1", "备注")
+        self.db.add("Name1", "备注", peer_id="AABBCCDD00112233")
         rows = self.db.export_all()
         self.assertEqual(len(rows), 1)
         row = rows[0]
-        self.assertEqual(set(row), {"player_name", "note", "created_at"})
+        self.assertEqual(set(row),
+                         {"player_name", "note", "peer_id", "prev_names",
+                          "created_at"})
         self.assertEqual(row["player_name"], "Name1")
         self.assertEqual(row["note"], "备注")
+        self.assertEqual(row["peer_id"], "AABBCCDD00112233")
 
     def test_export_all_ordering_is_stable(self):
         self.db.add("A")
@@ -546,7 +741,7 @@ class TestDatabase(TempCase):
         self.db.add("Name1", "原始备注")
         res = self.db.import_entries(
             [{"player_name": "Name1", "note": "新备注"}], strategy="skip")
-        self.assertEqual(res, {"inserted": 0, "skipped": 1, "updated": 0})
+        self.assertEqual(res, {"inserted": 0, "updated": 0, "skipped": 1, "renamed": 0})
         self.assertEqual(self.db.get_all()[0]["note"], "原始备注")
 
     def test_import_update_note_keeps_created_at(self):
@@ -557,7 +752,7 @@ class TestDatabase(TempCase):
             [{"player_name": "Name1", "note": "新备注",
               "created_at": "2000-01-01 00:00:00"}],
             strategy="update_note")
-        self.assertEqual(res, {"inserted": 0, "skipped": 0, "updated": 1})
+        self.assertEqual(res, {"inserted": 0, "updated": 1, "skipped": 0, "renamed": 0})
         row = self.db.get(eid)
         self.assertEqual(row["note"], "新备注")
         self.assertEqual(row["created_at"], created)     # 添加时间保持本机的
@@ -578,16 +773,88 @@ class TestDatabase(TempCase):
             [{"player_name": "NewOne", "note": "n",
               "created_at": "2020-01-01 00:00:00"}],
             strategy="skip")
-        self.assertEqual(res, {"inserted": 1, "skipped": 0, "updated": 0})
+        self.assertEqual(res, {"inserted": 1, "updated": 0, "skipped": 0, "renamed": 0})
         row = self.db.get_all()[0]
         self.assertEqual(row["player_name"], "NewOne")
         self.assertEqual(row["created_at"], "2020-01-01 00:00:00")
+        self.assertEqual(row["peer_id"], "")
+
+    def test_import_carries_peer_id(self):
+        """换台机器导回来，PeerID 精确匹配照样有效。"""
+        res = self.db.import_entries(
+            [{"player_name": "N", "note": "", "peer_id": "aabbccdd00112233"}],
+            strategy="skip")
+        self.assertEqual(res["inserted"], 1)
+        self.assertEqual(self.db.get_all()[0]["peer_id"], "AABBCCDD00112233")
+
+    def test_import_same_name_different_peer_id_keeps_both(self):
+        """名字相同、PeerID 不同 → 依旧记录（各留一条）。"""
+        self.db.add("Homer", peer_id="AABBCCDD00112233")
+        res = self.db.import_entries(
+            [{"player_name": "Homer", "note": "另一个 Homer",
+              "peer_id": "1111222233334444"}], strategy="skip")
+        self.assertEqual(res, {"inserted": 1, "updated": 0, "skipped": 0,
+                               "renamed": 0})
+        self.assertEqual(self.db.get_count(), 2)
+
+    def test_import_same_peer_id_updates_name(self):
+        """PeerID 相同、名字不同 → 是同一个人改了名 → 更新名字。"""
+        eid = self.db.add("老王", "备注留着", peer_id="AABBCCDD00112233")
+        res = self.db.import_entries(
+            [{"player_name": "老王改名了", "note": "",
+              "peer_id": "aabbccdd00112233"}], strategy="skip")
+        self.assertEqual(res["renamed"], 1)
+        self.assertEqual(res["inserted"], 0)          # 绝不新增第二条
+        self.assertEqual(self.db.get_count(), 1)
+        self.assertEqual(self.db.get(eid)["player_name"], "老王改名了")
+        self.assertEqual(self.db.get(eid)["note"], "备注留着")   # skip 不动备注
+
+    def test_import_rename_happens_under_every_strategy(self):
+        """改名不受策略影响（"谁"是确定的）；策略只管备注/时间。"""
+        for i, strategy in enumerate(("skip", "update_note", "overwrite")):
+            db = BlacklistDB(self.path(f"rename_{i}.db"))
+            try:
+                db.add("旧名字", "我的备注", peer_id="AABBCCDD00112233")
+                res = db.import_entries(
+                    [{"player_name": "新名字", "note": "文件备注",
+                      "peer_id": "AABBCCDD00112233"}], strategy=strategy)
+                self.assertEqual(res["renamed"], 1, strategy)
+                self.assertEqual(res["inserted"], 0, strategy)
+                self.assertEqual(db.get_count(), 1, strategy)
+                row = db.get_all()[0]
+                self.assertEqual(row["player_name"], "新名字", strategy)
+                want = "我的备注" if strategy == "skip" else "文件备注"
+                self.assertEqual(row["note"], want, strategy)
+            finally:
+                db.close()
+
+    def test_import_name_only_row_does_not_overwrite_id_row(self):
+        """文件里那条没有 ID、库里同名那条有 ID → 是两个人 → 各留一条。
+
+        （有 ID 的那条**不会**被文件里的裸名字顶掉：身份不同。）
+        """
+        eid = self.db.add("N", "有ID的", peer_id="AABBCCDD00112233")
+        res = self.db.import_entries(
+            [{"player_name": "N", "note": "没ID的"}], strategy="overwrite")
+        self.assertEqual(res["inserted"], 1)
+        self.assertEqual(self.db.get_count(), 2)
+        self.assertEqual(self.db.get(eid)["note"], "有ID的")     # 没被动过
+
+    def test_import_name_only_row_matches_name_only_row(self):
+        """两边都没有 ID → 名字就是身份 → 按策略处理，不新增。"""
+        eid = self.db.add("老王", "原来")
+        res = self.db.import_entries(
+            [{"player_name": "老王", "note": "文件里的"}], strategy="skip")
+        self.assertEqual(res["inserted"], 0)
+        self.assertEqual(res["skipped"], 1)
+        self.assertEqual(self.db.get_count(), 1)
+        self.assertEqual(self.db.get(eid)["note"], "原来")
 
     def test_import_skips_rows_without_name(self):
         res = self.db.import_entries(
             [{"player_name": ""}, {"note": "只有备注"}, {"player_name": "  "}],
             strategy="skip")
-        self.assertEqual(res, {"inserted": 0, "skipped": 3, "updated": 0})
+        self.assertEqual(res, {"inserted": 0, "updated": 0, "skipped": 3, "renamed": 0})
         self.assertEqual(self.db.get_count(), 0)
 
     def test_import_same_name_case_insensitive_is_duplicate(self):
@@ -659,9 +926,9 @@ class TestDatabase(TempCase):
 
     def test_import_empty_list_is_noop(self):
         self.assertEqual(self.db.import_entries([]),
-                         {"inserted": 0, "skipped": 0, "updated": 0})
+                         {"inserted": 0, "updated": 0, "skipped": 0, "renamed": 0})
         self.assertEqual(self.db.import_entries(None),
-                         {"inserted": 0, "skipped": 0, "updated": 0})
+                         {"inserted": 0, "updated": 0, "skipped": 0, "renamed": 0})
 
 
 # ==========================================================================
@@ -721,7 +988,8 @@ class TestLegacyMigration(TempCase):
         db = BlacklistDB(path)
         try:
             cols = {r[1] for r in db.conn.execute("PRAGMA table_info(blacklist)")}
-            self.assertEqual(cols, {"id", "player_name", "note", "created_at"})
+            self.assertEqual(cols, {"id", "player_name", "note", "peer_id",
+                                    "prev_names", "created_at"})
             names = sorted(r["player_name"] for r in db.get_all())
             # 名称栏为空的条目用 player_id 补名字；没有名字的占位行丢弃
             self.assertEqual(names, ["PlayerX", "PlayerZ", "？"])
@@ -730,12 +998,23 @@ class TestLegacyMigration(TempCase):
             self.assertEqual(by_name["PlayerZ"]["note"], "名字填在ID栏")
             self.assertEqual(by_name["PlayerZ"]["created_at"],
                              "2026-01-01 10:00:00")
-            # 历史统计一并清空
-            self.assertEqual(db.get_total_encounter_count(), 0)
-            self.assertEqual(db.get_today_encounter_count(), 0)
+            # 老条目一律没有 PeerID（凭空编一个只会认错人）
+            self.assertTrue(all(not r["peer_id"] for r in db.get_all()))
             # 名单里的 ? 依然可索引可命中
             m = Matcher(db)
             self.assertEqual(len(m.check(["？"])), 1)
+        finally:
+            db.close()
+
+    def test_migration_drops_legacy_encounters(self):
+        """抓屏时代的 encounters 表没有任何生产者/读者了，直接删掉。"""
+        path = self._make_legacy_db()
+        db = BlacklistDB(path)
+        try:
+            tables = {r[0] for r in db.conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'")}
+            self.assertNotIn("encounters", tables)
+            self.assertIn("seen_players", tables)
         finally:
             db.close()
 
@@ -748,14 +1027,110 @@ class TestLegacyMigration(TempCase):
             finally:
                 db.close()
 
-    def test_migration_keeps_evidence_untouched(self):
-        """证据截图是磁盘上的文件，迁移不碰它（只是不再有 DB 索引行）。"""
-        path = self._make_legacy_db()
+    def test_v1_1_db_gets_peer_id_column(self):
+        """v1.1.x 的库（有 encounters、没有 peer_id）也能无损升上来。"""
+        import sqlite3
+        path = self.path("v11.db")
+        conn = sqlite3.connect(path)
+        conn.executescript("""
+            CREATE TABLE blacklist (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                player_name TEXT NOT NULL,
+                note TEXT DEFAULT '',
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE TABLE encounters (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                blacklist_id INTEGER,
+                name_seen TEXT,
+                match_score REAL,
+                source TEXT,
+                screenshot_path TEXT,
+                seen_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            );
+        """)
+        conn.execute("INSERT INTO blacklist (player_name, note) "
+                     "VALUES ('老条目', '还在')")
+        conn.execute("INSERT INTO encounters (blacklist_id, name_seen) "
+                     "VALUES (1, '老条目')")
+        conn.commit()
+        conn.close()
+
         db = BlacklistDB(path)
         try:
-            self.assertEqual(db.get_recent_encounters(), [])
+            rows = db.get_all()
+            self.assertEqual(len(rows), 1)          # 名字与备注都保住
+            self.assertEqual(rows[0]["note"], "还在")
+            self.assertEqual(rows[0]["peer_id"], "")   # 老条目留空
+            tables = {r[0] for r in db.conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'")}
+            self.assertNotIn("encounters", tables)
         finally:
             db.close()
+
+
+# ==========================================================================
+class TestNormalizePeerId(unittest.TestCase):
+    """PeerID 归一化：洗掉大小写/空格/连字符/0x 前缀，非法的给空串。"""
+
+    def test_normalizes(self):
+        self.assertEqual(normalize_peer_id("aabbccdd00112233"),
+                         "AABBCCDD00112233")
+        self.assertEqual(normalize_peer_id("AABBCCDD 0011-2233"),
+                         "AABBCCDD00112233")
+        self.assertEqual(normalize_peer_id("0xAABBCCDD00112233"),
+                         "AABBCCDD00112233")
+        self.assertEqual(normalize_peer_id("  aabbccdd00112233  "),
+                         "AABBCCDD00112233")
+
+    def test_short_value_is_padded(self):
+        """插件永远给 16 位，但手工粘进来的 8 位也不该因此匹配不上。"""
+        self.assertEqual(normalize_peer_id("ff"), "00000000000000FF")
+
+    def test_rejects_garbage(self):
+        for bad in ("", None, "   ", "zzz", "0x", "12345678901234567",
+                    "AABBCCDD-0011-2233-x"):
+            self.assertEqual(normalize_peer_id(bad), "", repr(bad))
+
+
+# ==========================================================================
+class TestPrevNames(unittest.TestCase):
+    """曾用名的存/取/合并（纯函数，不碰数据库）。"""
+
+    def test_parse_json_and_plain(self):
+        self.assertEqual(parse_prev_names('["甲", "乙"]'), ["甲", "乙"])
+        self.assertEqual(parse_prev_names("甲 / 乙"), ["甲", "乙"])
+        self.assertEqual(parse_prev_names("甲,乙;丙\n丁"), ["甲", "乙", "丙", "丁"])
+        self.assertEqual(parse_prev_names(""), [])
+        self.assertEqual(parse_prev_names(None), [])
+
+    def test_format(self):
+        self.assertEqual(format_prev_names('["甲","乙"]'), "甲 / 乙")
+        self.assertEqual(format_prev_names(""), "")
+
+    def test_dump_dedupes_and_skips_empty(self):
+        self.assertEqual(dump_prev_names(["甲", "甲", " ", "乙"]),
+                         '["甲", "乙"]')
+        self.assertEqual(dump_prev_names([]), "")
+        self.assertEqual(dump_prev_names("甲 / 乙"), '["甲", "乙"]')
+
+    def test_push_dedupes(self):
+        self.assertEqual(push_prev_name('["甲"]', "甲"), '["甲"]')
+        self.assertEqual(push_prev_name('["甲"]', "乙"), '["甲", "乙"]')
+        self.assertEqual(push_prev_name("", ""), "")
+
+    def test_push_caps_length(self):
+        value = ""
+        for i in range(20):
+            value = push_prev_name(value, f"名字{i}")
+        self.assertEqual(len(parse_prev_names(value)), PREV_NAME_LIMIT)
+        # 留的是最近几个
+        self.assertEqual(parse_prev_names(value)[-1], "名字19")
+
+    def test_names_with_separators_survive_json(self):
+        """名字里带逗号/斜杠也不能被切碎（所以存 JSON 而不是分隔串）。"""
+        value = dump_prev_names(["Smith, John", "a/b"])
+        self.assertEqual(parse_prev_names(value), ["Smith, John", "a/b"])
 
 
 # ==========================================================================
@@ -879,6 +1254,60 @@ class TestMatcher(TempCase):
         self.db.delete(eid)
         self.matcher.reload()
         self.assertEqual(self.matcher.check(["PlayerX"]), [])
+
+
+# ==========================================================================
+class TestPeerIdLayer(TempCase):
+    """PeerID 是第一判据：有 ID 的条目只走精确层，不进名字索引。"""
+
+    def setUp(self):
+        super().setUp()
+        self.db = BlacklistDB(self.path("blacklist.db"))
+        self.with_id = self.db.add("有ID的人", "备注", peer_id="AABBCCDD00112233")
+        self.legacy = self.db.add("老条目")
+        self.matcher = Matcher(self.db)
+
+    def tearDown(self):
+        self.db.close()
+        super().tearDown()
+
+    def test_stats_split(self):
+        self.assertEqual(self.matcher.stats(), {"peers": 1, "names": 1})
+
+    def test_check_peer_hits(self):
+        hit = self.matcher.check_peer("aabbccdd 00112233")
+        self.assertIsNotNone(hit)
+        self.assertEqual(hit[0]["id"], self.with_id)
+        self.assertEqual(hit[1], 100.0)
+
+    def test_check_peer_misses(self):
+        self.assertIsNone(self.matcher.check_peer("0000000000000000"))
+        self.assertIsNone(self.matcher.check_peer(""))
+        self.assertIsNone(self.matcher.check_peer("zzz"))
+        self.assertIsNone(self.matcher.check_peer(None))
+
+    def test_entry_with_peer_id_is_not_name_indexed(self):
+        """有 ID 就不再靠名字 —— 否则冒用同名的人也会被算进来。"""
+        self.assertEqual(self.matcher.check(["有ID的人"]), [])
+        self.assertNotIn("有id的人", self.matcher.name_allowlist())
+
+    def test_legacy_entry_still_name_indexed(self):
+        hits = self.matcher.check(["老条目"])
+        self.assertEqual([h[0]["id"] for h in hits], [self.legacy])
+
+    def test_adding_peer_id_moves_entry_to_exact_layer(self):
+        self.db.set_peer_id(self.legacy, "1111222233334444")
+        self.matcher.reload()
+        self.assertEqual(self.matcher.stats(), {"peers": 2, "names": 0})
+        self.assertEqual(self.matcher.check(["老条目"]), [])
+        self.assertEqual(self.matcher.check_peer("1111222233334444")[0]["id"],
+                         self.legacy)
+
+    def test_reload_after_delete(self):
+        self.db.delete(self.with_id)
+        self.matcher.reload()
+        self.assertIsNone(self.matcher.check_peer("AABBCCDD00112233"))
+        self.assertEqual(self.matcher.stats(), {"peers": 0, "names": 1})
 
 
 # ==========================================================================

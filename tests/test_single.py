@@ -293,12 +293,20 @@ class TestMainWiring(unittest.TestCase):
         chk.assert_called_once()
         cls.assert_not_called()
 
-    def test_capture_debug_bypasses_single_instance(self):
+    def test_watch_debug_bypasses_single_instance(self):
         with mock.patch.object(si, "SingleInstance") as cls, \
-                mock.patch.object(main_mod, "run_capture_debug",
+                mock.patch.object(main_mod, "run_watch_debug",
                                   return_value=0) as fn:
-            self.assertEqual(main_mod.main(["--capture-debug"]), 0)
+            self.assertEqual(main_mod.main(["--watch-debug"]), 0)
         fn.assert_called_once()
+        cls.assert_not_called()
+
+    def test_replay_bypasses_single_instance(self):
+        with mock.patch.object(si, "SingleInstance") as cls, \
+                mock.patch.object(main_mod, "run_replay",
+                                  return_value=0) as fn:
+            self.assertEqual(main_mod.main(["--replay", "some.log"]), 0)
+        fn.assert_called_once_with("some.log")
         cls.assert_not_called()
 
     def test_window_title_is_shared_constant(self):

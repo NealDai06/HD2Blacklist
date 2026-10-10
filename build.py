@@ -17,8 +17,8 @@
     · 使用说明.txt / LICENSE.txt（从仓库根目录复制，永远与源码同步）
 
 ⚠ **打包不带任何用户数据**：`data/` 里的 blacklist.db、notification.json、
-   user_config.json、hotkey.json、logs/、evidence/、以及用户自己放进去的图片
-   音频，统统不进产物 —— 里面有本机使用痕迹（名单、区域坐标、自定义文件路径）。
+   user_config.json、logs/、以及用户自己放进去的图片音频，统统不进产物 ——
+   里面有本机使用痕迹（名单、自定义文件路径）。
    需要保留旧产物里的 data/ 时用 `--keep-data`（仅开发自用）。
 
 注意：config.py 以 **exe 所在目录** 作为 BASE_DIR，
@@ -45,13 +45,15 @@ BUILD = os.path.join(ROOT, "build")
 DATA = os.path.join(ROOT, "data")
 BACKUP_ROOT = os.path.join(OUT_ROOT, "_packaged_data_backup")
 #: 随包分发给人看的文档（源文件在仓库根目录里，打包时复制到产物旁边）
+#: THIRD_PARTY.md 必须跟着走：里面有配套插件的上游出处与两份上游许可正文
+#: （MIT 要求保留版权声明与许可正文），还有 LGPL 依赖（pystray/pygame）的说明。
 DOC_FILES = (("使用说明.txt", "使用说明.txt"),
-             ("LICENSE", "LICENSE.txt"))
+             ("LICENSE", "LICENSE.txt"),
+             ("THIRD_PARTY.md", "THIRD_PARTY.md"))
 #: 允许进产物的静态资源（其余 data/assets 里的东西都是用户自己的图片/音频）
 SEED_ASSETS = ("default_icon.png", "app_icon.png", "app_icon.ico")
 #: 明确属于"用户痕迹"的文件，产物里见到就删
-USER_DATA_FILES = ("blacklist.db", "notification.json", "user_config.json",
-                   "hotkey.json")
+USER_DATA_FILES = ("blacklist.db", "notification.json", "user_config.json")
 
 
 def log(msg):
@@ -69,14 +71,6 @@ def log(msg):
     except UnicodeEncodeError:
         enc = sys.stdout.encoding or "ascii"
         print(text.encode(enc, "replace").decode(enc, "replace"))
-
-
-def which_rapidocr():
-    """返回实际安装的 rapidocr 包名（不同 Python 版本装的包不同）。"""
-    for name in ("rapidocr_onnxruntime", "rapidocr"):
-        if importlib.util.find_spec(name) is not None:
-            return name
-    return None
 
 
 def ensure_seed_files():
@@ -143,24 +137,14 @@ def build_command(onefile: bool, console: bool) -> list:
         cmd += ["--icon", config.APP_ICON_ICO]
 
     # ---- 隐式依赖 ----
+    # v2 不再截图 / OCR / 订阅 WMI 事件，所以 wmi、pywin32、onnxruntime 都不用带。
+    # mss 还在：提示浮层要靠它拿显示器几何（不是抓游戏画面）。
     hidden = [
         "pystray._win32",
         "winotify",
-        "wmi",
-        "win32api", "win32con", "win32gui", "pythoncom", "pywintypes",
         "mss.windows",
         "pygame",
     ]
-    rapid = which_rapidocr()
-    if rapid:
-        hidden.append(rapid)
-        cmd += ["--collect-all", rapid]
-        log(f"OCR 引擎: {rapid}（已 collect-all）")
-    else:
-        log("警告：未检测到 rapidocr，打包后 OCR 功能不可用")
-
-    if importlib.util.find_spec("onnxruntime") is not None:
-        cmd += ["--collect-all", "onnxruntime"]
     if importlib.util.find_spec("rapidfuzz") is not None:
         cmd += ["--collect-all", "rapidfuzz"]
 
@@ -179,15 +163,14 @@ def build_command(onefile: bool, console: bool) -> list:
             log(f"警告：缺少静态资源 {asset}")
 
     # ---- 排除用不到的大块头 ----
-    # 重要：onnxruntime 里有 `try: import torch` 的 PyTorch 后端分支，
-    # PyInstaller 会把整个 torch 拖进来（实测多出 ~500MB 且构建慢一倍）。
-    # 本项目的 OCR 走 onnxruntime 的 CPU 执行器，完全不需要 torch。
+    # 本项目的第三方依赖只有 Pillow / numpy / mss / rapidfuzz / pystray /
+    # winotify / pygame，下面这些都是被间接拖进来的无关货（几百 MB 起）。
     for mod in (
-        # 深度学习框架（onnxruntime 的可选后端，实际不用）
+        # 深度学习 / 科学计算（旧版本靠 onnxruntime 做 OCR，v2 已经全部下线）
         "torch", "torchvision", "torchaudio", "torchgen", "functorch",
         "transformers", "tokenizers", "safetensors", "huggingface_hub",
+        "onnxruntime", "cv2", "rapidocr", "rapidocr_onnxruntime",
         "numba", "llvmlite", "sympy", "networkx",
-        # 科学计算 / 绘图 / 数据分析
         "matplotlib", "scipy", "pandas", "IPython", "notebook", "jupyter",
         # GUI 框架（本项目只用 tkinter）
         "PyQt5", "PyQt6", "PySide2", "PySide6", "wx",
@@ -196,6 +179,8 @@ def build_command(onefile: bool, console: bool) -> list:
         "fsspec", "aiohttp", "yarl", "multidict", "frozenlist",
         "aiohappyeyeballs", "propcache", "pydantic", "annotated_types",
         "typing_inspection", "tabulate", "Cython", "pytest",
+        # v2 不再订阅 WMI 进程事件、不再用 win32api 读按键
+        "wmi", "win32api", "win32con", "win32gui", "pythoncom", "pywintypes",
     ):
         cmd += ["--exclude-module", mod]
 
@@ -206,12 +191,12 @@ def copy_seed_data(target_dir: str):
     """只放**静态资源**到产物旁边；一个字节的用户数据都不带。
 
     notification.json / user_config.json 里可能有本机的东西（自定义提示图/音效
-    的绝对路径、自己框的区域坐标），所以不进产物 —— 程序首次运行会自己生成
-    默认配置（`ensure_notification_file` / `RegionConfig` 默认值）。
+    的绝对路径），所以不进产物 —— 程序首次运行会自己生成默认配置
+    （`ensure_notification_file`）。
     """
     dest = os.path.join(target_dir, "data")
     os.makedirs(dest, exist_ok=True)
-    for sub in ("assets", "evidence", "logs"):
+    for sub in ("assets", "logs"):
         os.makedirs(os.path.join(dest, sub), exist_ok=True)
 
     for icon_name in SEED_ASSETS:
@@ -238,7 +223,7 @@ def strip_user_data(target_dir: str) -> int:
             os.remove(p)
             removed.append(name)
 
-    for sub in ("logs", "evidence"):
+    for sub in ("logs",):
         d = os.path.join(dest, sub)
         if not os.path.isdir(d):
             continue
@@ -417,7 +402,7 @@ def main(argv=None) -> int:
         log(f"完成 ✅  {exe}")
     else:
         log("完成，但未找到 exe，请检查 PyInstaller 输出")
-    log("首次运行会自动创建数据库、日志与证据目录。")
+    log("首次运行会自动创建数据库与日志目录。")
     return 0
 
 

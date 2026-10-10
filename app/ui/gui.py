@@ -2,20 +2,18 @@
 """gui.py —— 主界面。
 
 布局（单页五段，每个功能只有一个入口）：
-    ① 运行状态带   应用标识 + 监控灯 + 统计 + F8 开关 + [扫描聊天框]/[暂停]/[退出]
+    ① 运行状态带   应用标识 + 监控灯 + 追踪状态 + [最近遇到]/[暂停]/[退出]
     ② 名单工具带   增删改查 + 搜索 + 排序 + 导入导出
     ③ 名单主区     表格（占满剩余空间）
-    ④ 设置分页     扫描与触发 / 通知 / 监视区域 / 数据 / 帮助（默认收起，可拖拽分隔）
+    ④ 设置分页     最近遇到 / 通知 / 数据 / 帮助（默认收起，可拖拽分隔）
     ⑤ 状态栏       「最近动态」事件流（3 行，带时间戳）+ 当前状态 + 统计
 
 没有菜单栏：菜单里曾经和工具栏重复的入口全部收敛到 ①②④，避免"同一个设置
 在两处出现、两处不一致"。
 
 红线：**所有 tkinter 操作都在主线程**。
-后台线程（扫描会话 / 进程监控 / ESC / 托盘）只能往两个 queue 里塞东西：
-    * _update_queue —— 命中数据（enqueue_encounter_update）
-    * _command_queue —— 需要主线程执行的可调用对象（post）
-主线程用 root.after(GUI_QUEUE_POLL_MS) 周期性排空它们。
+后台线程（尾随插件日志的线程 / 托盘）只能往 `_command_queue` 里塞可调用对象
+（`post()`），主线程用 root.after(GUI_QUEUE_POLL_MS) 周期性排空它。
 """
 from __future__ import annotations
 
@@ -30,17 +28,110 @@ import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
 from app import config
+from app.core.database import format_prev_names
 from app.ui import theme
 from app.config import GUI_QUEUE_POLL_MS, get_logger
 
-#: 名单只有三列：名字 / 备注 / 添加时间。
-#: 玩家ID、TK次数、遇到次数、最后遇见都删掉了（v1.1.2）—— 名单只回答
-#: "这个名字要不要提醒"，统计去 app.log 和 evidence/ 里看。
-COLUMNS = ("player_name", "note", "created_at")
-HEADERS = {"player_name": "名称", "note": "备注", "created_at": "添加时间"}
-WIDTHS = {"player_name": 220, "note": 520, "created_at": 165}
+#: 名单的列。最后那个 `_fill` 是**占位的空白列**，不显示任何数据 ——
+#: 它存在的唯一理由是"给最后一列让出可以拖宽的余地"，见 _ColumnFitter 的说明。
+COLUMNS = ("player_name", "peer_id", "prev_names", "note", "created_at",
+           "_fill")
+HEADERS = {"player_name": "名称", "peer_id": "PeerID", "prev_names": "曾用名",
+           "note": "备注", "created_at": "添加时间", "_fill": ""}
+#: 各列默认宽度（像素）。时间列（190）和 PeerID（170）是**实测**出来的：
+#: 这台机器上 `2026-12-31 23:59:59` 渲染要 169px、16 位十六进制 ID 要 142px，
+#: 而 Tk 自己的 `font.measure()` / `Label.winfo_reqwidth()` 只报 ~120/~100
+#: （DPI 缩放没算进去）—— 照 Tk 的数字定宽度会让它们被切掉末尾（实测踩过）。
+#: 反正每一列都能自己拖，这里只管"默认好看、不截断"。
+WIDTHS = {"player_name": 210, "peer_id": 190, "prev_names": 165,
+          "note": 250, "created_at": 200, "_fill": 40}
+#: 每列的宽度下限（防止被拖成一条缝，再也抓不住）。
+#: `_fill` 的下限就是"最后一列还能往右拖多少" —— 别设成 0。
+MIN_WIDTHS = {"player_name": 60, "peer_id": 120, "prev_names": 50,
+              "note": 50, "created_at": 120, "_fill": 16}
 
 SORT_OPTIONS = (("created_at", "按添加时间"), ("player_name", "按名称"))
+
+#: 「最近遇到」列表的列（来源：数据库 seen_players，由插件日志喂进来）
+RECENT_COLUMNS = ("name", "peer_id", "last_seen", "games", "state", "_fill")
+RECENT_HEADERS = {"name": "玩家名", "peer_id": "PeerID",
+                  "last_seen": "最近遇到", "games": "遇到局数",
+                  "state": "状态", "_fill": ""}
+#: 同样按**实测渲染**给：16 位 PeerID 要 142px、时间串要 181px，
+#: 「遇到局数」表头自己就要 63px（原来给 80 会把它切掉）
+RECENT_WIDTHS = {"name": 200, "peer_id": 195, "last_seen": 210, "games": 112,
+                 "state": 106, "_fill": 40}
+RECENT_MIN_WIDTHS = {"name": 60, "peer_id": 130, "last_seen": 120, "games": 60,
+                     "state": 60, "_fill": 16}
+
+#: 占位空白列的键名（不显示数据、不参与排序）
+FILLER_COLUMN = "_fill"
+
+
+class _ColumnFitter:
+    """列宽助手：所有真实列都是 **stretch=False**（宽度完全由用户拖出来），
+    外加一列**空白占位列**在最后，用来"吃掉剩下的宽度"。
+
+    为什么需要它（真实反馈：**最后一列只能缩小、不能放大**）：
+      · Tk 里拖分隔条**只改左边那一列的宽度**，所以想放大最后一列，只能拖
+        它**自己的右边缘**；
+      · 而如果所有列加起来正好等于控件宽度，那个右边缘就贴在控件右边界上 ——
+        指针得拖到控件外面才有效果；窗口最大化时外面就是屏幕边缘，**拖不动**。
+        于是结论就是"只能缩，不能放"。
+      · Tk 自带的 `stretch=True` 也救不了：它在拖分隔条时同样会重算，
+        刚拖出来的宽度会被 stretch 列立刻抢回去（实测：抓"备注/添加时间"
+        之间的分隔条往左拖，备注缩了、最后一列一动不动）。
+
+    有了一列会被拉伸的空白列就不一样了：最后一列的右边缘**永远在控件内部**，
+    往右拖时空白列同步让位，表格还始终是填满的。
+    """
+
+    def __init__(self, tree, columns, min_widths, filler=FILLER_COLUMN):
+        self.tree = tree
+        self.columns = tuple(columns)
+        self.reals = tuple(c for c in self.columns if c != filler)
+        self.min_widths = dict(min_widths)
+        self.filler = filler
+        self._w = 0
+        tree.bind("<Configure>", self._on_configure, add="+")
+        # 拖完分隔条松手时也重算一次：把差额记到空白列头上
+        tree.bind("<ButtonRelease-1>", self._on_release, add="+")
+
+    # ------------------------------------------------------------------ 内部
+    def _on_configure(self, event):
+        self._w = int(event.width)
+        self.apply(self._w)
+
+    def _on_release(self, _event=None):
+        self.apply()
+
+    # ------------------------------------------------------------------ 对外
+    def apply(self, total=None) -> int:
+        """把空白列设成"剩下那点宽度"，让表格始终填满控件。
+
+        用户拖宽某一列 → 空白列让位（这就是"最后一列能放大"的机制）；
+        拖窄某一列 / 缩放窗口 → 空白列补回来。空白列自己有下限，不会消失。
+        """
+        try:
+            total = int(total if total else self.tree.winfo_width())
+        except tk.TclError:
+            return 0
+        if total <= 1:
+            return 0
+        used = 0
+        for col in self.reals:
+            try:
+                used += int(self.tree.column(col, "width"))
+            except tk.TclError:
+                return 0
+        floor = int(self.min_widths.get(self.filler, 16))
+        want = max(floor, total - used - 2)      # 2px 给边框，免得撑出多余滚动条
+        try:
+            if int(self.tree.column(self.filler, "width")) != want:
+                self.tree.column(self.filler, width=want)
+        except tk.TclError:
+            return 0
+        return want
 
 # --------------------------------------------------------------------------
 # 布局常量
@@ -52,9 +143,8 @@ MIN_WIDTH, MIN_HEIGHT = 1060, 640
 
 #: 下方设置区分页（key, 标签）。顺序 = 标签栏从左到右的顺序
 SETTINGS_TABS = (
-    ("scan", "扫描与触发"),
+    ("recent", "最近遇到"),
     ("notify", "通知"),
-    ("region", "监视区域"),
     ("data", "数据"),
     ("help", "帮助"),
 )
@@ -72,27 +162,42 @@ MAX_COLLAPSED_HEIGHT = 96
 EVENT_ROWS = 3
 
 HELP_TEXT = (
-    "触发扫描的方式：\n"
-    "  · 聊天框（按需）：点顶部 [扫描聊天框] 或按你自己设的快捷键，才抓一次图\n"
-    "    + 跑一次 OCR；平时完全不扫聊天框，不占 CPU。\n"
-    f"  · 冷启动：游戏启动后自动扫一次 HUD 玩家列表。\n"
-    "  · ESC：按 ESC 打开菜单时自动扫一次菜单玩家列表。\n\n"
-    f"命中去重：同一玩家 {config.HIT_DEDUP_WINDOW} 秒内只计数一次、只提示一次。\n"
-    "批量命中：一次扫到多个黑名单玩家时，每人一个通知栏、只播一次音效\n"
-    "  （最多同时弹 5 个，超出的汇总在最后一栏）。\n\n"
-    "本工具不注入、不读内存、不改包，仅截图 + OCR + 本地比对。\n"
+    "数据来源：游戏内插件 HD2Tracker 写出的 playerLog.txt\n"
+    "（%LOCALAPPDATA%\\CowboyBingus\\Helldivers2\\Logs\\）。\n"
+    "本应用**只读这一个文本文件**：不注入、不读内存、不改包、不抢焦点。\n\n"
+    "提醒规则：有人**刚进队**（join）且 **PeerID 命中黑名单**，才弹提示。\n"
+    f"  · 同一个人在同一局里 {config.HIT_DEDUP_WINDOW} 秒内只提醒一次；\n"
+    "  · 队伍快照只刷新「现在队里有谁」，绝不触发提醒；\n"
+    "  · 你自己永远不会被当成目标；\n"
+    "  · **只认 PeerID**：没有 PeerID 的老条目不会提醒（名字会重名、会改，\n"
+    "    拿它当身份会认错人）—— 右键 [补全 PeerID] 或从「最近遇到」重新加入。\n\n"
+    "最近遇到：插件每读到一次名册就把队里的人记下来，\n"
+    "  于是在「最近遇到」里能直接把他们加进名单 —— 名字和 PeerID\n"
+    "  都是程序填的，你不用手打，也就不会填错。\n"
+    "  · [从列表移除] 只是把这一条划掉（下次遇到照旧记录、照旧提醒）；\n"
+    "  · [忽略此人] 是记进忽略名单，以后既不再提醒、也不再进列表 ——\n"
+    "    反悔入口在「数据」页 → [忽略名单…]。\n\n"
+    "PeerID 是 PlayFab 的账户标识，跨局稳定、改名字也不变 ——\n"
+    "  所以它是**身份**：同名不同 ID 是两个人（各留一条），同一个人改名\n"
+    "  只会更新名字。提醒也只认 PeerID，没有 ID 的条目不会提醒。\n\n"
     "重复打开不会多开进程：会把已经运行的那个窗口叫到前台。\n"
-    "关闭窗口 = 最小化到托盘，监控继续；要退出请点顶部 [退出]。"
+    "关闭窗口 = 最小化到托盘，追踪继续；要退出请点顶部 [退出]。"
 )
 
 
 # ==========================================================================
 class EntryDialog:
-    """新增 / 编辑黑名单条目。"""
+    """新增 / 编辑黑名单条目。
+
+    PeerID 一栏是**只读**的：它由「最近遇到」带进来，或者由程序写入。
+    用户在界面上没有地方手打 ID，所以再也不会出现 v1.1.2 那种
+    「把名字填进 ID 栏、名称栏留空，于是怎么都不命中」的错。
+    """
 
     def __init__(self, master, title="添加黑名单", entry=None):
         self.master = master
         self.result = None
+        entry = entry or {}
 
         self.top = tk.Toplevel(master)
         self.top.title(title)
@@ -103,7 +208,10 @@ class EntryDialog:
         self.top.grab_set()
 
         self.vars = {
-            "player_name": tk.StringVar(value=(entry or {}).get("player_name") or ""),
+            "player_name": tk.StringVar(value=entry.get("player_name") or ""),
+            "peer_id": tk.StringVar(value=entry.get("peer_id") or ""),
+            "prev_names": tk.StringVar(
+                value=format_prev_names(entry.get("prev_names"))),
         }
 
         frm = ttk.Frame(self.top, padding=12)
@@ -114,20 +222,33 @@ class EntryDialog:
         ttk.Entry(frm, textvariable=self.vars["player_name"], width=38).grid(
             row=0, column=1, columnspan=2, sticky="we", pady=4)
 
-        ttk.Label(frm, text="备注描述：").grid(row=1, column=0, sticky="nw", pady=4)
+        ttk.Label(frm, text="PeerID：").grid(row=1, column=0, sticky="w", pady=4)
+        ttk.Entry(frm, textvariable=self.vars["peer_id"], width=38,
+                  state="readonly").grid(row=1, column=1, sticky="we", pady=4)
+        ttk.Button(frm, text="复制", width=6,
+                   command=self._copy_peer).grid(row=1, column=2, padx=(6, 0))
+
+        ttk.Label(frm, text="曾用名：").grid(row=2, column=0, sticky="w", pady=4)
+        ttk.Entry(frm, textvariable=self.vars["prev_names"], width=38).grid(
+            row=2, column=1, columnspan=2, sticky="we", pady=4)
+
+        ttk.Label(frm, text="备注描述：").grid(row=3, column=0, sticky="nw", pady=4)
         self.note_text = tk.Text(frm, width=40, height=5, wrap="word")
         theme.style_text(self.note_text)
-        self.note_text.grid(row=1, column=1, columnspan=2, sticky="we", pady=4)
-        if entry and entry.get("note"):
+        self.note_text.grid(row=3, column=1, columnspan=2, sticky="we", pady=4)
+        if entry.get("note"):
             self.note_text.insert("1.0", entry["note"])
 
-        ttk.Label(frm, text="只需填玩家名称（就是游戏里显示的那个名字）；同名只能有一条。\n"
-                            "命中时的证据截图由程序自动保存到 data\\evidence\\，不用手填。",
-                  foreground="#888888", justify="left").grid(
-            row=2, column=0, columnspan=3, sticky="w", pady=(6, 0))
+        ttk.Label(
+            frm,
+            text=("有 PeerID = 精确命中（改名字也认得出）；没有则只能按名字匹配。\n"
+                  "PeerID 由程序从插件日志里读出来，不用手填、也改不了。\n"
+                  "曾用名可以自己填，多个用 / 分开；他改名时程序会自动往这里记。"),
+            foreground="#888888", justify="left").grid(
+            row=4, column=0, columnspan=3, sticky="w", pady=(6, 0))
 
         bar = ttk.Frame(frm)
-        bar.grid(row=3, column=0, columnspan=3, sticky="e", pady=(10, 0))
+        bar.grid(row=5, column=0, columnspan=3, sticky="e", pady=(10, 0))
         ttk.Button(bar, text="取消", command=self._cancel).pack(side="right",
                                                                padx=4)
         ttk.Button(bar, text="确定", command=self._ok).pack(side="right")
@@ -140,9 +261,21 @@ class EntryDialog:
         self.top.geometry(f"+{max(0, x)}+{max(0, y)}")
         self.top.wait_window()
 
+    def _copy_peer(self):
+        value = self.vars["peer_id"].get()
+        if not value:
+            return
+        try:
+            self.top.clipboard_clear()
+            self.top.clipboard_append(value)
+        except tk.TclError:
+            pass
+
     def _ok(self):
         data = {
             "player_name": self.vars["player_name"].get().strip(),
+            "peer_id": self.vars["peer_id"].get().strip(),
+            "prev_names": self.vars["prev_names"].get().strip(),
             "note": self.note_text.get("1.0", "end-1c").strip(),
         }
         if not data["player_name"]:
@@ -157,11 +290,144 @@ class EntryDialog:
         self.top.destroy()
 
 
+class RecentPickerDialog:
+    """从「最近遇到」里挑一个人加入名单。
+
+    存在的理由只有一个：**让程序把名字和 PeerID 填好**，用户只写备注。
+    抓到的人可能已经改过名字，所以名字是"最近一次看到"的，可以手改；
+    PeerID 才是判据。
+    """
+
+    COLUMNS = ("name", "peer_id", "last_seen", "games", "state")
+    HEADERS = {"name": "玩家名", "peer_id": "PeerID", "last_seen": "最近遇到",
+               "games": "遇到局数", "state": "状态"}
+    WIDTHS = {"name": 200, "peer_id": 150, "last_seen": 140, "games": 80,
+              "state": 120}
+
+    def __init__(self, master, rows, existing_peers=()):
+        self.master = master
+        #: 选中的人（dict）；"manual" = 用户选了手动输入
+        self.result = None
+        self._rows = list(rows or [])
+        self._existing = set(existing_peers or ())
+
+        top = self.top = tk.Toplevel(master)
+        top.title("从「最近遇到」里加入名单")
+        top.transient(master)
+        top.configure(bg=theme.PALETTE["bg"])
+        theme.apply_window_icon(top)
+        top.grab_set()
+        top.geometry("820x460")
+        top.minsize(680, 360)
+
+        frm = ttk.Frame(top, padding=10)
+        frm.pack(fill="both", expand=True)
+
+        head = ttk.Frame(frm)
+        head.pack(fill="x")
+        ttk.Label(head, text="搜索：", style="PanelMuted.TLabel").pack(side="left")
+        self.filter_var = tk.StringVar()
+        ent = ttk.Entry(head, textvariable=self.filter_var, width=24)
+        ent.pack(side="left", padx=4)
+        ent.bind("<KeyRelease>", lambda e: self._fill())
+        ttk.Label(head, text="（按名字或 PeerID 过滤；双击 = 加入名单）",
+                  style="PanelMuted.TLabel").pack(side="left", padx=(8, 0))
+
+        mid = ttk.Frame(frm)
+        mid.pack(fill="both", expand=True, pady=(8, 0))
+        self.tree = ttk.Treeview(mid, columns=self.COLUMNS, show="headings",
+                                 selectmode="browse")
+        for col in self.COLUMNS:
+            self.tree.heading(col, text=self.HEADERS[col])
+            self.tree.column(col, width=self.WIDTHS[col], minwidth=50,
+                             anchor="w" if col == "name" else "center",
+                             stretch=False)
+        vsb = ttk.Scrollbar(mid, orient="vertical", command=self.tree.yview)
+        self.tree.configure(yscrollcommand=vsb.set)
+        self.tree.pack(side="left", fill="both", expand=True)
+        vsb.pack(side="left", fill="y")
+        self.tree.bind("<Double-1>", lambda e: self._ok())
+
+        foot = ttk.Frame(frm)
+        foot.pack(fill="x", pady=(8, 0))
+        self.hint_var = tk.StringVar(value="")
+        ttk.Label(foot, textvariable=self.hint_var,
+                  style="PanelMuted.TLabel").pack(side="left")
+
+        ttk.Button(foot, text="取消", command=self._cancel).pack(side="right",
+                                                               padx=4)
+        ttk.Button(foot, text="加入名单", style="Accent.TButton",
+                   command=self._ok).pack(side="right")
+        ttk.Button(foot, text="手动输入…",
+                   command=self._manual).pack(side="right", padx=4)
+
+        self._fill()
+        top.bind("<Escape>", lambda e: self._cancel())
+        top.update_idletasks()
+        x = master.winfo_rootx() + (master.winfo_width() - top.winfo_width()) // 2
+        y = master.winfo_rooty() + (master.winfo_height() - top.winfo_height()) // 3
+        top.geometry(f"+{max(0, x)}+{max(0, y)}")
+        top.wait_window()
+
+    # ------------------------------------------------------------------ 内部
+    @staticmethod
+    def state_of(peer_id: str, existing) -> str:
+        """状态只看 PeerID：同名但不同 ID 是**另一个人**，不算"已在名单"。"""
+        return "已在名单" if peer_id in existing else "未加入"
+
+    def _display_name(self, row) -> str:
+        return (row.get("name_last") or row.get("name_first") or "").strip()
+
+    def _fill(self):
+        self.tree.delete(*self.tree.get_children())
+        needle = self.filter_var.get().strip().lower()
+        shown = 0
+        for row in self._rows:
+            pid = row.get("peer_id") or ""
+            name = self._display_name(row)
+            if needle and needle not in name.lower() and needle not in pid.lower():
+                continue
+            self.tree.insert("", "end", iid=pid,
+                             values=(name or "（无名）", pid,
+                                     row.get("last_seen") or "",
+                                     row.get("seen_count") or 1,
+                                     self.state_of(pid, self._existing)))
+            shown += 1
+        self.hint_var.set(f"共 {len(self._rows)} 人，显示 {shown} 人")
+
+    def _cancel(self):
+        self.result = None
+        self.top.destroy()
+
+    def _manual(self):
+        self.result = "manual"
+        self.top.destroy()
+
+    def _ok(self):
+        sel = [iid for iid in self.tree.selection()]
+        if not sel:
+            messagebox.showinfo("提示", "请先选中一个玩家", parent=self.top)
+            return
+        by_peer = {r.get("peer_id"): r for r in self._rows}
+        row = by_peer.get(sel[0])
+        if row is None:
+            return
+        if sel[0] in self._existing:
+            messagebox.showinfo("提示",
+                                "这个人已经在名单里了（列表里标着「已在名单」）",
+                                parent=self.top)
+            return
+        self.result = row
+        self.top.destroy()
+
+
 # ==========================================================================
 # 名单导入导出（模块级函数，方便单独测试）
 # ==========================================================================
 #: 导出/导入字段顺序（与 database.export_all 一致）
-IO_FIELDS = ("player_name", "note", "created_at")
+#: `peer_id` 与 `prev_names` 一起走：换台机器导回来，PeerID 精确匹配照样有效，
+#: 曾用名也不会丢（它在文件里是一串 JSON 数组，导入时原样带回来）。
+IO_FIELDS = ("player_name", "note", "peer_id", "prev_names", "created_at")
 
 
 def write_csv(path: str, rows) -> None:
@@ -276,6 +542,104 @@ class ImportStrategyDialog:
         self.top.destroy()
 
 
+class IgnoreListDialog:
+    """忽略名单：看有哪些人、逐条取消忽略、或整体清空。
+
+    「忽略」和「从列表移除」不是一回事：后者只是把这一条从「最近遇到」里
+    划掉，下次遇到照旧记录、照旧提醒；忽略是记进一张表，之后既不提醒、
+    也不再进列表 —— 所以**反悔的入口必须有**，就是这个对话框。
+    """
+
+    def __init__(self, master, db):
+        self.db = db
+        self.changed = False
+
+        top = self.top = tk.Toplevel(master)
+        top.title("忽略名单")
+        top.transient(master)
+        top.configure(bg=theme.PALETTE["bg"])
+        theme.apply_window_icon(top)
+        top.grab_set()
+        top.geometry("640x400")
+        top.minsize(520, 300)
+
+        frm = ttk.Frame(top, padding=10)
+        frm.pack(fill="both", expand=True)
+        ttk.Label(frm,
+                  text="下面这些人不会被提醒，也不会出现在「最近遇到」里。",
+                  style="Muted.TLabel").pack(anchor="w")
+
+        mid = ttk.Frame(frm)
+        mid.pack(fill="both", expand=True, pady=(8, 0))
+        self.tree = ttk.Treeview(mid, columns=("name", "peer_id", "added_at"),
+                                 show="headings", selectmode="browse")
+        for col, label, width in (("name", "玩家名", 180),
+                                  ("peer_id", "PeerID", 160),
+                                  ("added_at", "加入时间", 150)):
+            self.tree.heading(col, text=label)
+            self.tree.column(col, width=width,
+                             anchor="w" if col == "name" else "center",
+                             stretch=(col == "name"))
+        vsb = ttk.Scrollbar(mid, orient="vertical", command=self.tree.yview)
+        self.tree.configure(yscrollcommand=vsb.set)
+        self.tree.pack(side="left", fill="both", expand=True)
+        vsb.pack(side="left", fill="y")
+        self.tree.bind("<Double-1>", lambda e: self._unignore())
+
+        self.hint_var = tk.StringVar(value="")
+        foot = ttk.Frame(frm)
+        foot.pack(fill="x", pady=(8, 0))
+        ttk.Label(foot, textvariable=self.hint_var,
+                  style="Muted.TLabel").pack(side="left")
+        ttk.Button(foot, text="关闭", command=self._close).pack(side="right",
+                                                              padx=4)
+        ttk.Button(foot, text="取消忽略",
+                   command=self._unignore).pack(side="right")
+        ttk.Button(foot, text="清空忽略名单", style="Danger.TButton",
+                   command=self._clear).pack(side="right", padx=4)
+
+        self._fill()
+        top.bind("<Escape>", lambda e: self._close())
+        top.update_idletasks()
+        x = master.winfo_rootx() + (master.winfo_width() - top.winfo_width()) // 2
+        y = master.winfo_rooty() + (master.winfo_height() - top.winfo_height()) // 3
+        top.geometry(f"+{max(0, x)}+{max(0, y)}")
+        top.wait_window()
+
+    def _fill(self):
+        self.tree.delete(*self.tree.get_children())
+        rows = self.db.get_ignored()
+        for row in rows:
+            pid = row.get("peer_id") or ""
+            self.tree.insert("", "end", iid=pid, values=(
+                row.get("name") or "（无名）", pid, row.get("added_at") or ""))
+        self.hint_var.set(f"共 {len(rows)} 人")
+
+    def _unignore(self):
+        sel = list(self.tree.selection())
+        if not sel:
+            messagebox.showinfo("提示", "请先选中一个人（双击也行）",
+                                parent=self.top)
+            return
+        for pid in sel:
+            self.db.unignore_peer(pid)
+        self.changed = True
+        self._fill()
+
+    def _clear(self):
+        if not messagebox.askyesno(
+                "确认清空",
+                "清空整个忽略名单？\n（这些人以后会重新出现，也会重新提醒）",
+                parent=self.top):
+            return
+        self.db.clear_ignored()
+        self.changed = True
+        self._fill()
+
+    def _close(self):
+        self.top.destroy()
+
+
 # ==========================================================================
 class _ScrollArea(ttk.Frame):
     """竖向滚动容器（内容装得下就自动隐藏滚动条）。
@@ -349,27 +713,19 @@ class _ScrollArea(ttk.Frame):
 class BlacklistGUI:
     """主窗口。"""
 
-    def __init__(self, db, notification_config, region_config,
-                 matcher=None, scheduler=None, capture=None, notifier=None,
-                 chat_scanner=None, hotkey_config=None, on_quit=None,
-                 on_pause=None, on_chat_hotkey=None, app=None):
+    def __init__(self, db, notification_config, matcher=None, notifier=None,
+                 watcher=None, on_quit=None, on_pause=None, app=None):
         self.db = db
         self.notification_config = notification_config
-        self.region_config = region_config
         self.matcher = matcher
-        self.scheduler = scheduler
-        self.capture = capture
         self.notifier = notifier
-        self.chat_scanner = chat_scanner
-        self.hotkey_config = hotkey_config
+        self.watcher = watcher
         self.on_quit = on_quit
         self.on_pause = on_pause
-        self.on_chat_hotkey = on_chat_hotkey
         self.app = app
         self.log = get_logger("gui")
 
-        # 跨线程通信
-        self._update_queue = queue.Queue()
+        # 跨线程通信（后台线程只能用 post() 排可调用对象到主线程）
         self._command_queue = queue.Queue()
 
         self.session_hit_count = 0
@@ -385,6 +741,8 @@ class BlacklistGUI:
         self._flash_jobs = {}
         self._drain_job = None
         self._flash_job = None
+        self._watch_job = None            # 「最近遇到」页的定时刷新
+        self._recent_sig = None           # 上次渲染过的最近遇到列表指纹
 
         self.root = tk.Tk()
         self.root.title(config.WINDOW_TITLE)
@@ -394,12 +752,9 @@ class BlacklistGUI:
         theme.apply_theme(self.root)
         theme.apply_window_icon(self.root)
 
-        # 运行状态带上的开关变量（建好窗口后立刻创建，按钮直接绑定）
-        self.chat_hotkey_var = tk.BooleanVar(
-            value=bool(hotkey_config.enabled)
-            if hotkey_config is not None else False)
         self.pause_var = tk.BooleanVar(value=False)
         self.data_info_var = tk.StringVar(value="")
+        self.track_var = tk.StringVar(value="● 正在连接插件日志…")
         self.settings_expanded = False          # 设置区默认收起
         self.settings_page = SETTINGS_TABS[0][0]
         self.settings_pages = {}
@@ -412,23 +767,18 @@ class BlacklistGUI:
         self._build_toolbar()         # ② 名单工具带
         self._build_body()            # ③④ 名单 + 设置分页（可拖拽分隔）
         self._build_statusbar()       # ⑤ 状态栏
-        self._sync_hotkey_ui()
-
-        # 聊天框扫描的结果统一由扫描器回调上报：**按钮和 F8 热键走同一条路**，
-        # 否则按热键触发的那次扫描在界面上什么都不显示（实测反馈）。
-        if self.chat_scanner is not None:
-            self.chat_scanner.on_result = self._chat_scan_event
 
         self._load_data()
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
         self._drain_job = self.root.after(GUI_QUEUE_POLL_MS, self._drain_queues)
+        self._watch_job = self.root.after(400, self._tick_watch)
 
     # ------------------------------------------------------- ① 运行状态带
     def _build_header(self):
-        """顶部一条：应用标识 + 运行状态 + 高频动作。
+        """顶部一条：应用标识 + 追踪状态 + 高频动作。
 
-        这条带子取代了原来的「标题带 + 设置菜单」：F8 开关、暂停、扫描这些
-        随时要看、要点的东西现在一直露在外面，不用翻菜单。
+        数据来源只有一个文本文件，所以这里不再有"扫描""热键"这类按钮；
+        留下的是随时要看的东西：追踪指示灯、队伍人数、暂停、退出。
         """
         p = theme.PALETTE
         bar = ttk.Frame(self.root, style="Panel.TFrame", padding=(10, 6))
@@ -455,26 +805,20 @@ class BlacklistGUI:
         self.monitor_label = ttk.Label(bar, textvariable=self.monitor_var,
                                        style="Hit.TLabel")
         self.monitor_label.pack(side="left", padx=(16, 0))
+        ttk.Label(bar, textvariable=self.track_var,
+                  style="PanelMuted.TLabel").pack(side="left", padx=(12, 0))
 
         # ---- 右：高频动作（pack 顺序 = 从右往左）----
         ttk.Button(bar, text="退出", style="Bar.TButton",
                    command=self.quit_app).pack(side="right")
-        self.pause_btn = ttk.Button(bar, text="暂停监控", style="Bar.TButton",
+        self.pause_btn = ttk.Button(bar, text="暂停追踪", style="Bar.TButton",
                                     command=self.toggle_pause)
         self.pause_btn.pack(side="right", padx=(0, 6))
-        self.scan_chat_btn = ttk.Button(bar, text="扫描聊天框",
-                                        style="Accent.TButton",
-                                        command=self.scan_chat_now)
-        self.scan_chat_btn.pack(side="right", padx=(0, 6))
+        self.recent_btn = ttk.Button(bar, text="最近遇到", style="Accent.TButton",
+                                     command=self.open_recent)
+        self.recent_btn.pack(side="right", padx=(0, 6))
         ttk.Separator(bar, orient="vertical").pack(side="right", fill="y",
                                                    padx=10)
-        # 热键开关：文字写"动作"（启用/停用 X 扫描），金色 = 已启用。
-        # 原来是 textvariable 的"热键扫描：关"，在深色面板上看就是一段灰字，
-        # 用户根本不知道那是个按钮（实测反馈）。
-        self.hotkey_btn = ttk.Button(bar, text="启用扫描热键",
-                                     style="Bar.TButton",
-                                     command=self.toggle_hotkey)
-        self.hotkey_btn.pack(side="right", padx=(0, 6))
 
     # ------------------------------------------------------- ② 名单工具带
     def _build_toolbar(self):
@@ -596,9 +940,8 @@ class BlacklistGUI:
             return page
         page = ttk.Frame(self.settings_body, padding=2)
         {
-            "scan": self._page_scan,
+            "recent": self._page_recent,
             "notify": self._page_notify,
-            "region": self._page_region,
             "data": self._page_data,
             "help": self._page_help,
         }[key](page)
@@ -624,13 +967,12 @@ class BlacklistGUI:
             btn.configure(style="Accent.TButton" if k == key else "Bar.TButton")
         if expand and not self.settings_expanded:
             self.set_settings_expanded(True)
-        # 每次进「扫描与触发」都对齐一次热键总开关（顶部那个按钮才是开关的正主）
-        if key == "scan" and getattr(self, "hotkey_panel", None) is not None:
+        # 每次进「最近遇到」都立刻对齐一次（列表 + 追踪状态）
+        if key == "recent":
             try:
-                self.hotkey_panel.refresh_enabled(
-                    bool(self.chat_hotkey_var.get()))
+                self._refresh_recent(force=True)
             except Exception as e:                        # noqa: BLE001
-                self.log.warning("刷新自定义快捷键面板失败: %s", e)
+                self.log.warning("刷新「最近遇到」失败: %s", e)
         # force：刚建好的分页要等一轮几何计算才量得出内容高度
         self._sync_settings_layout(force=True)
 
@@ -746,46 +1088,67 @@ class BlacklistGUI:
             self.settings_toggle_btn.configure(
                 text="▾ 收起设置" if expanded else "▴ 展开设置")
 
-    # ---- 设置页：扫描与触发 ----
-    def _page_scan(self, parent):
-        left = ttk.Frame(parent)
-        left.pack(side="left", fill="both", expand=True)
-        right = ttk.Frame(parent)
-        right.pack(side="left", fill="both", expand=True, padx=(14, 0))
-
-        if self.hotkey_config is None:
-            ttk.Label(left, text="热键配置不可用", style="Muted.TLabel").pack(
-                anchor="w")
-        else:
-            from app.ui.hotkey_dialog import HotkeyPanel
-            # show_enabled=False：开关在顶部状态带上，这里只负责改键
-            self.hotkey_panel = HotkeyPanel(
-                left, self.hotkey_config, on_saved=self._on_hotkey_saved,
-                embedded=True, show_enabled=False)
-            self.hotkey_panel.pack(fill="both", expand=True)
-
-        box = ttk.LabelFrame(right, text="扫描节流与去重", padding=10)
+    # ---- 设置页：最近遇到 ----
+    def _page_recent(self, parent):
+        """追踪状态（只读）+ 「最近遇到」列表（可一键加入名单）。"""
+        box = ttk.LabelFrame(parent, text="追踪状态", padding=10)
         box.pack(fill="x")
-        rows = (
-            ("命中去重窗口", f"{config.HIT_DEDUP_WINDOW} 秒"),
-            ("抓屏间隔", f"{config.ESC_SESSION['interval']} 秒"),
-            ("画面没变时跳过 OCR",
-             "开" if config.SESSION_SKIP_UNCHANGED else "关"),
-            ("画面静止多少帧收工", f"{config.SESSION_MAX_STATIC_FRAMES} 帧"),
-            ("模糊匹配阈值", f"{config.MATCH_THRESHOLD} 分"),
-        )
-        for i, (label, value) in enumerate(rows):
-            ttk.Label(box, text=f"{label}：").grid(row=i, column=0, sticky="w",
-                                                  pady=2)
-            ttk.Label(box, text=value).grid(row=i, column=1, sticky="w",
-                                            padx=(8, 0), pady=2)
-        ttk.Label(box, text="这些是内置节流参数，改 config.py 后重启生效。",
-                  style="Muted.TLabel").grid(row=len(rows), column=0,
-                                             columnspan=2, sticky="w",
-                                             pady=(6, 0))
-        ttk.Button(right, text="清空命中去重缓存",
-                   command=self._clear_dedup_cache).pack(anchor="w",
-                                                         pady=(10, 0))
+        self.track_detail_var = tk.StringVar(value="")
+        ttk.Label(box, textvariable=self.track_detail_var, justify="left",
+                  style="Muted.TLabel", wraplength=980).pack(anchor="w")
+        row = ttk.Frame(box)
+        row.pack(fill="x", pady=(8, 0))
+        ttk.Button(row, text="打开日志目录",
+                   command=self.open_log_dir).pack(side="left")
+        ttk.Button(row, text="打开 playerLog.txt",
+                   command=self.open_player_log).pack(side="left", padx=6)
+        ttk.Button(row, text="刷新",
+                   command=lambda: self._refresh_recent(force=True)).pack(
+            side="left")
+
+        # 动作行放在**列表上面**：这一页内容比设置区高，按钮放下面会被滚出可视区
+        # （实测截图确认过：加入名单那排按钮整个看不见了）。正文越长的页越要这样排。
+        bar = ttk.Frame(parent)
+        bar.pack(fill="x", pady=(10, 4))
+        ttk.Button(bar, text="加入名单", style="Accent.TButton",
+                   command=self.add_from_recent).pack(side="left")
+        ttk.Button(bar, text="从列表移除",
+                   command=self.forget_recent_selected).pack(side="left",
+                                                             padx=6)
+        ttk.Button(bar, text="忽略此人",
+                   command=self.ignore_recent_selected).pack(side="left")
+        ttk.Button(bar, text="手动添加…",
+                   command=self.add_entry).pack(side="left", padx=6)
+        ttk.Button(bar, text="列宽自适应",
+                   command=self.reset_recent_columns).pack(side="left")
+        self.recent_hint_var = tk.StringVar(value="")
+        ttk.Label(bar, textvariable=self.recent_hint_var,
+                  style="Muted.TLabel").pack(side="right")
+
+        ttk.Label(parent,
+                  text="最近遇到（插件每读到一次名册就记一次；双击那一行 = 加入名单）",
+                  style="Muted.TLabel").pack(anchor="w", pady=(6, 2))
+        wrap = ttk.Frame(parent)
+        wrap.pack(fill="both", expand=True)
+        self.recent_tree = ttk.Treeview(wrap, columns=RECENT_COLUMNS,
+                                        show="headings", selectmode="browse",
+                                        height=7)
+        for col in RECENT_COLUMNS:
+            self.recent_tree.heading(col, text=RECENT_HEADERS[col])
+            self.recent_tree.column(col, width=RECENT_WIDTHS[col],
+                                    minwidth=RECENT_MIN_WIDTHS[col],
+                                    anchor="w" if col == "name" else "center",
+                                    stretch=False)
+        self._recent_fitter = _ColumnFitter(self.recent_tree, RECENT_COLUMNS,
+                                            RECENT_MIN_WIDTHS)
+        vsb = ttk.Scrollbar(wrap, orient="vertical",
+                            command=self.recent_tree.yview)
+        self.recent_tree.configure(yscrollcommand=vsb.set)
+        self.recent_tree.pack(side="left", fill="both", expand=True)
+        vsb.pack(side="left", fill="y")
+        self.recent_tree.bind("<Double-1>", lambda e: self.add_from_recent())
+
+        self._refresh_recent(force=True)
 
     # ---- 设置页：通知 ----
     def _page_notify(self, parent):
@@ -798,14 +1161,6 @@ class BlacklistGUI:
             parent, self.notification_config, self.notifier, embedded=True,
             on_saved=lambda: self._flash_status("通知设置已保存"))
         self.notify_panel.pack(fill="both", expand=True)
-
-    # ---- 设置页：监视区域 ----
-    def _page_region(self, parent):
-        from app.ui.calibrator import CalibratorPanel
-        self.region_panel = CalibratorPanel(
-            parent, self.region_config, self.capture, embedded=True,
-            on_changed=lambda: self._flash_status("区域配置已更新"))
-        self.region_panel.pack(fill="both", expand=True)
 
     # ---- 设置页：数据 ----
     def _page_data(self, parent):
@@ -823,25 +1178,41 @@ class BlacklistGUI:
             side="left", padx=6)
         ttk.Button(row, text="刷新统计", command=self._refresh_data_info).pack(
             side="left", padx=6)
+        row2 = ttk.Frame(parent)
+        row2.pack(fill="x", pady=(8, 0))
+        ttk.Button(row2, text="清空「最近遇到」", style="Danger.TButton",
+                   command=self.clear_recent).pack(side="left")
+        ttk.Button(row2, text="忽略名单…",
+                   command=self.open_ignore_list).pack(side="left", padx=6)
         ttk.Label(parent, text="导入 / 导出在名单工具条上。",
                   style="Muted.TLabel").pack(anchor="w", pady=(10, 0))
         self._refresh_data_info()
 
     def _refresh_data_info(self):
-        """数据页的只读统计：数据库条数/体积 + 证据图数量。"""
+        """数据页的只读统计：名单条数、能告警几条、追踪记录、忽略名单、体积。"""
         parts = []
         try:
-            parts.append(f"黑名单 {len(self.db.get_all())} 条")
+            entries = self.db.get_all()
+            with_id = sum(1 for e in entries if e.get("peer_id"))
+            parts.append(f"黑名单 {len(entries)} 条（可告警 {with_id} 条）")
+            if len(entries) > with_id:
+                parts.append(f"⚠ {len(entries) - with_id} 条没有 PeerID，"
+                             "不会告警（右键[补全 PeerID]）")
+        except Exception:                                # noqa: BLE001
+            pass
+        try:
+            parts.append(f"最近遇到 {self.db.count_seen()} 人"
+                         f"（{config.RECENT_DAYS} 天内 "
+                         f"{self.db.count_seen(days=config.RECENT_DAYS)} 人）")
+        except Exception:                                # noqa: BLE001
+            pass
+        try:
+            parts.append(f"已忽略 {len(self.db.ignored_peers())} 人")
         except Exception:                                # noqa: BLE001
             pass
         try:
             size = os.path.getsize(config.DB_PATH) / 1024.0
             parts.append(f"数据库 {size:.0f} KB")
-        except OSError:
-            pass
-        try:
-            shots = len(os.listdir(config.EVIDENCE_DIR))
-            parts.append(f"证据截图 {shots} 张")
         except OSError:
             pass
         self.data_info_var.set("　·　".join(parts) if parts else "（暂无数据）")
@@ -869,9 +1240,12 @@ class BlacklistGUI:
         for col in COLUMNS:
             self.tree.heading(col, text=HEADERS[col],
                               command=lambda c=col: self.sort_by_column(c))
+            # stretch=False 是有意的：宽度完全由用户拖出来，见 _ColumnFitter
             self.tree.column(col, width=WIDTHS[col],
+                             minwidth=MIN_WIDTHS[col],
                              anchor="center" if col != "note" else "w",
-                             stretch=(col == "note"))
+                             stretch=False)
+        self._column_fitter = _ColumnFitter(self.tree, COLUMNS, MIN_WIDTHS)
 
         vsb = ttk.Scrollbar(frm, orient="vertical", command=self.tree.yview)
         hsb = ttk.Scrollbar(frm, orient="horizontal", command=self.tree.xview)
@@ -891,6 +1265,12 @@ class BlacklistGUI:
         self.menu = theme.make_menu(self.root)
         self.menu.add_command(label="编辑", command=self.edit_selected)
         self.menu.add_command(label="删除", command=self.delete_selected)
+        self.menu.add_separator()
+        self.menu.add_command(label="复制名称", command=self.copy_name)
+        self.menu.add_command(label="复制 PeerID", command=self.copy_peer_id)
+        self.menu.add_command(label="补全 PeerID", command=self.fill_peer_id)
+        self.menu.add_separator()
+        self.menu.add_command(label="列宽自适应", command=self.reset_column_widths)
         self._ctx_iid = None
 
     def _build_statusbar(self):
@@ -977,15 +1357,17 @@ class BlacklistGUI:
 
     @staticmethod
     def _row_values(row):
-        return (row.get("player_name") or "", row.get("note") or "",
-                row.get("created_at") or "")
+        # 最后一列是占位空白列，永远给空串；曾用名存的是 JSON，显示成一行
+        return (row.get("player_name") or "", row.get("peer_id") or "",
+                format_prev_names(row.get("prev_names")),
+                row.get("note") or "", row.get("created_at") or "", "")
 
     def refresh(self):
         self._load_data()
 
     # ------------------------------------------------------------ 排序搜索
     def sort_by_column(self, col):
-        if col not in ("player_name", "note", "created_at"):
+        if col not in ("player_name", "peer_id", "note", "created_at"):
             return
         if self.sort_key == col:
             self.sort_desc = not self.sort_desc
@@ -1031,17 +1413,61 @@ class BlacklistGUI:
 
     # ---------------------------------------------------------------- CRUD
     def add_entry(self):
+        """添加黑名单。
+
+        默认先让用户在「最近遇到」里挑人 —— 名字和 PeerID 由程序填好，
+        只需要写备注；也可以选「手动输入」走老路（只填名字，只能按名字匹配）。
+        """
+        rows = self._recent_rows()
+        if rows:
+            existing = set()
+            try:
+                existing = set(self.db.blacklist_peers())
+            except Exception:                            # noqa: BLE001
+                pass
+            dlg = RecentPickerDialog(self.root, rows, existing_peers=existing)
+            if dlg.result is None:
+                return                                   # 取消 = 什么都不做
+            if dlg.result != "manual":
+                self._add_from_seen(dlg.result)
+                return
+        self._add_manual()
+
+    def _add_manual(self):
         dlg = EntryDialog(self.root, "添加黑名单条目")
         if not dlg.result:
             return
+        self._commit_add(dlg.result)
+
+    def _add_from_seen(self, row):
+        """从「最近遇到」加入名单：名字与 PeerID 预填好，只让用户写备注。"""
+        peer_id = row.get("peer_id") or ""
+        name = (row.get("name_last") or row.get("name_first") or "").strip()
+        dlg = EntryDialog(self.root, "加入名单",
+                          {"player_name": name or peer_id, "peer_id": peer_id})
+        if not dlg.result:
+            return
+        if self._commit_add(dlg.result) is not None:
+            self._refresh_recent(force=True)
+
+    def _commit_add(self, data):
+        """写进名单。同一个 PeerID 已经存在时不会新增，而是更新那一条的名字。"""
+        before = self.db.get_count()
         try:
-            entry_id = self.db.add(**dlg.result)
+            entry_id = self.db.add(data.get("player_name") or "",
+                                   data.get("note") or "",
+                                   peer_id=data.get("peer_id") or "",
+                                   prev_names=data.get("prev_names") or "")
         except ValueError as e:
             messagebox.showerror("添加失败", str(e), parent=self.root)
-            return
+            return None
         self._after_db_change()
-        self.set_status(f"已添加条目 #{entry_id}")
+        if self.db.get_count() > before:
+            self.set_status(f"已添加条目 #{entry_id}")
+        else:
+            self.set_status(f"这个 PeerID 已在名单里 → 更新了 #{entry_id} 的名字")
         self._select_and_reveal(str(entry_id))
+        return entry_id
 
     def edit_selected(self):
         iid = self._selected_iid()
@@ -1056,7 +1482,11 @@ class BlacklistGUI:
         if not dlg.result:
             return
         try:
-            self.db.update(int(iid), **dlg.result)
+            # PeerID 不在这里改：它在界面上是只读的，属于系统字段。
+            # 曾用名以编辑框里的内容为准（清空就是清空）。
+            self.db.update(int(iid), player_name=dlg.result["player_name"],
+                           note=dlg.result["note"],
+                           prev_names=dlg.result.get("prev_names", ""))
         except ValueError as e:
             messagebox.showerror("保存失败", str(e), parent=self.root)
             return
@@ -1069,10 +1499,11 @@ class BlacklistGUI:
         if not iids:
             messagebox.showinfo("提示", "请先选中要删除的记录", parent=self.root)
             return
-        if not messagebox.askyesno("确认删除",
-                                   f"确定删除选中的 {len(iids)} 条记录？\n"
-                                   "同时会删除这些条目的命中历史。",
-                                   parent=self.root):
+        if not messagebox.askyesno(
+                "确认删除",
+                f"确定删除选中的 {len(iids)} 条记录？\n"
+                "「最近遇到」里仍然留着这些人（那是遇到过的事实，不是名单）。",
+                parent=self.root):
             return
         for iid in iids:
             self.db.delete(int(iid))
@@ -1081,16 +1512,15 @@ class BlacklistGUI:
 
     def _after_db_change(self):
         self._load_data()
-        if self.scheduler is not None:
-            try:
-                self.scheduler.reload_blacklist()
-            except Exception as e:                       # noqa: BLE001
-                self.log.warning("刷新匹配索引失败: %s", e)
-        if self.matcher is not None and self.scheduler is None:
+        if self.matcher is not None:
             try:
                 self.matcher.reload()
-            except Exception:                            # noqa: BLE001
-                pass
+            except Exception as e:                       # noqa: BLE001
+                self.log.warning("刷新匹配索引失败: %s", e)
+        try:
+            self._refresh_data_info()
+        except Exception:                                # noqa: BLE001
+            pass
 
     def _selected_iid(self):
         sel = self.tree.selection()
@@ -1101,6 +1531,16 @@ class BlacklistGUI:
             self.tree.selection_set(iid)
             self.tree.focus(iid)
             self.tree.see(iid)
+
+    def reset_column_widths(self):
+        """[列宽自适应]：列宽恢复默认，空白列重新吃掉剩余宽度（拖乱了就用这个）。"""
+        for col in COLUMNS:
+            try:
+                self.tree.column(col, width=WIDTHS[col])
+            except tk.TclError:
+                return
+        self._column_fitter.apply()
+        self._flash_status("列宽已恢复默认（每一列都可以自己拖）")
 
     def _on_right_click(self, event):
         iid = self.tree.identify_row(event.y)
@@ -1114,10 +1554,343 @@ class BlacklistGUI:
         finally:
             self.menu.grab_release()
 
+    def copy_name(self):
+        """把选中条目的玩家名复制到剪贴板（去游戏里粘贴搜索用）。"""
+        iid = getattr(self, "_ctx_iid", None) or self._selected_iid()
+        if not iid:
+            return
+        entry = self.db.get(int(iid))
+        if entry:
+            self._copy_to_clipboard(entry.get("player_name") or "")
+
+    def copy_peer_id(self):
+        """把选中条目的 PeerID 复制到剪贴板。"""
+        iid = getattr(self, "_ctx_iid", None) or self._selected_iid()
+        if not iid:
+            return
+        entry = self.db.get(int(iid))
+        if not entry:
+            return
+        value = entry.get("peer_id") or ""
+        if not value:
+            self._flash_status("这条没有 PeerID → 不会告警；"
+                               "右键[补全 PeerID] 或从「最近遇到」重新加入")
+            return
+        self._copy_to_clipboard(value)
+
+    def _copy_to_clipboard(self, value: str):
+        if not value:
+            return
+        try:
+            self.root.clipboard_clear()
+            self.root.clipboard_append(value)
+            self._flash_status(f"已复制：{value}")
+        except tk.TclError:
+            pass
+
+    def fill_peer_id(self):
+        """给老条目补上 PeerID：从「最近遇到」里挑一个。
+
+        为什么需要：老条目只有名字，只能按名字匹配 —— 别人取同名就会误报。
+        补上 ID 之后这条就只走精确层（改名字也认得出，也不会被冒充）。
+        """
+        iid = getattr(self, "_ctx_iid", None) or self._selected_iid()
+        if not iid:
+            messagebox.showinfo("提示", "请先选中一条记录", parent=self.root)
+            return
+        entry = self.db.get(int(iid))
+        if not entry:
+            self.refresh()
+            return
+        if entry.get("peer_id"):
+            if not messagebox.askyesno(
+                    "这条已经有 PeerID",
+                    f"「{entry['player_name']}」现在的 PeerID 是\n"
+                    f"{entry['peer_id']}\n\n要换成另一个吗？",
+                    parent=self.root):
+                return
+        rows = self._recent_rows()
+        if not rows:
+            messagebox.showinfo(
+                "提示",
+                "「最近遇到」还是空的，没有可挑的人。\n"
+                "（和游戏一起跑一会儿，等到他出现在列表里再回来补）",
+                parent=self.root)
+            return
+        dlg = RecentPickerDialog(self.root, rows, existing_peers=())
+        if dlg.result in (None, "manual"):
+            return
+        try:
+            self.db.set_peer_id(int(iid), dlg.result.get("peer_id") or "")
+        except ValueError as e:
+            messagebox.showerror("补全失败", str(e), parent=self.root)
+            return
+        self._after_db_change()
+        self._select_and_reveal(iid)
+        self._flash_status(f"已给「{entry['player_name']}」补上 PeerID")
+
+    def on_rename(self, data: dict) -> None:
+        """日志里发现名单里那个人改名了 —— 名单已经跟着改完，这里只说一声。
+
+        这条不是"锦上添花"：名字同步是**自动改你数据库**的操作，不让用户看见
+        就等于偷偷改数据。所以状态栏 +「最近动态」+ 那一行闪一下，三处都留痕。
+        """
+        old = data.get("old") or ""
+        new = data.get("new") or ""
+        peer_id = data.get("peer_id") or ""
+        self._after_db_change()
+        if peer_id:
+            entry = self.db.find_by_peer_id(peer_id)
+            if entry is not None:
+                self._flash_row(str(entry["id"]), times=4)
+        text = f"名单名字自动更新：{old} → {new}"
+        self._flash_status(text, 6000)
+        self.notify_event(text, "info")
+
+    # -------------------------------------------------- 最近遇到（追踪）
+    def _recent_rows(self) -> list:
+        """读「最近遇到」列表（读不到就返回空，界面不炸）。"""
+        try:
+            return self.db.get_recent_seen()
+        except Exception as e:                           # noqa: BLE001
+            self.log.warning("读取「最近遇到」失败: %s", e)
+            return []
+
+    def open_recent(self):
+        """[最近遇到]：跳到那一页。"""
+        self.show_settings_page("recent")
+
+    def reset_recent_columns(self):
+        """[列宽自适应]：「最近遇到」列表的列宽恢复默认，空白列重新吃掉剩余宽度。"""
+        for col in RECENT_COLUMNS:
+            try:
+                self.recent_tree.column(col, width=RECENT_WIDTHS[col])
+            except tk.TclError:
+                return
+        self._recent_fitter.apply()
+        self._flash_status("列宽已恢复默认（每一列都可以自己拖）")
+
+    def _refresh_recent(self, force: bool = False):
+        """刷新「最近遇到」页：追踪状态文字 + 列表（只在真的变了时重建）。"""
+        tree = getattr(self, "recent_tree", None)
+        rows = self._recent_rows()
+        existing = set()
+        try:
+            existing = set(self.db.blacklist_peers())
+        except Exception:                                # noqa: BLE001
+            pass
+
+        if tree is not None:
+            signature = tuple((r.get("peer_id"),
+                               r.get("name_last") or r.get("name_first"),
+                               r.get("seen_count"),
+                               r.get("peer_id") in existing)
+                              for r in rows)
+            if force or signature != self._recent_sig:
+                keep = None
+                sel = tree.selection()
+                if sel:
+                    keep = sel[0]
+                tree.delete(*tree.get_children())
+                for r in rows:
+                    pid = r.get("peer_id") or ""
+                    name = (r.get("name_last") or r.get("name_first") or "").strip()
+                    tree.insert("", "end", iid=pid, values=(
+                        name or "（无名）", pid, r.get("last_seen") or "",
+                        r.get("seen_count") or 1,
+                        "已在名单" if pid in existing else "未加入", ""))
+                self._recent_sig = signature
+                if keep and tree.exists(keep):
+                    tree.selection_set(keep)
+
+        hint = getattr(self, "recent_hint_var", None)
+        if hint is not None:
+            hint.set(f"共 {len(rows)} 人（{config.RECENT_DAYS} 天内）")
+
+        self._refresh_track_detail()
+
+    def _refresh_track_detail(self):
+        """把追踪状态写进「最近遇到」页的只读区块。"""
+        var = getattr(self, "track_detail_var", None)
+        if var is None:
+            return
+        if self.watcher is None:
+            var.set("追踪器未接入（数据来源不可用）")
+            return
+        s = self.watcher.snapshot()
+        lines = [f"日志文件：{s['path'] or '（未取到路径）'}",
+                 f"文件状态：{'存在' if s['exists'] else '不存在'}"
+                 f"　大小 {s['size']} 字节　已读到偏移 {s['offset']}",
+                 f"插件版本：{s['plugin'] or '未知'}"
+                 + (f"（⚠ 低于要求的 {s['plugin_required']}，字段可能对不上）"
+                    if s["plugin_outdated"] else ""),
+                 f"解析：成功 {s['lines']} 行　失败 {s['bad_lines']} 行　"
+                 f"重复丢弃 {s['dup_lines']} 行",
+                 f"游戏 PID：{s['game_pid'] or '—'}　"
+                 f"我自己：{s['self_name'] or '未知'}"
+                 f"　最后事件：{s['last_event'] or '—'}"
+                 f" @ {s['last_event_at'] or '—'}"]
+        squad = s["squad"]
+        if squad:
+            members = "、".join(f"{m['name'] or '（无名）'}"
+                                for m in squad)
+            lines.append(f"当前队伍（{len(squad)} 人）：{members}")
+        else:
+            lines.append("当前队伍：（空 —— 没在队里，或者插件还没读到名册）")
+        if s["error"]:
+            lines.append(f"⚠ {s['error']}")
+        if not s["dir_exists"]:
+            lines.append(f"⚠ 找不到日志目录 {s['dir']} —— 游戏里装 HD2Tracker 了吗？")
+        var.set("\n".join(lines))
+
+    def _tick_watch(self):
+        """每秒刷一次追踪状态（只在真的变化时重建最近遇到列表）。"""
+        if self._closing:
+            return
+        try:
+            snap = self.watcher.snapshot() if self.watcher is not None else None
+            if snap is None:
+                self.track_var.set("● 无数据来源")
+            elif not snap["dir_exists"] or not snap["exists"]:
+                self.track_var.set("● 未找到插件日志")
+            elif snap["plugin_outdated"]:
+                self.track_var.set("● 插件版本过旧")
+            else:
+                self.track_var.set(
+                    f"● 追踪中 · 队伍 {len(snap['squad'])} 人 · "
+                    f"最近遇到 {self.db.count_seen()} 人")
+            if self.settings_page == "recent" and self.recent_tree is not None:
+                self._refresh_recent(force=False)
+        except Exception as e:                           # noqa: BLE001
+            self.log.warning("刷新追踪状态失败: %s", e)
+        finally:
+            if not self._closing:
+                try:
+                    self._watch_job = self.root.after(1000, self._tick_watch)
+                except tk.TclError:
+                    self._watch_job = None
+
+    def add_from_recent(self):
+        """[加入名单]：从列表里选中的人 → 预填名字与 PeerID → 只写备注。"""
+        tree = getattr(self, "recent_tree", None)
+        if tree is None:
+            return
+        sel = tree.selection()
+        if not sel:
+            messagebox.showinfo("提示", "请先在列表里选中一个人", parent=self.root)
+            return
+        row = self.db.get_seen(sel[0])
+        if not row:
+            self._refresh_recent(force=True)
+            return
+        self._add_from_seen(row)
+
+    def forget_recent_selected(self):
+        """[从列表移除]：把这个人从「最近遇到」里划掉（不影响名单）。"""
+        tree = getattr(self, "recent_tree", None)
+        if tree is None:
+            return
+        sel = list(tree.selection())
+        if not sel:
+            messagebox.showinfo("提示", "请先在列表里选中一个人", parent=self.root)
+            return
+        if not messagebox.askyesno(
+                "确认移除",
+                f"把这 {len(sel)} 个人从「最近遇到」里划掉？\n"
+                "（不会动黑名单；下次再遇到他们还是会重新出现）",
+                parent=self.root):
+            return
+        for pid in sel:
+            self.db.forget_seen(pid)
+        self._refresh_recent(force=True)
+        self._refresh_data_info()
+        self._flash_status(f"已从列表移除 {len(sel)} 人")
+
+    def clear_recent(self):
+        """[清空最近遇到]：整张列表清掉（名单不动）。"""
+        if not messagebox.askyesno("确认清空",
+                                   "清空「最近遇到」全部记录？\n"
+                                   "（不动黑名单；下次再遇到他们还是会重新记录）",
+                                   parent=self.root):
+            return
+        self.db.clear_seen()
+        self._refresh_recent(force=True)
+        self._refresh_data_info()
+        self._flash_status("「最近遇到」已清空")
+
+    def ignore_recent_selected(self):
+        """[忽略此人]：以后不再提醒他，也不再进「最近遇到」。
+
+        和[从列表移除]的区别：那个只是把这一条划掉，下次遇到照旧提醒；
+        忽略是记进忽略名单。反悔的入口在「数据」页 → [忽略名单…]。
+        """
+        tree = getattr(self, "recent_tree", None)
+        if tree is None:
+            return
+        sel = list(tree.selection())
+        if not sel:
+            messagebox.showinfo("提示", "请先在列表里选中一个人", parent=self.root)
+            return
+        row = self.db.get_seen(sel[0]) or {}
+        name = (row.get("name_last") or row.get("name_first") or "").strip()
+        if not messagebox.askyesno(
+                "确认忽略",
+                f"以后不再提醒「{name or sel[0]}」，也不再把他列进「最近遇到」？\n"
+                "（可以在「数据」页 → [忽略名单…] 里取消）",
+                parent=self.root):
+            return
+        for pid in sel:
+            self.db.ignore_peer(pid, name)
+        self._refresh_recent(force=True)
+        self._refresh_data_info()
+        self._flash_status(f"已忽略 {len(sel)} 人")
+
+    def open_ignore_list(self):
+        """[忽略名单…]：查看 / 逐条取消忽略 / 整体清空。"""
+        dlg = IgnoreListDialog(self.root, self.db)
+        if dlg.changed:
+            self._refresh_recent(force=True)
+            self._refresh_data_info()
+            self._flash_status("忽略名单已更新")
+
+    def open_log_dir(self):
+        try:
+            os.startfile(config.PLUGIN_LOG_DIR)          # noqa: S606
+        except Exception as e:                           # noqa: BLE001
+            messagebox.showerror("打开失败", str(e), parent=self.root)
+
+    def open_player_log(self):
+        path = config.player_log_path()
+        if not os.path.exists(path):
+            messagebox.showinfo("提示",
+                                f"文件还不存在：\n{path}\n"
+                                "（插件没加载，或者还没进过任何一局）",
+                                parent=self.root)
+            return
+        try:
+            os.startfile(path)                           # noqa: S606
+        except Exception as e:                           # noqa: BLE001
+            messagebox.showerror("打开失败", str(e), parent=self.root)
+
     # -------------------------------------------------- 后台线程 → 主线程
-    def enqueue_encounter_update(self, data: dict) -> None:
-        """供 ScanScheduler 的后台线程调用（唯一允许的跨线程入口）。"""
-        self._update_queue.put(data)
+    def on_alert(self, data: dict) -> None:
+        """供 app 层推送一次命中（主线程里执行）。
+
+        与 v1 的 ``enqueue_encounter_update`` 是同一个位置，区别是它现在
+        直接由 app 层经 `_gui_call` 派发，不再需要一条专用队列。
+        """
+        entry = data.get("entry") or {}
+        iid = str(entry.get("id") or "")
+        if iid and self.tree.exists(iid):
+            self._flash_row(iid, times=config.FLASH_TIMES)
+        self.session_hit_count += 1
+        self._refresh_stats()
+        name = data.get("name") or entry.get("player_name") or "未知"
+        label = config.alert_source_label(data.get("source") or "")
+        note = "" if data.get("notified") else "（提示未能弹出，见日志）"
+        self.set_status(f"命中黑名单：{name}　匹配度 "
+                        f"{float(data.get('score') or 0):.0f}　{label}{note}")
+        self.notify_event(f"命中黑名单：{name}　{label}", "hit")
 
     def post(self, func) -> None:
         """把任意可调用对象排到主线程执行（托盘线程用）。"""
@@ -1147,17 +1920,7 @@ class BlacklistGUI:
                                               self._drain_queues)
 
     def _drain_once(self):
-        """排空两个队列（不排定时器，可安全地被测试或其它代码直接调用）。"""
-        try:
-            while True:
-                data = self._update_queue.get_nowait()
-                try:
-                    self._apply_encounter_update(data)
-                except Exception as e:                   # noqa: BLE001
-                    self.log.warning("应用命中更新失败: %s", e)
-        except queue.Empty:
-            pass
-
+        """排空命令队列（不排定时器，可安全地被测试或其它代码直接调用）。"""
         try:
             while True:
                 func = self._command_queue.get_nowait()
@@ -1167,22 +1930,6 @@ class BlacklistGUI:
                     self.log.warning("主线程任务异常: %s", e)
         except queue.Empty:
             pass
-
-    def _apply_encounter_update(self, data: dict):
-        """命中后由主线程更新界面：闪烁那一行 + 状态栏 + 动态流。
-
-        名单里已经没有「遇到次数 / 最后遇见」这些列了，所以这里不写单元格，
-        只把命中那一行闪一下，具体事实（时间 / 匹配度 / 来源 / 证据图）
-        记在数据库的 encounters 表与 app.log 里。
-        """
-        iid = str(data.get("entry_id"))
-        if self.tree.exists(iid):
-            self._flash_row(iid, times=config.FLASH_TIMES)
-        self.session_hit_count += 1
-        self._refresh_stats()
-        name = data.get("player_name") or "未知"
-        self.set_status(f"命中黑名单：{name}（{data.get('source', '')}，"
-                        f"匹配度 {float(data.get('score') or 0):.0f}）")
 
     def _flash_row(self, iid, times=None, interval=None):
         """命中后行高亮闪烁（约 3 秒后恢复）。"""
@@ -1216,12 +1963,18 @@ class BlacklistGUI:
     def _refresh_stats(self):
         total = len(self.tree.get_children())
         try:
-            today = self.db.get_today_encounter_count()
+            seen = self.db.count_seen()
         except Exception:                                # noqa: BLE001
-            today = 0
+            seen = 0
+        squad = 0
+        if self.watcher is not None:
+            try:
+                squad = len(self.watcher.snapshot()["squad"])
+            except Exception:                            # noqa: BLE001
+                squad = 0
         self.stats_var.set(
-            f"黑名单总数：{total}　|　本局命中：{self.session_hit_count}"
-            f"　|　今日命中：{today}"
+            f"黑名单总数：{total}　|　本局告警：{self.session_hit_count}"
+            f"　|　最近遇到：{seen} 人　|　当前队伍：{squad} 人"
         )
 
     def set_status(self, text: str):
@@ -1243,7 +1996,7 @@ class BlacklistGUI:
         self.status_var.set(f"就绪（当前列出 {total} 条）")
 
     def reset_session_stats(self):
-        """一局开始时清零“本局命中”。"""
+        """一局开始时清零「本局告警」。"""
         self.session_hit_count = 0
         self._refresh_stats()
 
@@ -1270,7 +2023,7 @@ class BlacklistGUI:
                 f"● 已暂停{(' (' + self.game_reason + ')') if self.game_reason else ''}")
             self.monitor_label.configure(style="Paused.TLabel")
         else:
-            self.monitor_var.set("● 监控中")
+            self.monitor_var.set("● 追踪中")
             self.monitor_label.configure(style="Hit.TLabel")
 
     def toggle_pause(self):
@@ -1287,233 +2040,27 @@ class BlacklistGUI:
         if notify and self.on_pause:
             self.on_pause(self.paused)
         self._render_monitor()
-        self.set_status("已暂停监控" if self.paused else "已恢复监控")
+        self.set_status("已暂停追踪" if self.paused else "已恢复追踪")
         self._sync_pause_ui()
 
     def _sync_pause_ui(self):
-        """顶部 [暂停监控] 按钮的文字/样式跟着状态走。"""
+        """顶部 [暂停追踪] 按钮的文字/样式跟着状态走。"""
         btn = getattr(self, "pause_btn", None)
         if btn is None:
             return
         try:
-            btn.configure(text="恢复监控" if self.paused else "暂停监控",
+            btn.configure(text="恢复追踪" if self.paused else "暂停追踪",
                           style="Accent.TButton" if self.paused else "Bar.TButton")
         except tk.TclError:
             pass
 
     # ---------------------------------------------------------------- 设置
-    def open_calibrator(self):
-        """打开设置区的「监视区域」分页（原来是个独立对话框）。"""
-        self.show_settings_page("region")
-
-    def reset_regions(self):
-        if not messagebox.askyesno("确认", "恢复全部监视区域为默认坐标？",
-                                   parent=self.root):
-            return
-        self.region_config.reset_all()
-        self.set_status("全部区域已恢复默认")
-
     def open_notification_settings(self):
         """打开设置区的「通知」分页（原来是个独立对话框）。"""
         if self.notifier is None:
             messagebox.showinfo("提示", "通知模块不可用", parent=self.root)
             return
         self.show_settings_page("notify")
-
-    # ------------------------------------------------------- 聊天框按需扫描
-    def scan_chat_now(self):
-        """[扫描聊天框]：抓一张聊天框截图、跑一次 OCR、匹配黑名单。
-
-        OCR 放到后台线程，避免阻塞 UI；结果由 ChatScanner.on_result 回调
-        回到主线程播报（和 F8 热键走的是同一条路）。
-        """
-        if self.chat_scanner is None:
-            self._flash_status("聊天框扫描不可用（未接入 ChatScanner）")
-            self.notify_event("聊天框扫描不可用（未接入 ChatScanner）", "warn")
-            return
-        if self.chat_scanner.is_busy():
-            self._flash_status("上一次聊天框扫描还没结束，已忽略本次点击")
-            self.notify_event("上一次聊天框扫描还没结束，本次点击已忽略",
-                              "warn")
-            return
-        threading.Thread(target=self._scan_chat_worker, daemon=True,
-                         name="ChatScan").start()
-
-    def _scan_chat_worker(self):
-        try:
-            self.chat_scanner.scan_now()
-        except Exception as e:                           # noqa: BLE001
-            # 正常路径下结果由 ChatScanner.on_result 上报；这里只兜住
-            # "scan_now 自己炸了"这种情况，否则界面上会什么都没有。
-            # 注意：不能把 e 直接闭包进 lambda —— except 块结束后这个名字
-            # 会被删掉，延迟执行的回调只会拿到 NameError（踩过）。
-            message = str(e)
-            self.log.warning("聊天框扫描线程异常: %s", message)
-            self.post(lambda: self._on_scan_chat_done(
-                {"status": "error", "error": message}))
-
-    def _chat_scan_event(self, result: dict):
-        """ChatScanner.on_result 回调 —— **在扫描线程里**被调用。
-
-        这里只做一件事：把结果排进命令队列，真正的界面更新在主线程。
-        """
-        self.post(lambda: self._on_scan_chat_done(result))
-
-    def _scan_source_label(self, result: dict) -> str:
-        """把来源翻成一句人话：按 F8 / 点按钮 / 热键名。"""
-        source = result.get("source") or ""
-        if source == config.CHAT_SCAN_HOTKEY_SOURCE:
-            name = "热键"
-            if self.hotkey_config is not None:
-                try:
-                    name = self.hotkey_config.display or "热键"
-                except Exception:                        # noqa: BLE001
-                    pass
-            return f"按 {name}"
-        if source == config.CHAT_SCAN_SOURCE:
-            return "点 [扫描聊天框]"
-        return "聊天框扫描"
-
-    def _scan_chat_message(self, result: dict) -> tuple:
-        """把一次聊天框扫描的结果翻成（给人看的一句话, 级别）。"""
-        status = result.get("status")
-        hits = int(result.get("hits") or 0)
-        ms = float(result.get("elapsed_ms") or 0)
-        label = self._scan_source_label(result)
-
-        if status == "started":
-            return (f"{label}：开始扫描聊天框…", "info")
-        if status == "busy":
-            return ("上一次扫描尚未完成，本次已跳过", "warn")
-        if status == "empty":
-            return (f"{label}：聊天框扫描完成，但聊天框为空"
-                    f"（没识别到文字，{ms:.0f}ms）", "info")
-        if status == "no_hit":
-            return (f"{label}：聊天框扫描完成，未命中黑名单（{ms:.0f}ms）",
-                    "info")
-        if status == "ok":
-            names = "、".join(str(n) for n in (result.get("names") or []))
-            recorded = int(result.get("recorded") or 0)
-            deduped = int(result.get("deduped") or 0)
-            head = f"{label}：聊天框扫描完成，命中 {hits} 条"
-            if names:
-                head += f"：{names}"
-            if recorded and deduped:
-                detail = (f"{recorded} 条已提示并记录，"
-                          f"{deduped} 条在 {config.HIT_DEDUP_WINDOW} 秒去重窗口内已跳过")
-                return (f"{head}（{detail}，{ms:.0f}ms）", "hit")
-            if recorded:
-                return (f"{head}（已提示 + 已记录，{ms:.0f}ms）", "hit")
-            if deduped:
-                return (f"{head}（{config.HIT_DEDUP_WINDOW} 秒内已提示过 → "
-                        f"本次跳过，未重复计数，{ms:.0f}ms）", "dedup")
-            # 命中了但一条都没落库（数据库被占用之类）
-            return (f"{head}（命中但全部写入失败，详见日志，{ms:.0f}ms）",
-                    "warn")
-        if status == "error":
-            return (f"{label}：聊天框扫描失败：{result.get('error', '未知错误')}",
-                    "warn")
-        if status == "ocr_unavailable":
-            return (f"{label}：OCR 引擎不可用，扫描不会有结果 —— "
-                    f"{result.get('error', '未安装 rapidocr')}", "warn")
-        return ("聊天框扫描完成", "info")
-
-    def _on_scan_chat_done(self, result: dict):
-        text, level = self._scan_chat_message(result)
-        if result.get("status") == "started":
-            # "正在扫"只是个过渡态，别把结果行顶掉，所以不进动态流
-            self.set_status(text)
-            return
-        self._flash_status(text, 6000)
-        self.notify_event(text, level)
-
-    def _clear_dedup_cache(self):
-        if self.scheduler is None:
-            return
-        self.scheduler.clear_dedup_cache()
-        self._flash_status("已清空命中去重缓存（立即可以重新计数）")
-
-    def toggle_hotkey(self):
-        """① 上的 [启用/停用 X 扫描]：切换热键开关。
-
-        必须自己取反。旧实现是读 chat_hotkey_var（那是菜单时代留给
-        Checkbutton 用的），而主界面这个按钮从来不去写它 —— 于是点一次提交
-        一次"当前值"，按钮永远启动不了热键（和暂停按钮同一个坑）。
-        """
-        self.set_hotkey_enabled(not bool(self.chat_hotkey_var.get()))
-
-    def set_hotkey_enabled(self, enabled: bool):
-        """写盘并通知 app 重启热键监听。"""
-        if self.hotkey_config is None:
-            self._flash_status("热键配置不可用")
-            self._sync_hotkey_ui()          # 把按钮状态还原，别骗用户
-            return
-        self.chat_hotkey_var.set(bool(enabled))
-        cfg = self.hotkey_config.set_enabled(bool(enabled))
-        self._notify_hotkey_changed(cfg)
-
-    def open_hotkey_settings(self):
-        """打开设置区的「扫描与触发」分页（改键在那里）。"""
-        if self.hotkey_config is None:
-            self._flash_status("热键配置不可用")
-            return
-        self.show_settings_page("scan")
-
-    def _on_hotkey_saved(self, cfg: dict):
-        self.chat_hotkey_var.set(bool(cfg.get("enabled")))
-        self._sync_hotkey_ui()
-        self._notify_hotkey_changed(cfg)
-
-    def _notify_hotkey_changed(self, cfg: dict):
-        self._sync_hotkey_ui()
-        if self.on_chat_hotkey is None:
-            self._flash_status("热键开关不可用（未接入 app）")
-            return
-        try:
-            # 回调可以返回一句状态说明（例如「已注册为系统全局热键」）
-            status = self.on_chat_hotkey(cfg)
-            name = cfg.get("name") or "热键"
-            text = status if isinstance(status, str) and status.strip() else (
-                f"扫描热键 {name} 已{'启用' if cfg.get('enabled') else '停用'}")
-            self._flash_status(text, 8000)
-        except Exception as e:                           # noqa: BLE001
-            messagebox.showerror("热键切换失败", str(e), parent=self.root)
-
-    def _sync_hotkey_ui(self):
-        """同步 ① 上的热键开关按钮。
-
-        按钮文字写的是**动作**（点下去会发生什么），配上当前按键名：
-            未启用 → 「启用 F8 扫描」（普通按钮样式）
-            已启用 → 「停用 F8 扫描」（金色 = 正在生效）
-        这样"到底开没开、点了会怎样"一眼就知道，不用翻菜单。
-        """
-        enabled = bool(self.chat_hotkey_var.get())
-        name = "热键"
-        if self.hotkey_config is not None:
-            try:
-                name = self.hotkey_config.display or "热键"
-            except Exception:                            # noqa: BLE001
-                name = "热键"
-        btn = getattr(self, "hotkey_btn", None)
-        if btn is not None:
-            try:
-                btn.configure(
-                    text=f"停用 {name} 扫描" if enabled else f"启用 {name} 扫描",
-                    style="Accent.TButton" if enabled else "Bar.TButton")
-            except tk.TclError:
-                pass
-        # 设置区里那个按键框也必须跟着变。否则会出现这种自相矛盾：
-        # 顶部写着「停用 F8 扫描」（= 正在生效），设置页里却是「F8（未启用）」
-        # —— 因为那个面板开机时按当时的 enabled=False 渲染，之后再没刷新过。
-        panel = getattr(self, "hotkey_panel", None)
-        if panel is not None:
-            try:
-                panel.refresh_enabled(enabled)
-            except Exception as e:                        # noqa: BLE001
-                self.log.warning("刷新自定义快捷键面板失败: %s", e)
-
-    #: 兼容旧名字（菜单时代的叫法）
-    _sync_hotkey_menu_label = _sync_hotkey_ui
 
     # ---------------------------------------------------------------- 导入导出
     def export_list(self):
@@ -1617,20 +2164,23 @@ class BlacklistGUI:
     def show_help(self):
         messagebox.showinfo(
             "使用说明",
-            "触发扫描的方式：\n"
-            "  · 聊天框（按需）：点工具栏 [扫描聊天框] 或按 F8（需在\n"
-            "    设置 → 聊天框扫描快捷键 里启用）才抓一次图 + 跑一次 OCR；\n"
-            "    平时完全不会扫描聊天框，不占 CPU；\n"
-            "  · 冷启动：游戏启动后 12 秒自动扫一次 HUD 玩家列表；\n"
-            "  · ESC：按 ESC 打开菜单时自动扫一次菜单玩家列表。\n\n"
-            f"命中去重：同一玩家 {config.HIT_DEDUP_WINDOW} 秒内只计数一次、"
-            "只提示一次，\n  防止连点扫描按钮造成重复计数。\n"
-            "批量命中：一次扫描命中多个玩家时，每个玩家一个通知栏，\n"
-            "  但只播一次音效（最多同时弹 5 个）。\n\n"
+            "数据来源：游戏内插件 HD2Tracker 写出的 playerLog.txt\n"
+            "  %LOCALAPPDATA%\\CowboyBingus\\Helldivers2\\Logs\\\n"
+            "本应用只读这一个文本文件，不注入、不读内存、不改包。\n\n"
+            "什么时候提醒：有人刚进队（join）且 **PeerID 命中黑名单**。\n"
+            f"  · 同一局里同一个人 {config.HIT_DEDUP_WINDOW} 秒内只提醒一次；\n"
+            "  · 队伍快照只刷新「现在队里有谁」，不会触发提醒；\n"
+            "  · 你自己永远不会被当成目标；\n"
+            "  · **只认 PeerID**：没 ID 的老条目不会提醒（名字会重名、会改）。\n\n"
+            "怎么加人：打开「最近遇到」→ 选中 → [加入名单]（双击也行）。\n"
+            "  名字与 PeerID 由程序填好，你只写备注 —— 不会填错。\n"
+            "  不想再被某个人打扰就点 [忽略此人]，反悔在「数据」页 → [忽略名单…]。\n"
+            "  老条目可以在名单里右键 → [补全 PeerID]（从「最近遇到」挑一个）。\n\n"
+            "PeerID 是 PlayFab 账户标识，跨局稳定、改名也不变 —— 所以它是**身份**：\n"
+            "  同名不同 ID 是两个人（各留一条），同一个人改名只更新名字。\n\n"
             "名单备份：工具栏 [导出] / [导入]，支持 CSV（Excel 兼容）与 JSON。\n"
-            "自定义提示：设置 → 通知设置。\n"
-            "校准区域：设置 → 校准区域（或工具栏）。\n\n"
-            "本工具不注入、不读内存、不改包，仅截图 + OCR + 本地比对。\n"
+            "自定义提示：设置 → 通知。\n\n"
+            "命令行：--check 自检 / --watch-debug 实时看日志 / --replay 回放日志。\n"
             "重复打开不会多开进程：会把已经运行的那个窗口叫到前台。",
             parent=self.root)
 
@@ -1638,9 +2188,11 @@ class BlacklistGUI:
         messagebox.showinfo(
             "关于",
             f"{config.APP_NAME} v{config.VERSION}\n\n"
-            "屏幕截图 + OCR + 本地黑名单比对，全程不注入游戏进程。\n"
+            "读取游戏内插件写出的日志文件，本地比对本机黑名单。\n"
+            "全程不注入游戏进程、不读游戏内存、不改游戏包。\n"
             "提示窗口使用 WS_EX_NOACTIVATE | WS_EX_TRANSPARENT，不抢焦点。\n\n"
-            f"数据目录：{config.DATA_DIR}",
+            f"数据目录：{config.DATA_DIR}\n"
+            f"插件日志：{config.player_log_path()}",
             parent=self.root)
 
     # ---------------------------------------------------------------- 托盘
@@ -1675,19 +2227,14 @@ class BlacklistGUI:
             # 只转发同一条命令（不要在这里先翻 pause_var，否则会翻两次）
             self.post(self.toggle_pause)
 
-        def _scan(icon=None, item=None):
-            self.post(self.scan_chat_now)
-
         # 托盘只是"同一个命令的另一个入口"，不重复实现任何逻辑
         menu = pystray.Menu(
             pystray.MenuItem("显示主界面", _show, default=True),
-            pystray.MenuItem("扫描聊天框", _scan),
-            pystray.MenuItem("暂停/恢复监控", _pause),
+            pystray.MenuItem("最近遇到", lambda i, it: self.post(self.open_recent)),
+            pystray.MenuItem("暂停/恢复追踪", _pause),
             pystray.Menu.SEPARATOR,
-            pystray.MenuItem("打开设置：扫描与触发",
-                             lambda i, it: self.post(self.open_hotkey_settings)),
-            pystray.MenuItem("打开设置：监视区域",
-                             lambda i, it: self.post(self.open_calibrator)),
+            pystray.MenuItem("打开设置：最近遇到",
+                             lambda i, it: self.post(self.open_recent)),
             pystray.MenuItem("打开设置：通知",
                              lambda i, it: self.post(self.open_notification_settings)),
             pystray.Menu.SEPARATOR,
@@ -1727,7 +2274,7 @@ class BlacklistGUI:
         否则窗口销毁后 Tcl 还会去调用已消失的回调，控制台会刷
         `invalid command name "..._drain_queues"`。
         """
-        jobs = ([self._drain_job, self._flash_job,
+        jobs = ([self._drain_job, self._flash_job, self._watch_job,
                  getattr(self, "_resync_job", None)]
                 + list(self._flash_jobs.values()))
         for job in jobs:
@@ -1739,6 +2286,7 @@ class BlacklistGUI:
         self._flash_jobs.clear()
         self._drain_job = None
         self._flash_job = None
+        self._watch_job = None
         self._resync_job = None
 
     def quit_app(self):

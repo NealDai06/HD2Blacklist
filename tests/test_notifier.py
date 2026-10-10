@@ -254,10 +254,19 @@ class TestOverlayWindow(TempCase):
             if not w.start(timeout=8.0):
                 self.skipTest("Overlay 不可用")
             img = Image.new("RGBA", (120, 40), (0, 0, 255, 255))
-            w.show(img, 10, 10, 0.3)
-            time.sleep(0.15)
-            self.assertTrue(nt.user32.IsWindowVisible(w.hwnd))
-            time.sleep(1.0)
+            # duration 留 1 秒而不是 0.3 秒：把图**画到屏幕上**本身也要时间
+            # （实测 0.05~0.25 秒，取决于机器负载），0.3 秒那种写法会出现
+            # "还没画出来就已经到点了"，于是这条测试随机变红。
+            w.show(img, 10, 10, 1.0)
+            deadline = time.time() + 1.5
+            visible = False
+            while time.time() < deadline:
+                if nt.user32.IsWindowVisible(w.hwnd):
+                    visible = True
+                    break
+                time.sleep(0.02)
+            self.assertTrue(visible, "Overlay 应当在 duration 内可见")
+            time.sleep(1.2)                     # 等它自己到点
             self.assertFalse(nt.user32.IsWindowVisible(w.hwnd),
                              "超过 duration 后应当自动隐藏")
         finally:

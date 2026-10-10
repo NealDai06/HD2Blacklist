@@ -2,20 +2,19 @@
 """priority.py —— 把本程序的 CPU 优先级压到游戏下面（保护游戏帧数）。
 
 为什么需要：
-    抓屏 + OCR 是「一次性吃掉一大块 CPU」的活（实测单次约 0.3~0.9 CPU 秒，
-    压在 0.3~0.5 秒内跑完，等于瞬间占满 2 个核）。如果这些工作和游戏的
-    渲染/逻辑线程同为 NORMAL 优先级，Windows 会公平地轮转 CPU，
-    游戏就会出现卡顿 —— 表现就是 1% low 掉到 55 这种「最低帧」被拉低。
+    v1 的抓屏 + OCR 是「一次性吃掉一大块 CPU」的活（实测单次约 0.3~0.9 CPU 秒）。
+    v2 只剩「读一个文本文件 + 比对字符串」，开销本身可以忽略；但这套机制留着
+    仍然有用：只要本进程和游戏同为 NORMAL，Windows 就会公平轮转 CPU，
+    游戏的「最低帧」就可能被拉低。
 
-    把本进程降到 BELOW_NORMAL、把扫描线程再压到 LOWEST 之后，
-    游戏线程永远优先拿到 CPU，我们只在**空闲时间片**里干活：
-    扫描可能慢一点（0.5 → 0.8 秒），但游戏的帧率不再被拖。
+    把本进程降到 BELOW_NORMAL、把追踪线程再压到 LOWEST 之后，
+    游戏线程永远优先拿到 CPU，我们只在**空闲时间片**里干活。
 
 机制（Windows 优先级是「进程基类 + 线程偏移」算出来的）：
     * `SetPriorityClass(GetCurrentProcess(), BELOW_NORMAL)` 会影响本进程
-      **所有线程**（包括 onnxruntime 内部自己建的工作线程）——
-      因为它们的基础优先级是拿进程基类现算的，所以一次调用就能全压低。
-    * `SetThreadPriority(GetCurrentThread(), LOWEST)` 让扫描线程更靠后。
+      **所有线程** —— 因为它们的基础优先级是拿进程基类现算的，
+      所以一次调用就能全压低。
+    * `SetThreadPriority(GetCurrentThread(), LOWEST)` 让追踪线程更靠后。
 
 非 Windows / 调用失败都安静降级，绝不影响功能。
 """
@@ -165,7 +164,7 @@ def apply_game_friendly(process_level: str = "below_normal",
     if log:
         logger = get_logger("priority")
         if ok:
-            logger.info("已把本进程优先级降到 %s（游戏优先拿 CPU；扫描线程用 %s）",
+            logger.info("已把本进程优先级降到 %s（游戏优先拿 CPU；追踪线程用 %s）",
                         process_level, "lowest")
         else:
             logger.info("调整进程优先级失败或已跳过，保持系统默认")

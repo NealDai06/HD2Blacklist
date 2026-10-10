@@ -106,15 +106,13 @@ class TestConfigSwitch(unittest.TestCase):
         self.assertIsInstance(config.GAME_FRIENDLY_PRIORITY, bool)
         self.assertIn(config.PROCESS_PRIORITY,
                       ("idle", "below_normal", "normal"))
-        self.assertIn(config.SCAN_THREAD_PRIORITY,
+        self.assertIn(config.WATCH_THREAD_PRIORITY,
                       ("idle", "lowest", "below_normal", "normal"))
-        self.assertIsInstance(config.SESSION_SKIP_UNCHANGED, bool)
-        self.assertGreaterEqual(config.SESSION_MAX_STATIC_FRAMES, 0)
-        self.assertGreater(config.SESSION_DIFF_TOLERANCE, 0)
 
-    def test_esc_session_has_static_limit(self):
-        self.assertIn("max_static_frames", config.ESC_SESSION)
-        self.assertLessEqual(float(config.ESC_SESSION["interval"]), 1.0)
+    def test_watch_is_cheap_and_slow(self):
+        """v2 只读一个文本文件：轮询必须够稀，别拿高频轮询去磨 CPU。"""
+        self.assertGreaterEqual(config.WATCH_POLL_INTERVAL, 0.2)
+        self.assertLessEqual(config.WATCH_POLL_INTERVAL, 5.0)
 
 
 if __name__ == "__main__":

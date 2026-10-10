@@ -15,12 +15,12 @@ import sys
 # --------------------------------------------------------------------------
 APP_NAME = "HD2 黑名单"
 APP_ID = "hd2_blacklist"
-VERSION = "1.1.3"
+VERSION = "2.0.0"
 #: 主窗口标题（GUI 与单实例「叫回窗口」都用它，避免两处写法漂移）
 WINDOW_TITLE = f"{APP_NAME} v{VERSION}"
 
-# 目标进程（进程监控只认这些名字，全部小写）
-TARGET_PROCESS_NAMES = ("helldivers2.exe",)
+# 数据来源：游戏内插件 HD2Tracker 写出的日志文件（本应用**只读这一个文件**）。
+# 不再有进程监控 —— 「游戏有没有在跑」直接由日志里的事件告诉你。
 
 # --------------------------------------------------------------------------
 # 路径解析
@@ -41,19 +41,19 @@ def _resolve_base_dir() -> str:
 BASE_DIR = _resolve_base_dir()
 DATA_DIR = os.path.join(BASE_DIR, "data")
 ASSETS_DIR = os.path.join(DATA_DIR, "assets")
-EVIDENCE_DIR = os.path.join(DATA_DIR, "evidence")
 LOG_DIR = os.path.join(DATA_DIR, "logs")
 
 DB_PATH = os.path.join(DATA_DIR, "blacklist.db")
+#: 预留：将来要允许用户改写数据来源路径（例如插件日志换个位置）就落在这里。
+#: v2 目前**不读**这个文件，删掉它不会有任何影响。
 USER_CONFIG_PATH = os.path.join(DATA_DIR, "user_config.json")
 NOTIFICATION_PATH = os.path.join(DATA_DIR, "notification.json")
-HOTKEY_PATH = os.path.join(DATA_DIR, "hotkey.json")
 DEFAULT_ICON_PATH = os.path.join(ASSETS_DIR, "default_icon.png")
 APP_ICON_PATH = os.path.join(ASSETS_DIR, "app_icon.png")
 APP_ICON_ICO = os.path.join(ASSETS_DIR, "app_icon.ico")
 LOG_PATH = os.path.join(LOG_DIR, "app.log")
 
-DIRECTORIES = (DATA_DIR, ASSETS_DIR, EVIDENCE_DIR, LOG_DIR)
+DIRECTORIES = (DATA_DIR, ASSETS_DIR, LOG_DIR)
 
 #: 随程序一起分发的静态资源（打包后在 sys._MEIPASS/data/assets 里）
 BUNDLED_ASSETS = ("app_icon.png", "app_icon.ico", "default_icon.png")
@@ -92,8 +92,8 @@ def ensure_dirs() -> None:
 def enable_dpi_awareness() -> bool:
     """开启 Per-Monitor DPI 感知。
 
-    必须在创建任何窗口 / 截图之前调用。否则在缩放不是 100% 的显示器上，
-    系统会对坐标做虚拟化，导致 mss 截图区域和 Overlay 位置都对不上。
+    必须在创建任何窗口之前调用。否则在缩放不是 100% 的显示器上，系统会对
+    坐标做虚拟化，导致无焦点提示浮层的位置和尺寸都对不上。
     """
     if os.name != "nt":
         return False
@@ -111,24 +111,100 @@ def enable_dpi_awareness() -> bool:
 
 
 # --------------------------------------------------------------------------
-# 区域配置系统
+# 数据源：插件日志文件（唯一的输入）
 # --------------------------------------------------------------------------
-# 默认坐标以 1920x1080 无边框窗口、游戏 UI 缩放 100% 为基准，
-# 其它分辨率 / 缩放比例请使用 GUI 的 [校准区域] 重新框选。
-DEFAULT_REGIONS = {
-    "chat_event":       {"left": 20, "top": 720, "width": 420, "height": 160},
-    "player_list_hud":  {"left": 40, "top": 200, "width": 400, "height": 120},
-    "menu_player_list": {"left": 60, "top": 120, "width": 500, "height": 300},
+# 游戏内插件 HD2Tracker 把每一条记录写成一行 JSON、只追加到这个文件：
+#   %LOCALAPPDATA%\CowboyBingus\Helldivers2\Logs\playerLog.txt
+# 本应用**只读**它：不注入、不读内存、不改包、不抢焦点。
+# 字段含义见 V2\build\hd2list\docs\记录字段说明.md。
+_LOCALAPPDATA = (
+    os.environ.get("LOCALAPPDATA")
+    or os.path.join(os.path.expanduser("~"), "AppData", "Local")
+)
+#: 插件日志目录（LOCALAPPDATA 取不到时按 Windows 规范退回 ~\AppData\Local）
+PLUGIN_LOG_DIR = os.path.join(_LOCALAPPDATA, "CowboyBingus", "Helldivers2", "Logs")
+#: 数据文件（一行一条 JSON，UTF-8，只追加）
+PLAYER_LOG_NAME = "playerLog.txt"
+#: 插件的诊断日志（给人看的，本应用不读；自检只用它判断"插件到底装没装"）
+PLUGIN_DIAG_NAME = "playerLog.log"
+
+
+def player_log_path() -> str:
+    """插件日志文件的绝对路径。"""
+    return os.path.join(PLUGIN_LOG_DIR, PLAYER_LOG_NAME)
+
+
+def plugin_diag_path() -> str:
+    """插件诊断日志的绝对路径。"""
+    return os.path.join(PLUGIN_LOG_DIR, PLUGIN_DIAG_NAME)
+
+
+# --------------------------------------------------------------------------
+# 文件追踪
+# --------------------------------------------------------------------------
+#: 轮询间隔（秒）。文件只追加，1 Hz 足够；一次轮询只是一个 os.stat，几乎不耗 CPU
+WATCH_POLL_INTERVAL = 1.0
+#: 单轮最多消化多少行 —— 防止首启去追一个几十万行的历史文件时把界面拖住
+WATCH_TAIL_MAX_LINES = 5000
+#: 首次启动时最多往回读多少字节（只用于立刻在界面上显示"你现在队里有谁"）
+WATCH_BACKFILL_BYTES = 512 * 1024
+#: 幂等去重：记住最近这么多个 capture_id，同一行永不重复处理
+WATCH_SEEN_IDS = 4096
+#: 追踪线程优先级（idle / lowest / below_normal / normal）
+WATCH_THREAD_PRIORITY = "lowest"
+
+#: 插件最低版本。更老的版本字段不一样（没有 capture_id / peer_id_hex），
+#: 界面必须明确报出来，否则用户只会觉得"应用没反应"。
+PLUGIN_MIN_VERSION = "hd2trackerv21.2"
+
+# --------------------------------------------------------------------------
+# 事件类型（插件写在每行的 `ev` 字段里）
+# --------------------------------------------------------------------------
+EVENT_FILE_START = "file_start"      # 插件每次加载（= 游戏每次启动）
+EVENT_MATCH_START = "match_start"    # 检测到进入一局
+EVENT_JOIN = "join"                  # 有人进队（或回来了）
+EVENT_LEAVE = "leave"                # 有人离队（插件侧已做 2 秒防抖）
+EVENT_UPDATE = "update"              # 同一个人的信息补齐（典型：名字晚几秒才拿到）
+EVENT_SQUAD = "squad"                # 全队快照 —— 这是**状态**，不是事件
+EVENT_MATCH_END = "match_end"        # 对局会话消失
+
+#: 允许触发告警的事件。铁律：**只有 join**。
+#: `squad` 是快照，用它触发会让"进队就在队里的人"和"刚进来的人"混在一起反复报警。
+ALERT_EVENTS = (EVENT_JOIN,)
+
+#: 告警**只认 PeerID**：名字可以重名、可以随时改，拿它当身份会认错人。
+#: 所以没有 PeerID 的老条目不会参与告警（"补上 ID 才生效"）。
+ALERT_BY_PEER_ID_ONLY = True
+
+#: 同一 (game_pid, peer_id_hex) 在这个秒数内只告警一次
+#: （30 秒：挡住"同一局里反复进出"造成的连响，又不至于漏掉隔一会儿又回来的人）
+HIT_DEDUP_WINDOW = 30
+
+#: 命中来源 -> 人话。界面动态流、日志、通知栏共用一套叫法
+ALERT_SOURCE_LABELS = {
+    "peer_join": "PeerID 命中（有人进队）",
 }
 
-REGION_META = {
-    "chat_event":       {"label": "聊天框事件区域", "desc": "检测玩家加入/离开提示文字"},
-    "player_list_hud":  {"label": "HUD 玩家列表", "desc": "任务中显示的队友名称区域"},
-    "menu_player_list": {"label": "ESC 菜单玩家列表", "desc": "按 ESC 后左上角玩家信息区域"},
-}
+#: 名字自动同步：日志里看到某个 PeerID 的名字变了，就把名单里那条的名字改过来
+#: （PeerID 是身份、名字只是显示名，写个过期名字只会误导人）。
+#: 同一个人在这个秒数内最多同步一次 —— 挡的是"名册读取抖动"造成的反复改名。
+NAME_SYNC_COOLDOWN = 5.0
 
-# 区域最小可用尺寸（防止用户框选到 0 像素区域）
-REGION_MIN_SIZE = 8
+
+def alert_source_label(source: str, default: str = "") -> str:
+    """把内部的 source 字符串翻成能给用户看的名字。"""
+    if not source:
+        return default
+    return ALERT_SOURCE_LABELS.get(source, default or source)
+
+
+# --------------------------------------------------------------------------
+# 「最近遇到」
+# --------------------------------------------------------------------------
+#: 界面上最多显示多少条
+RECENT_KEEP = 200
+#: 只显示最近这么多天遇到的人
+RECENT_DAYS = 7
 
 # --------------------------------------------------------------------------
 # 通知配置系统
@@ -182,160 +258,45 @@ DEFAULT_BODY_FONT_SIZE = 13
 FONT_SIZE_MIN = 8
 FONT_SIZE_MAX = 72
 
-# --------------------------------------------------------------------------
-# 聊天框扫描（按需触发，不再有 1 秒 tick / 10 秒定期扫描）
-# --------------------------------------------------------------------------
-CHAT_SCAN_REGION_KEY = "chat_event"
-CHAT_SCAN_SOURCE = "chat_manual"    # 手动点按钮
-CHAT_SCAN_HOTKEY_SOURCE = "chat_hotkey"
-
-#: 扫描来源 -> 人话。界面动态流、日志、会话摘要共用一套叫法，
-#: 免得同一个触发在界面上叫"聊天框扫描"、在日志里叫 "chat_hotkey"。
-SCAN_SOURCE_LABELS = {
-    CHAT_SCAN_SOURCE: "手动点的聊天框扫描",
-    CHAT_SCAN_HOTKEY_SOURCE: "聊天框扫描热键",
-    "esc_menu": "ESC 菜单玩家列表",
-    "cold_start": "进游戏后的冷启动扫描",
-    "player_list_hud": "HUD 队友列表",
-}
-
-
-def scan_source_label(source: str, default: str = "") -> str:
-    """把内部的 source 字符串翻成能给用户看的名字。"""
-    if not source:
-        return default
-    return SCAN_SOURCE_LABELS.get(source, default or source)
-
-# 热键（默认关闭，避免与游戏内快捷键冲突；可在 GUI 里自定义并持久化）
-CHAT_SCAN_HOTKEY_ENABLED = False
-CHAT_SCAN_HOTKEY_VK = 0x77          # F8
-CHAT_SCAN_HOTKEY_DEBOUNCE = 1.0
-
-#: data/hotkey.json 的默认内容（用户改过就以文件为准）
-DEFAULT_HOTKEY = {
-    "version": 1,
-    "enabled": CHAT_SCAN_HOTKEY_ENABLED,
-    "vk": CHAT_SCAN_HOTKEY_VK,
-    "ctrl": False,
-    "alt": False,
-    "shift": False,
-    "name": "F8",
-}
-
-# 命中去重窗口：同一玩家在该窗口内只计数一次、只提示一次
-# （30 秒：既能挡住「连点扫描按钮」造成的重复计数，又不至于漏掉
-#   隔一会儿又出现一次的同一玩家）
-HIT_DEDUP_WINDOW = 30
-
 # 批量命中时的通知堆叠
 MAX_NOTIFY_STACK = 5                # 最多同时弹出 5 个通知栏
 NOTIFY_STACK_GAP = 8                # 通知栏之间的垂直间距（像素）
 NOTIFY_STACK_BASE_Y = 40            # 第一个通知栏距离屏幕顶部的距离
 
 # --------------------------------------------------------------------------
-# 游戏友好（保护游戏帧数）—— 必须在 ESC_SESSION 之前定义
+# 触发的来源与游戏友好（保护游戏帧数）
 # --------------------------------------------------------------------------
-# 抓屏 + OCR 会一次性吃掉一大块 CPU（实测单次可达 1~6 CPU秒，压在 1 秒内
-# 跑完 ≈ 瞬时占满 3 个核）。如果和游戏同为 NORMAL 优先级，Windows 会公平
-# 轮转 CPU，游戏的「最低帧」就会被拉低。把本进程压到 BELOW_NORMAL、扫描线程
-# 再压到 LOWEST 之后，游戏线程始终优先拿到 CPU。
-#   · 想对比效果 / 觉得扫得太慢 → 改成 False，恢复系统默认优先级
+# 本应用只做「读一个文本文件 + 比对字符串」，本身开销可以忽略；但仍把本进程
+# 压到 BELOW_NORMAL、追踪线程压到 LOWEST，把 CPU 优先让给游戏线程。
+#   · 想对比效果 → 改成 False，恢复系统默认优先级
 GAME_FRIENDLY_PRIORITY = True
 PROCESS_PRIORITY = "below_normal"   # idle / below_normal / normal
-SCAN_THREAD_PRIORITY = "lowest"     # idle / lowest / below_normal / normal
-
-# 扫描会话里「画面没变化就跳过 OCR」：
-# 菜单/列表静止时对同一张图反复 OCR 是纯浪费，还会持续拖累游戏帧数。
-# 只做一次缩略图的 numpy 差分（几十微秒）就能判断画面变没变。
-SESSION_SKIP_UNCHANGED = True
-SESSION_DIFF_TOLERANCE = 1.0        # 缩略图平均像素差阈值（0~255），越小越敏感
-
-# 「画面连续静止 N 帧就收工」——这条才是省游戏帧数的关键：
-# 每次抓屏都会让 DWM/GPU 同步一次，游戏就可能卡一帧；抓屏次数 ≈ 卡顿次数。
-# 菜单开着不动时其实一眼就看完了，没必要 8 秒里抓 26 次。
-#   0 = 不启用（会话只受 max_duration 约束）
-SESSION_MAX_STATIC_FRAMES = 6       # 配合 0.5s 间隔 ≈ 静止 3 秒收工
-
-# --------------------------------------------------------------------------
-# ESC 菜单扫描
-# --------------------------------------------------------------------------
-ESC_POLL_INTERVAL = 0.1             # 每 100ms 轮询 ESC 键
-ESC_MENU_DELAY = 0.6                # 等菜单动画
-ESC_DEBOUNCE = 1.0                  # 按键去抖
-
-ESC_SESSION = {
-    "interval": 0.5,                # 抓屏间隔：抓一次就可能让游戏卡一帧，
-                                    # 所以宁可稀一点（滚动停下后画面仍在，照样能扫到）
-    "max_duration": 8.0,
-    "max_consecutive_empty": 4,     # 3 太紧：菜单淡入期/滚动空白期容易误收工
-    "keep_alive_after_hit": 3.5,
-    "max_static_frames": SESSION_MAX_STATIC_FRAMES,
-}
-
-# --------------------------------------------------------------------------
-# ESC 菜单「是否已经打开」的判定
-# --------------------------------------------------------------------------
-# 曾经的实现只看「灰度标准差 > 20」，理由是"菜单打开后画面更复杂"。
-# 实测真实截图（556x548 的 ESC 菜单区域、玩家名清晰可见）后否定了这个假设：
-#     菜单**开着**的 7 张图 —— 标准差 9.6 / 9.6 / 20.7 / 21.1 / 21.1 / 23.1 / 23.3
-#     菜单**没开**的那张（游戏画面）—— 标准差 93.0、平均亮度 140.3
-# 阈值 20 恰好压在这批真实样本的正中间，于是「菜单明明开着」也有一半概率被判成
-# 「菜单没开」→ 连扫描都不启动 → 表现就是"ESC 菜单经常检测不出东西"。
-#
-# 菜单打开时的真正特征：左上角是一块**暗色面板 + 少量亮字**
-#     · 平均亮度低（面板是暗的，实测 10~36）
-#     · 但又不是纯黑（有文字 → 标准差不会接近 0）
-# 菜单没打开时同一块区域是游戏画面：平均亮度高得多（实测 140）。
-ESC_MENU_MEAN_MAX = 90.0        # 平均亮度 <= 此值 → 像暗色菜单面板
-ESC_MENU_MEAN_MIN_BRIGHT = 120.0  # 平均亮度 >= 此值 → 像游戏画面
-ESC_MENU_STD_MIN = 4.0          # 低于此值说明是纯色/黑屏，什么也识别不出来
-ESC_MENU_STD_THRESHOLD = 20.0   # 保留：仅用于日志里的"复杂度"参考
-ESC_MENU_CHECK_RETRY = 3        # 判定不出来时最多复查几次（菜单还在淡入）
-ESC_MENU_RETRY_DELAY = 0.35     # 复查间隔（秒）
-
-# --------------------------------------------------------------------------
-# 冷启动扫描
-# --------------------------------------------------------------------------
-COLD_START_DELAY = 12.0
-COLD_START_SESSION = {
-    "interval": 1.5,
-    "max_duration": 15.0,
-    "max_consecutive_empty": 3,
-    "keep_alive_after_hit": 0,
-}
 
 # --------------------------------------------------------------------------
 # 匹配
 # --------------------------------------------------------------------------
+# ⚠ 告警**只认 PeerID**（`ALERT_BY_PEER_ID_ONLY`）。下面这三个常量属于
+#   名字匹配那一层，而它现在只服务于**离线排查**（`--replay` / 自检 / 单元测试），
+#   不参与线上告警 —— 名字会重名、会随时改，拿它当身份会认错人。
+#: 名字模糊匹配的相似度阈值（0~100）。
 MATCH_THRESHOLD = 85
-OCR_CONFIDENCE_MIN = 0.7
 
 #: 允许把「纯符号名字」写进黑名单（例如玩家名就是一个问号 `?` / `？`）。
 #: 这类名字无法用「去掉所有非字母数字」的老办法归一化（会被归一化成空串然后
 #: 被直接丢出索引），所以单独走一层「符号层」：只做 NFKC + 去空白 + 大小写折叠，
-#: 并且**只按整体相等**匹配 —— 否则一个 `?` 会在每句带问号的聊天里误报。
+#: 并且**只按整体相等**匹配 —— 否则一个 `?` 会在每句话里误报。
 #: 关掉它会导致全符号名字永远匹配不上。
 MATCH_SYMBOL_NAMES = True
 
-#: OCR 易混字符容错：把 0/O、1/l/I、5/S、8/B、2/Z、4/A 折叠成同一个字符
-#: 再做一次「整体相等」比较。游戏里的字很小，OCR 把 Player_01 读成 Player_Ol
-#: 是常事，靠这条能救回来。仅在该折叠键于黑名单中**唯一**时才生效，
+#: 易混字符容错：把 0/O、1/l/I、5/S、8/B、2/Z、4/A 折叠成同一个字符
+#: 再做一次「整体相等」比较。这是给**老条目**留的兜底 —— 那些条目当年是靠
+#: 截图 + OCR 认名字认错的。仅在该折叠键于黑名单中**唯一**时才生效，
 #: 所以不会把两个不同的玩家混成一个。
 MATCH_FUZZY_CONFUSABLE = True
 
 # --------------------------------------------------------------------------
-# OCR
+# 日志
 # --------------------------------------------------------------------------
-OCR_UPSCALE = 2                     # 识别前放大倍数（2~3 倍效果最佳）
-OCR_MIN_TEXT_LEN = 1
-OCR_INTRA_OP_THREADS = 2            # 限制 onnxruntime 线程数，压低 CPU 占用
-OCR_USE_ANGLE_CLS = False           # 聊天/HUD 文本基本无旋转，关掉省 CPU
-
-# --------------------------------------------------------------------------
-# 证据 / 日志
-# --------------------------------------------------------------------------
-EVIDENCE_JPEG_QUALITY = 80          # 证据截图压缩质量（省磁盘）
-EVIDENCE_MAX_FILES = 500            # 超过后自动删除最旧的证据图
 LOG_MAX_BYTES = 2 * 1024 * 1024     # 单个日志文件上限 2MB
 LOG_BACKUP_COUNT = 2
 LOG_LEVEL = "INFO"
