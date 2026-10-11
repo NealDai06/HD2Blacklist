@@ -15,7 +15,7 @@ import sys
 # --------------------------------------------------------------------------
 APP_NAME = "HD2 黑名单"
 APP_ID = "hd2_blacklist"
-VERSION = "2.0.0"
+VERSION = "2.0.1"
 #: 主窗口标题（GUI 与单实例「叫回窗口」都用它，避免两处写法漂移）
 WINDOW_TITLE = f"{APP_NAME} v{VERSION}"
 

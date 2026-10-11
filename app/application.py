@@ -89,7 +89,12 @@ class HD2BlacklistApp:
         """尾随线程的回调 —— **在工作线程里执行，绝不能在这里碰 tkinter**。
 
         `live=False` 是首启补读的那一批：只记事实，不弹告警。
+
+        本批的命中**先收集、循环后一次性交给通知层**（`alert_batch`）——
+        逐条调 `notifier.alert()` 的话都画在 0 号通知栏上，后一条会把前一条
+        覆盖掉：同一次轮询里两个人命中，你就只看得到后一个。
         """
+        pending = []                     # [(Event, entry, score), ...]
         for ev in events:
             if ev.kind == config.EVENT_SQUAD:
                 # 快照不是事件：只补"遇到过"的事实，**永远不告警**
@@ -130,7 +135,12 @@ class HD2BlacklistApp:
                 continue
 
             if ev.kind in config.ALERT_EVENTS and live:
-                self._alert(ev)
+                hit = self._resolve_hit(ev)
+                if hit is not None:
+                    pending.append((ev, hit[0], hit[1]))
+
+        if pending:
+            self._alert_many(pending)
 
     def _sync_blacklist_name(self, peer_id, seen_name) -> None:
         """日志里看到名单中某个 PeerID 的名字变了 → **主动把名单里的名字改过来**。
@@ -188,42 +198,59 @@ class HD2BlacklistApp:
         except Exception as e:                           # noqa: BLE001
             self.log.warning("记录「最近遇到」失败（%s）: %s", peer_id, e)
 
-    def _alert(self, ev) -> None:
-        """一条 join 事件 → 查忽略名单 → **按 PeerID** 查黑名单 → 弹提示。
+    def _resolve_hit(self, ev):
+        """一条 join 事件 → 查忽略名单 → **按 PeerID** 查黑名单 → 去重窗口。
 
         只认 PeerID：名字可以重名、可以随时改，拿它当身份会认错人。
         没有 PeerID 的老条目在这个环节**不参与**（它既不会命中、也不会误报），
         想让它生效得先补上 ID。
+
+        返回 `(entry, score)`；返回 `None` 表示这条不该弹（忽略 / 不在名单 /
+        还在去重窗口内）。去重在这里就登记，所以同一批里同一个人重复进队也只算一次。
         """
         try:
             if self.db.is_ignored(ev.peer_id):
                 self.log.debug("[忽略] %s 在忽略名单里，不提醒", ev.peer_id)
-                return
+                return None
         except Exception as e:                           # noqa: BLE001
             self.log.warning("查忽略名单失败（%s）: %s", ev.peer_id, e)
 
         hit = self.matcher.check_peer(ev.peer_id)
         if hit is None:
-            return
+            return None
         entry, score = hit
         if not self._should_alert(ev, entry):
-            return
+            return None
+        return entry, float(score)
 
-        who = ev.name or entry.get("player_name") or ev.peer_id
+    def _alert_many(self, pending) -> None:
+        """一批 join 命中 → **一次**批量提示，再逐条记日志、通知界面。
+
+        `pending` = `[(Event, entry, score), ...]`。
+        走 `notifier.alert_batch()`：每人一个通知栏（依次用 0/1/2… 号槽位），
+        **音效只播一次**；命中数超过堆叠上限时，最后一栏换成汇总栏把剩下的人列出来。
+        一条命中时它的行为和原来的 `alert()` 完全一致（测试里也钉住了这一点）。
+
+        弹提示失败不影响入库与界面动态 —— 原来单条时的容错照旧。
+        """
         source = "peer_join"
+        hits = [(entry, score, source) for _ev, entry, score in pending]
+        acted = 0
         try:
-            acted = bool(self.notifier.alert(entry, float(score), source))
+            acted = int(self.notifier.alert_batch(hits))
         except Exception:                                # noqa: BLE001
             self.log.exception("弹提示失败")
-            acted = False
+            acted = 0
 
         label = config.alert_source_label(source)
-        self.log.info("[命中] %s (%s) 匹配度 %.0f —— %s",
-                      who, ev.peer_id, score, label)
-        self._gui_call("on_alert", {
-            "entry": entry, "score": float(score), "source": source,
-            "name": who, "peer_id": ev.peer_id, "notified": acted,
-        })
+        for ev, entry, score in pending:
+            who = ev.name or entry.get("player_name") or ev.peer_id
+            self.log.info("[命中] %s (%s) 匹配度 %.0f —— %s",
+                          who, ev.peer_id, score, label)
+            self._gui_call("on_alert", {
+                "entry": entry, "score": float(score), "source": source,
+                "name": who, "peer_id": ev.peer_id, "notified": acted > 0,
+            })
 
     def _should_alert(self, ev, entry) -> bool:
         """同一 (game_pid, peer) 在去重窗口内只告警一次。

@@ -83,15 +83,27 @@ class LogFile:
 
 
 class FakeNotifier:
-    """接住 alert()，好断言"到底弹了没有、弹的是什么"。"""
+    """接住 alert() / alert_batch()，好断言"到底弹了没有、弹的是什么"。"""
 
     def __init__(self):
         self.alerts = []
+        self.batches = []                # 每次 alert_batch 收到的命中数
 
     def alert(self, entry, score, source):
         self.alerts.append({"name": entry.get("player_name"), "score": score,
                             "source": source, "id": entry.get("id")})
         return True
+
+    def alert_batch(self, hits):
+        """批量入口：逐条记进 `alerts`（既有断言不用改），另外记一笔批量大小。
+
+        逐条转给 `self.alert`，子类覆盖 `alert`（比如故意抛错）照样生效。
+        """
+        hits = list(hits or [])
+        self.batches.append(len(hits))
+        for entry, score, source in hits:
+            self.alert(entry, score, source)
+        return len(hits)
 
     def close(self):
         pass
@@ -360,6 +372,29 @@ class TestAlertPipeline(TempCase):
         self.drain()
         self.assertEqual(app.notifier.alerts, [])
         self.assertEqual(app.db.count_seen(), 1)
+
+    def test_two_players_in_one_batch_get_two_panels(self):
+        """同一次轮询里两个人命中 → 必须走**一次批量**提示。
+
+        这是"标记了两个人，进游戏只看得到一个提醒"的回归测试：
+        逐条调 alert() 时两条都画在 0 号通知栏上，后一条覆盖前一条；
+        批量接口会依次用 0/1 号槽位，两条都在。
+        """
+        app = self.build_app()
+        app.db.add("坏人甲", "", peer_id="AAAA000000000001")
+        app.db.add("坏人乙", "", peer_id="BBBB000000000002")
+        app.matcher.reload()
+        log = self.log()
+        self._start(log)
+        log.write(make_line("join", 2, peer="AAAA000000000001", name="坏人甲"),
+                  make_line("join", 3, peer="BBBB000000000002", name="坏人乙"))
+        self.drain()
+        self.assertEqual(app.notifier.batches, [2])          # 一次批量、两条命中
+        self.assertEqual([a["name"] for a in app.notifier.alerts],
+                         ["坏人甲", "坏人乙"])
+        self.assertEqual([a["id"] for a in app.notifier.alerts],
+                         [app.db.find_by_peer_id("AAAA000000000001")["id"],
+                          app.db.find_by_peer_id("BBBB000000000002")["id"]])
 
     def test_notifier_failure_does_not_kill_pipeline(self):
         app = self.build_app()
